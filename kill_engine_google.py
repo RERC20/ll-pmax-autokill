@@ -40,12 +40,14 @@ def google_product_perf(run_date):
         r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json={'query':q}, timeout=60)
         r.raise_for_status(); return r.json().get('results', [])
     g=collections.defaultdict(lambda: {'cost7':0.0,'cost30':0.0,'clicks30':0})
-    # explicit calendar range INCLUDING today, so Google's window == the Shopify revenue window
-    # (only 7 & 30 day windows are used; rev14 comes from Shopify, not Google).
+    # Windows = the last N COMPLETE days, ENDING YESTERDAY (today's partial day excluded).
+    # Keeps Google's window == the Shopify window AND avoids the midnight boundary where a
+    # ~6-day-old sale would drop out of a "last 7 days incl. today" window and mis-fire Tier 6.
+    end=(run_date-datetime.timedelta(days=1)).isoformat()           # yesterday (last complete day)
     for win,days in (('7',7),('30',30)):
-        start=(run_date-datetime.timedelta(days=days-1)).isoformat()
+        start=(run_date-datetime.timedelta(days=days)).isoformat()  # N complete days back
         q=(f"SELECT segments.product_item_id, metrics.cost_micros, metrics.clicks "
-           f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{run_date.isoformat()}'")
+           f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{end}'")
         for row in search(q):
             parts=str(row['segments']['productItemId']).split('_')      # shopify_zz_<pid>_<vid>
             pid=norm(parts[2]) if len(parts)>=3 else None
@@ -86,13 +88,13 @@ def shopify_revenue(tok, run_date):
         for e in c['edges']:
             oid=e['node']['id']
             ca=datetime.datetime.fromisoformat(e['node']['createdAt'].replace('Z','+00:00')).astimezone(UK).date()
-            age=(run_date-ca).days                              # calendar-day age incl. today (matches Google window)
+            age=(run_date-ca).days                              # window = last N COMPLETE days (age 1..N), today excluded
             for li in e['node']['lineItems']['edges']:
                 pr=li['node'].get('product')
                 if not pr: continue
                 pid=norm(pr['legacyResourceId']); amt=float(li['node']['discountedTotalSet']['shopMoney']['amount'])
                 for i,d in enumerate((7,14,30)):
-                    if 0<=age<d: rev[pid][i]+=amt; orders[pid][i].add(oid)
+                    if 1<=age<=d: rev[pid][i]+=amt; orders[pid][i].add(oid)
         if c['pageInfo']['hasNextPage']: cur=c['pageInfo']['endCursor']
         else: break
     cnt={pid:[len(s) for s in sets] for pid,sets in orders.items()}
