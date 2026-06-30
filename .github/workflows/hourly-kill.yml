@@ -1,0 +1,55 @@
+name: PMax Auto-Kill (hourly)
+
+# Runs kill_engine_google_auto.py once an hour on GitHub's servers (no laptop needed),
+# drafts losing products, emails the report, and commits the run log back into this repo
+# so you can read it any time you open the repo (kill_engine_auto_runs.log).
+
+on:
+  schedule:
+    - cron: '0 * * * *'        # top of every hour (UTC). GitHub may delay a few minutes under load.
+  workflow_dispatch: {}          # also lets you run it on demand from the Actions tab
+
+permissions:
+  contents: write                # needed so the job can commit the log back to the repo
+
+concurrency:
+  group: auto-kill               # never let two runs overlap
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the auto-kill engine
+        env:
+          GOOGLE_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_DEVELOPER_TOKEN }}
+          GOOGLE_CLIENT_ID:       ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET:   ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN:   ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GOOGLE_CUSTOMER_ID:     ${{ secrets.GOOGLE_CUSTOMER_ID }}
+          SHOPIFY_STORE:          ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_CLIENT_ID:      ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET:  ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          GMAIL_ADDRESS:          ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD:     ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python kill_engine_google_auto.py
+
+      - name: Commit the run log back to the repo
+        if: always()             # commit the log even if the engine aborted/failed
+        run: |
+          git config user.name  "auto-kill-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add kill_engine_auto_runs.log kills_log_auto.csv 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "auto-kill run $(date -u '+%Y-%m-%d %H:00 UTC')"
+          git push || true

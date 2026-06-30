@@ -1,0 +1,18 @@
+# *** NEVER COMMIT — real credentials live here (local laptop only) ***
+_secrets_local.py
+
+# hourly Excel reports are emailed, not needed in the repo
+auto_kill_report_*.xlsx
+kill_list_google.xlsx
+kill_list_pythago.xlsx
+
+# python
+__pycache__/
+*.pyc
+
+# scratch
+_*.py
+_*.json
+_*.csv
+_apiout*.json
+scratchpad/
