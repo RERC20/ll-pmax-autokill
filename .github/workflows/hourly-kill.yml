@@ -41,8 +41,7 @@ jobs:
           SHOPIFY_STORE:          ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_CLIENT_ID:      ${{ secrets.SHOPIFY_CLIENT_ID }}
           SHOPIFY_CLIENT_SECRET:  ${{ secrets.SHOPIFY_CLIENT_SECRET }}
-          GMAIL_ADDRESS:          ${{ secrets.GMAIL_ADDRESS }}
-          GMAIL_APP_PASSWORD:     ${{ secrets.GMAIL_APP_PASSWORD }}
+          RESEND_API_KEY:         ${{ secrets.RESEND_API_KEY }}
         run: python kill_engine_google_auto.py
 
       - name: Commit the run log back to the repo

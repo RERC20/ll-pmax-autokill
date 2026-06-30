@@ -24,9 +24,9 @@ can read it any time you open the repo.
    - `SHOPIFY_STORE`
    - `SHOPIFY_CLIENT_ID`
    - `SHOPIFY_CLIENT_SECRET`
-   - `GMAIL_ADDRESS` = the Gmail you send from
-   - `GMAIL_APP_PASSWORD` = a 16-char Gmail **App Password** (create at
-     https://myaccount.google.com/apppasswords — NOT your normal password)
+   - `RESEND_API_KEY` = a free API key from https://resend.com (for the report email; no Gmail/SMTP).
+     Sign up at resend.com with the **same inbox** the report goes to, so the default
+     `onboarding@resend.dev` sender delivers without verifying a domain.
 
    (No secrets live in the code — the repo is safe even if it leaks. The values exist only in
    your local `_secrets_local.py` and in GitHub's encrypted Secrets.)

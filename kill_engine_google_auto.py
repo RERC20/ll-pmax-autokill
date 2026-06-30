@@ -16,15 +16,14 @@
 #   python kill_engine_google_auto.py          # live: drafts the kills + emails the report
 #   python kill_engine_google_auto.py --dry     # safe test: computes + reports + emails, but DRAFTS NOTHING
 #
-# Email setup (one time): set two environment variables / repo secrets —
-#   GMAIL_ADDRESS         = the sending Gmail address
-#   GMAIL_APP_PASSWORD    = a 16-char Gmail App Password (NOT your normal password;
-#                           create at https://myaccount.google.com/apppasswords)
-# If they're unset, the run still drafts + saves the report locally and just
+# Email setup (one time): set ONE repo secret —
+#   RESEND_API_KEY = a free API key from https://resend.com  (no Gmail / app-password / SMTP).
+#   Sign up at resend.com with the SAME inbox as EMAIL_TO, so the default
+#   onboarding@resend.dev sender can deliver to it without verifying a domain.
+# If it's unset, the run still drafts + saves the report locally and just
 # prints that the email was skipped.
 # ---------------------------------------------------------------------------
-import sys, os, csv, datetime, collections, smtplib
-from email.message import EmailMessage
+import sys, os, csv, base64, datetime, collections, requests
 from openpyxl import Workbook
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 from zoneinfo import ZoneInfo
@@ -35,13 +34,11 @@ from kill_engine_v4 import evaluate, shopify_token, shopify_draft, _Tee
 
 UK = ZoneInfo('Europe/London')                 # store + Google Ads account run on UK time
 
-EMAIL_TO          = 'redacted@example.com'
-SMTP_HOST         = 'smtp.gmail.com'
-SMTP_PORT         = 587
-GMAIL_ADDRESS     = os.environ.get('GMAIL_ADDRESS', '')         # sender (repo secret / env var)
-GMAIL_APP_PASSWORD= os.environ.get('GMAIL_APP_PASSWORD', '')    # 16-char Gmail App Password
-RUN_LOG           = 'kill_engine_auto_runs.log'
-KILLS_LOG         = 'kills_log_auto.csv'
+EMAIL_TO       = 'redacted@example.com'
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')           # free API key from resend.com (repo secret)
+RESEND_FROM    = os.environ.get('RESEND_FROM', 'onboarding@resend.dev')  # default test sender (works without a domain)
+RUN_LOG        = 'kill_engine_auto_runs.log'
+KILLS_LOG      = 'kills_log_auto.csv'
 
 def _days_live(p, run_date):
     return (run_date - datetime.date.fromisoformat(p['pub'])).days
@@ -76,23 +73,23 @@ def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry
     return fname
 
 def send_report(subject, body, xlsx_path=None):
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        print("!! EMAIL NOT SENT — set env vars GMAIL_ADDRESS and GMAIL_APP_PASSWORD (a Gmail App Password).")
+    if not RESEND_API_KEY:
+        print("!! EMAIL NOT SENT — set the RESEND_API_KEY secret (free key from resend.com).")
         if xlsx_path: print(f"   report saved locally: {xlsx_path}")
         return False
     try:
-        msg = EmailMessage()
-        msg['Subject'] = subject; msg['From'] = GMAIL_ADDRESS; msg['To'] = EMAIL_TO
-        msg.set_content(body)
+        payload = {'from': RESEND_FROM, 'to': [EMAIL_TO], 'subject': subject, 'text': body}
         if xlsx_path:
             with open(xlsx_path, 'rb') as f:
-                msg.add_attachment(f.read(), maintype='application',
-                    subtype='vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    filename=os.path.basename(xlsx_path))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as smtp:
-            smtp.starttls(); smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD); smtp.send_message(msg)
-        print(f'Email sent to {EMAIL_TO}: "{subject}"')
-        return True
+                payload['attachments'] = [{'filename': os.path.basename(xlsx_path),
+                                           'content': base64.b64encode(f.read()).decode()}]
+        r = requests.post('https://api.resend.com/emails',
+                          headers={'Authorization': f'Bearer {RESEND_API_KEY}'}, json=payload, timeout=30)
+        if r.status_code in (200, 201):
+            print(f'Email sent to {EMAIL_TO} via Resend: "{subject}"')
+            return True
+        print(f"!! EMAIL FAILED (Resend {r.status_code}): {r.text[:200]}")
+        return False
     except Exception as ex:
         print(f"!! EMAIL FAILED: {ex}   (report saved: {xlsx_path})")
         return False
