@@ -1,6 +1,6 @@
 # google_ads_connect.py
 # ──────────────────────────────────────────────────────────────
-# the-store PMax Auto-Kill Engine — STEP 1: prove the connection
+# PMax Auto-Kill Engine — STEP 1: prove the connection
 #
 # Mirrors your Shopify auth (client_id + client_secret -> token in a header),
 # but Google Ads needs ONE extra durable secret: a refresh_token.
@@ -23,8 +23,8 @@ DEVELOPER_TOKEN   = cred('GOOGLE_DEVELOPER_TOKEN')
 CLIENT_ID         = cred('GOOGLE_CLIENT_ID')
 CLIENT_SECRET     = cred('GOOGLE_CLIENT_SECRET')
 REFRESH_TOKEN     = cred('GOOGLE_REFRESH_TOKEN')
-LOGIN_CUSTOMER_ID = cred('GOOGLE_LOGIN_CUSTOMER_ID')   # empty → direct access to 751
-CUSTOMER_ID       = cred('GOOGLE_CUSTOMER_ID')         # Lola Looks ad account 751-243-1652
+LOGIN_CUSTOMER_ID = cred('GOOGLE_LOGIN_CUSTOMER_ID')   # empty → direct access (no manager account)
+CUSTOMER_ID       = cred('GOOGLE_CUSTOMER_ID')         # Google Ads customer id (from secret)
 
 API_VERSION = 'v21'   # if the 1st real call 404s with "version not found", bump this — Google ships ~3x/yr
 
@@ -80,7 +80,7 @@ def list_accessible_customers(access_token):
 
 
 # ── 3. One GAQL query against YOUR account ───────────────────
-# Proves you can actually read the specific the-store account
+# Proves you can actually read the specific account
 # (this is where login-customer-id + CUSTOMER_ID have to line up).
 def query_customer(access_token):
     url  = f'{ADS_BASE}/customers/{CUSTOMER_ID}/googleAds:search'

@@ -51,7 +51,7 @@ def _days_live(p, run_date):
 def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry):
     wb = Workbook()
     s = wb.active; s.title = 'Summary'
-    s.append(['the-store PMax — Google Auto-Kill Run Report'])
+    s.append(['PMax — Google Auto-Kill Run Report'])
     s.append(['Run (UK time)', ts])
     s.append(['Data date', str(run_date), run_date.strftime('%A')])
     s.append(['Mode', 'DRY-RUN (nothing drafted)' if dry else 'LIVE (products drafted)'])
@@ -133,7 +133,7 @@ def _kills_last_12h():
 
 def build_12h_report(rows, ts):
     wb = Workbook(); s = wb.active; s.title = '12h drafted'
-    s.append(['the-store Auto-Kill — 12h digest', ts]); s.append(['Products drafted (12h)', len(rows)])
+    s.append(['Auto-Kill — 12h digest', ts]); s.append(['Products drafted (12h)', len(rows)])
     s.append(['By tier'] + [f'{k}: {v}' for k, v in sorted(collections.Counter(r['tier'] for r in rows).items())])
     s.append([]); s.append(['timestamp', 'product_id', 'name', 'tier', 'reason', 'cost_30d', 'clicks_30d', 'roas_7d'])
     for r in rows:
@@ -149,13 +149,13 @@ def maybe_send_12h_email(ts, force=False):
     tiers = collections.Counter(r['tier'] for r in rows)
     lines = [f"- {r['product_id']} [{r['tier']}] {r['name'][:44]} | £{r['cost_30d']}/30d, {r['clicks_30d']} clk"
              for r in rows[:50]]
-    body = (f"the-store Auto-Kill — 12-hour digest\n{ts} (UK)\n\n"
+    body = (f"Auto-Kill — 12-hour digest\n{ts} (UK)\n\n"
             f"PRODUCTS DRAFTED (last 12h): {len(rows)}\n"
             f"By tier: {dict(tiers) or '-'}\n\n"
             + ("\n".join(lines) if lines else "(nothing drafted in the last 12 hours)")
             + (f"\n...and {len(rows)-50} more" if len(rows) > 50 else "")
             + "\n\n(Full list also in the attached Excel.)")
-    send_report(f"the-store 12h Auto-Kill — {len(rows)} drafted", body, build_12h_report(rows, ts) if rows else None)
+    send_report(f"12h Auto-Kill — {len(rows)} drafted", body, build_12h_report(rows, ts) if rows else None)
 
 def _write_kills_log(rows, outcomes, run_date, ts, dry):
     new = not os.path.exists(KILLS_LOG)
@@ -198,7 +198,7 @@ def main():
             print("!! " + msg)
             send_telegram(f"⚠️ <b>Auto-Kill ABORTED</b>\n{ts} UK\n{msg}")
             send_report("ALERT: auto-kill ABORTED — no Shopify orders data",
-                        f"the-store PMax auto-kill — {ts} (UK)\nMode: {'DRY-RUN' if dry else 'LIVE'}\n\n{msg}")
+                        f"PMax auto-kill — {ts} (UK)\nMode: {'DRY-RUN' if dry else 'LIVE'}\n\n{msg}")
             return
 
         kills = []
@@ -246,7 +246,7 @@ def main():
         try:
             send_telegram(f"❌ <b>Auto-Kill FAILED</b>\n{ts} UK\n<pre>{err[-500:]}</pre>")
             send_report(f"AUTO-KILL FAILED — {run_date}",
-                        f"the-store auto-kill run FAILED at {ts} (UK).\n\nError:\n{err}")
+                        f"auto-kill run FAILED at {ts} (UK).\n\nError:\n{err}")
         except Exception:
             pass
     finally:

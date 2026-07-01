@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# kill_engine_v4.py  —  the-store PMax Auto-Kill Engine (rules v4)
+# kill_engine_v4.py  —  PMax Auto-Kill Engine (rules v4)
 # ---------------------------------------------------------------------------
 # Daily check:
 #   1. Pull ACTIVE products live from the Pythago API (7/14/30-day metrics).
@@ -28,7 +28,7 @@ UK = ZoneInfo('Europe/London')                      # store + ad account run on 
 # Secrets come from env vars / GitHub Secrets (local: the git-ignored _secrets_local.py).
 PYTHAGO_BASE = 'https://api.pythago.io/api/v1'
 PYTHAGO_KEY  = cred('PYTHAGO_KEY')
-STORE_ID     = 313                                  # Pythago store id (the-store)
+STORE_ID     = 313                                  # Pythago store id
 SHOP   = cred('SHOPIFY_STORE')
 SHOP_CID = cred('SHOPIFY_CLIENT_ID')
 SHOP_CSEC = cred('SHOPIFY_CLIENT_SECRET')
