@@ -40,12 +40,12 @@ def google_product_perf(run_date):
         r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json={'query':q}, timeout=60)
         r.raise_for_status(); return r.json().get('results', [])
     g=collections.defaultdict(lambda: {'cost7':0.0,'cost30':0.0,'clicks30':0})
-    # Windows = the last N COMPLETE days, ENDING YESTERDAY (today's partial day excluded).
-    # Keeps Google's window == the Shopify window AND avoids the midnight boundary where a
-    # ~6-day-old sale would drop out of a "last 7 days incl. today" window and mis-fire Tier 6.
-    end=(run_date-datetime.timedelta(days=1)).isoformat()           # yesterday (last complete day)
+    # Windows = ROLLING last N days, INCLUDING today (matches the dashboard timing fix). A same-day
+    # sale counts immediately, so a cross-sell / low-spend sale isn't mis-read as £0 revenue and
+    # false-killed. Rolling (vs the old "ending yesterday") = no abrupt midnight boundary. RULES UNCHANGED.
+    end=run_date.isoformat()                                        # TODAY (included)
     for win,days in (('7',7),('30',30)):
-        start=(run_date-datetime.timedelta(days=days)).isoformat()  # N complete days back
+        start=(run_date-datetime.timedelta(days=days-1)).isoformat()  # today + (N-1) prior days = N dates
         q=(f"SELECT segments.product_item_id, metrics.cost_micros, metrics.clicks "
            f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{end}'")
         for row in search(q):
@@ -77,6 +77,7 @@ def shopify_revenue(tok, run_date):
     # issue (size/shipping/changed mind), not a sign the product is bad; if it sold, it
     # counts. So a refunded sale still proves the product can sell and won't be killed for it.
     since=(run_date-datetime.timedelta(days=31)).isoformat()
+    now_uk=datetime.datetime.now(UK)                                 # precise clock for rolling N×24h windows (include today)
     Q=('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s"){'
        'pageInfo{hasNextPage endCursor} edges{node{id createdAt '
        'lineItems(first:100){edges{node{product{legacyResourceId} discountedTotalSet{shopMoney{amount}}}}}}}}}' % since)
@@ -87,14 +88,14 @@ def shopify_revenue(tok, run_date):
         c=_gql(tok,Q,{'c':cur})['data']['orders']
         for e in c['edges']:
             oid=e['node']['id']
-            ca=datetime.datetime.fromisoformat(e['node']['createdAt'].replace('Z','+00:00')).astimezone(UK).date()
-            age=(run_date-ca).days                              # window = last N COMPLETE days (age 1..N), today excluded
+            ca_dt=datetime.datetime.fromisoformat(e['node']['createdAt'].replace('Z','+00:00')).astimezone(UK)
+            delta=(now_uk-ca_dt).total_seconds()/86400.0        # rolling age in days -> window = last N×24h INCLUDING today
             for li in e['node']['lineItems']['edges']:
                 pr=li['node'].get('product')
                 if not pr: continue
                 pid=norm(pr['legacyResourceId']); amt=float(li['node']['discountedTotalSet']['shopMoney']['amount'])
                 for i,d in enumerate((7,14,30)):
-                    if 1<=age<=d: rev[pid][i]+=amt; orders[pid][i].add(oid)
+                    if 0<=delta<=d: rev[pid][i]+=amt; orders[pid][i].add(oid)   # rolling, INCLUDES today
         if c['pageInfo']['hasNextPage']: cur=c['pageInfo']['endCursor']
         else: break
     cnt={pid:[len(s) for s in sets] for pid,sets in orders.items()}
