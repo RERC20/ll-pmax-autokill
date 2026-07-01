@@ -1,18 +1,23 @@
-name: PMax Auto-Kill (hourly)
+name: PMax Auto-Kill (every 8 min)
 
-# Runs kill_engine_google_auto.py once an hour on GitHub's servers (no laptop needed),
-# drafts losing products, emails the report, and commits the run log back into this repo
-# so you can read it any time you open the repo (kill_engine_auto_runs.log).
+# Runs kill_engine_google_auto.py on GitHub's servers (no laptop/VM needed).
+# Drafts losing products, sends a Telegram message every run + a Resend email digest every 12h.
+#
+# PRIVACY: this repo is PUBLIC only so Actions minutes are free & unlimited. The CODE is public;
+# your API creds are NOT -- they live in encrypted repo Secrets (never in the code, masked in logs,
+# never handed to forks). Run logs (product ids + spend/revenue) are kept OUT of the repo and
+# persisted privately via Actions cache, so nothing business-sensitive is ever committed publicly.
 
 on:
   schedule:
-    # Hourly at :27 (off-peak minute — GitHub drops fewer than at :00). Light BACKUP only; the
-    # frequent/reliable runs come from the external cron-job.org -> workflow_dispatch trigger.
-    - cron: '27 * * * *'        # every hour at :27 (UTC), off-peak — backup for the external trigger
-  workflow_dispatch: {}          # on-demand + the endpoint the external trigger calls for guaranteed firing
+    # every 8 minutes. GitHub's scheduler is best-effort and drops some runs at high frequency;
+    # for guaranteed firing, point an external cron (cron-job.org, free) at the workflow_dispatch
+    # endpoint below and delete this schedule to avoid double runs.
+    - cron: '*/8 * * * *'
+  workflow_dispatch: {}          # manual + the endpoint an external cron can call for guaranteed firing
 
 permissions:
-  contents: write                # needed so the job can commit the log back to the repo
+  contents: read                 # read-only -- we no longer commit anything back to the repo
 
 concurrency:
   group: auto-kill               # never let two runs overlap
@@ -33,6 +38,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Restore the rolling kills history (used by the 12h email digest) from a PRIVATE Actions
+      # cache -- not committed to the repo, not web-visible. restore-keys grabs the newest saved copy.
+      - name: Restore kills history
+        uses: actions/cache/restore@v4
+        with:
+          path: kills_log_auto.csv
+          key: kills-log-${{ github.run_id }}
+          restore-keys: |
+            kills-log-
+
       - name: Run the auto-kill engine
         env:
           GOOGLE_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_DEVELOPER_TOKEN }}
@@ -48,11 +63,10 @@ jobs:
           TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python kill_engine_google_auto.py
 
-      - name: Commit the run log back to the repo
-        if: always()             # commit the log even if the engine aborted/failed
-        run: |
-          git config user.name  "auto-kill-bot"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add kill_engine_auto_runs.log kills_log_auto.csv 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "auto-kill run $(date -u '+%Y-%m-%d %H:00 UTC')"
-          git push || true
+      # Save the updated kills history back to the PRIVATE cache for the next run.
+      - name: Save kills history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: kills_log_auto.csv
+          key: kills-log-${{ github.run_id }}
