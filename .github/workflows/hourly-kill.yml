@@ -6,10 +6,11 @@ name: PMax Auto-Kill (hourly)
 
 on:
   schedule:
-    # :00 (top of hour) is GitHub's most congested minute — it silently DROPS most runs there
-    # (observed ~60% miss rate). :27 is off-peak and fires far more reliably. Runs hourly, at :27 past.
-    - cron: '27 * * * *'        # 27 min past every hour (UTC)
-  workflow_dispatch: {}          # also lets you run it on demand from the Actions tab
+    # Every 30 min at :07 and :37 — off-peak minutes (GitHub drops far fewer than at :00/:30).
+    # Job runs ~20s = 1 billed min/run; 48/day = ~1,440 of the 2,000 free private-repo min/month (safe).
+    # GitHub's scheduler is best-effort (drops some); an external cron -> workflow_dispatch is the reliable driver.
+    - cron: '7,37 * * * *'       # every 30 minutes (UTC), off-peak
+  workflow_dispatch: {}          # on-demand + the endpoint the external trigger calls for guaranteed firing
 
 permissions:
   contents: write                # needed so the job can commit the log back to the repo
