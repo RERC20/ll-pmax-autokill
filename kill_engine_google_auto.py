@@ -6,22 +6,22 @@
 #   1. Pull the live feed (Google Ads cost/clicks + Shopify revenue, UK tz).
 #   2. Apply the SAME v4 rules (evaluate) as the manual engine.
 #   3. DRAFT every flagged product in Shopify (no yes/no prompt).
-#   4. Build a detailed .xlsx report and EMAIL it to redacted@example.com
-#      with the subject "<N> Products Draft".
+#   4. NOTIFY:
+#        - TELEGRAM every run  -> run stats + the .xlsx (instant push, no daily cap)
+#        - RESEND email twice/day (SUMMARY_HOURS) -> a TEXT digest of the last 12h kills + the .xlsx
 #
 # Separate from kill_engine_google.py (which asks for confirmation) — it changes
 # nothing in the other files; it only REUSES their tested functions.
 #
 # Usage:
-#   python kill_engine_google_auto.py          # live: drafts the kills + emails the report
-#   python kill_engine_google_auto.py --dry     # safe test: computes + reports + emails, but DRAFTS NOTHING
+#   python kill_engine_google_auto.py          # live: drafts the kills + notifies
+#   python kill_engine_google_auto.py --dry     # safe test: computes + notifies, DRAFTS NOTHING
+#   python kill_engine_google_auto.py --test    # like the run but also FORCES the 12h email now (testing)
 #
-# Email setup (one time): set ONE repo secret —
-#   RESEND_API_KEY = a free API key from https://resend.com  (no Gmail / app-password / SMTP).
-#   Sign up at resend.com with the SAME inbox as EMAIL_TO, so the default
-#   onboarding@resend.dev sender can deliver to it without verifying a domain.
-# If it's unset, the run still drafts + saves the report locally and just
-# prints that the email was skipped.
+# Setup (env vars, or the git-ignored _secrets_local.py):
+#   TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID  (from @BotFather; drives the every-run push)
+#   RESEND_API_KEY  (free key from resend.com; twice-daily digest; signup inbox == EMAIL_TO)
+# Any unset channel is simply skipped (the run still drafts + logs).
 # ---------------------------------------------------------------------------
 import sys, os, csv, base64, datetime, collections, requests
 from openpyxl import Workbook
@@ -31,12 +31,17 @@ from zoneinfo import ZoneInfo
 # reuse the EXACT feed + rules + Shopify write + logging from the existing engines
 from kill_engine_google import build_feed
 from kill_engine_v4 import evaluate, shopify_token, shopify_draft, _Tee
+from creds import cred                          # env -> _secrets_local.py -> '' (so local testing works too)
 
 UK = ZoneInfo('Europe/London')                 # store + Google Ads account run on UK time
 
+# ---- notifications ----
 EMAIL_TO       = 'redacted@example.com'
-RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')           # free API key from resend.com (repo secret)
-RESEND_FROM    = os.environ.get('RESEND_FROM', 'onboarding@resend.dev')  # default test sender (works without a domain)
+RESEND_API_KEY = cred('RESEND_API_KEY')
+RESEND_FROM    = cred('RESEND_FROM') or 'onboarding@resend.dev'
+TELEGRAM_TOKEN = cred('TELEGRAM_BOT_TOKEN')     # from @BotFather — every-run push
+TELEGRAM_CHAT  = cred('TELEGRAM_CHAT_ID')       # your numeric chat id (@userinfobot)
+SUMMARY_HOURS  = (9, 21)                        # UK hours for the twice-a-day (every 12h) email digest
 RUN_LOG        = 'kill_engine_auto_runs.log'
 KILLS_LOG      = 'kills_log_auto.csv'
 
@@ -94,6 +99,64 @@ def send_report(subject, body, xlsx_path=None):
         print(f"!! EMAIL FAILED: {ex}   (report saved: {xlsx_path})")
         return False
 
+def send_telegram(text, xlsx_path=None):
+    """Every-run push: a text summary + the .xlsx as a document. No daily cap on Telegram."""
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
+        print("!! TELEGRAM NOT SENT — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (env or _secrets_local.py).")
+        return False
+    base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"; ok = False
+    try:
+        r = requests.post(f"{base}/sendMessage",
+                          data={'chat_id': TELEGRAM_CHAT, 'text': text, 'parse_mode': 'HTML'}, timeout=30)
+        ok = (r.status_code == 200)
+        if not ok: print(f"!! Telegram message failed ({r.status_code}): {r.text[:200]}")
+        if xlsx_path and os.path.exists(xlsx_path):
+            with open(xlsx_path, 'rb') as f:
+                rd = requests.post(f"{base}/sendDocument",
+                                   data={'chat_id': TELEGRAM_CHAT}, files={'document': f}, timeout=60)
+            if rd.status_code != 200: print(f"!! Telegram document failed ({rd.status_code}): {rd.text[:200]}")
+        if ok: print(f"Telegram sent to chat {TELEGRAM_CHAT}.")
+    except Exception as ex:
+        print(f"!! TELEGRAM FAILED: {ex}")
+    return ok
+
+def _kills_last_12h():
+    """Rows actually DRAFTED (outcome 'ok') in the last 12h, from kills_log_auto.csv."""
+    if not os.path.exists(KILLS_LOG): return []
+    cutoff = datetime.datetime.now(UK) - datetime.timedelta(hours=12); out = []
+    with open(KILLS_LOG, encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            try: t = datetime.datetime.fromisoformat(row['timestamp']).replace(tzinfo=UK)
+            except Exception: continue
+            if t >= cutoff and row.get('outcome') == 'ok': out.append(row)
+    return out
+
+def build_12h_report(rows, ts):
+    wb = Workbook(); s = wb.active; s.title = '12h drafted'
+    s.append(['the-store Auto-Kill — 12h digest', ts]); s.append(['Products drafted (12h)', len(rows)])
+    s.append(['By tier'] + [f'{k}: {v}' for k, v in sorted(collections.Counter(r['tier'] for r in rows).items())])
+    s.append([]); s.append(['timestamp', 'product_id', 'name', 'tier', 'reason', 'cost_30d', 'clicks_30d', 'roas_7d'])
+    for r in rows:
+        s.append([r['timestamp'], int(r['product_id']), r['name'], r['tier'], r['reason'],
+                  r['cost_30d'], r['clicks_30d'], r['roas_7d']])
+    fname = f"auto_kill_12h_{datetime.datetime.now(UK).strftime('%Y-%m-%d_%H%M')}.xlsx"; wb.save(fname); return fname
+
+def maybe_send_12h_email(ts, force=False):
+    """Twice a day (SUMMARY_HOURS) email a TEXT digest of the last 12h kills + the .xlsx."""
+    now = datetime.datetime.now(UK)
+    if not (force or (now.hour in SUMMARY_HOURS and now.minute < 8)): return
+    rows = _kills_last_12h()
+    tiers = collections.Counter(r['tier'] for r in rows)
+    lines = [f"- {r['product_id']} [{r['tier']}] {r['name'][:44]} | £{r['cost_30d']}/30d, {r['clicks_30d']} clk"
+             for r in rows[:50]]
+    body = (f"the-store Auto-Kill — 12-hour digest\n{ts} (UK)\n\n"
+            f"PRODUCTS DRAFTED (last 12h): {len(rows)}\n"
+            f"By tier: {dict(tiers) or '-'}\n\n"
+            + ("\n".join(lines) if lines else "(nothing drafted in the last 12 hours)")
+            + (f"\n...and {len(rows)-50} more" if len(rows) > 50 else "")
+            + "\n\n(Full list also in the attached Excel.)")
+    send_report(f"the-store 12h Auto-Kill — {len(rows)} drafted", body, build_12h_report(rows, ts) if rows else None)
+
 def _write_kills_log(rows, outcomes, run_date, ts, dry):
     new = not os.path.exists(KILLS_LOG)
     with open(KILLS_LOG, 'a', newline='', encoding='utf-8') as f:
@@ -133,6 +196,7 @@ def main():
             msg = (f"ABORTED — Shopify returned £0 revenue across ALL {len(feed)} active products over 30 days. "
                    f"That's an empty/failed orders pull, not real sales. NOTHING was drafted; re-run after Shopify recovers.")
             print("!! " + msg)
+            send_telegram(f"⚠️ <b>Auto-Kill ABORTED</b>\n{ts} UK\n{msg}")
             send_report("ALERT: auto-kill ABORTED — no Shopify orders data",
                         f"the-store PMax auto-kill — {ts} (UK)\nMode: {'DRY-RUN' if dry else 'LIVE'}\n\n{msg}")
             return
@@ -158,24 +222,29 @@ def main():
         xlsx = build_report(to_draft, outcomes, run_date, ts, len(feed), len(kills), drafted, dry)
         print(f"report: {xlsx}")
 
-        n_for_subject = len(to_draft) if dry else drafted
-        subject = f"{n_for_subject} Products Draft" + (" (DRY-RUN)" if dry else "")
-        body = (f"the-store PMax auto-kill run — {ts} (UK)\n"
-                f"Mode: {'DRY-RUN (nothing drafted)' if dry else 'LIVE'}\n"
-                f"Data date: {run_date} ({run_date.strftime('%A')})\n"
-                f"Active products analyzed: {len(feed)}\n"
-                f"Kills found by rules: {len(kills)}\n"
-                f"Products {'that WOULD be drafted' if dry else 'drafted'}: {len(to_draft) if dry else drafted}\n"
-                + "\nFull breakdown with reasons + metrics is in the attached Excel report.")
-        send_report(subject, body, xlsx)
-
+        # log FIRST so the 12h digest can include this run's kills
         _write_kills_log(to_draft, outcomes, run_date, ts, dry)
         print(f"logs: run -> {RUN_LOG} | kills -> {KILLS_LOG}")
+
+        # TELEGRAM — every run: run stats + the .xlsx
+        n = len(to_draft) if dry else drafted
+        tg = (f"🤖 <b>Auto-Kill</b> — {n} drafted{' (DRY)' if dry else ''}\n"
+              f"{ts} UK · {run_date.strftime('%a')}\n"
+              f"Active: {len(feed)} | kills found: {len(kills)} | drafted: {n}")
+        if to_draft:
+            tg += "\n\n" + "\n".join(f"• <code>{p['pid']}</code> [{tier}] {p['name'][:38]}"
+                                     for p, tier, why in to_draft[:25])
+            if len(to_draft) > 25: tg += f"\n…+{len(to_draft)-25} more"
+        send_telegram(tg, xlsx)
+
+        # RESEND email — twice a day (SUMMARY_HOURS): TEXT digest of last 12h + the .xlsx
+        maybe_send_12h_email(ts, force=('--test' in sys.argv or '--email' in sys.argv))
     except Exception:
         import traceback
         err = traceback.format_exc()
         print("!! AUTO-KILL RUN FAILED — nothing further drafted:\n" + err)
         try:
+            send_telegram(f"❌ <b>Auto-Kill FAILED</b>\n{ts} UK\n<pre>{err[-500:]}</pre>")
             send_report(f"AUTO-KILL FAILED — {run_date}",
                         f"the-store auto-kill run FAILED at {ts} (UK).\n\nError:\n{err}")
         except Exception:
