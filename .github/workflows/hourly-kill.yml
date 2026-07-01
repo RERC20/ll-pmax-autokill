@@ -6,7 +6,9 @@ name: PMax Auto-Kill (hourly)
 
 on:
   schedule:
-    - cron: '0 * * * *'        # top of every hour (UTC). GitHub may delay a few minutes under load.
+    # :00 (top of hour) is GitHub's most congested minute — it silently DROPS most runs there
+    # (observed ~60% miss rate). :27 is off-peak and fires far more reliably. Runs hourly, at :27 past.
+    - cron: '27 * * * *'        # 27 min past every hour (UTC)
   workflow_dispatch: {}          # also lets you run it on demand from the Actions tab
 
 permissions:
