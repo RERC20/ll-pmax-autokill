@@ -9,12 +9,10 @@ name: PMax Auto-Kill (every 8 min)
 # persisted privately via Actions cache, so nothing business-sensitive is ever committed publicly.
 
 on:
-  schedule:
-    # every 8 minutes. GitHub's scheduler is best-effort and drops some runs at high frequency;
-    # for guaranteed firing, point an external cron (cron-job.org, free) at the workflow_dispatch
-    # endpoint below and delete this schedule to avoid double runs.
-    - cron: '*/8 * * * *'
-  workflow_dispatch: {}          # manual + the endpoint an external cron can call for guaranteed firing
+  # Fires ONLY via workflow_dispatch — an external cron (cron-job.org) hits the dispatch API every
+  # 8 min, which fires reliably. GitHub's own `schedule` was REMOVED: it's best-effort and dropped
+  # ~70% of runs, and keeping it would double-fire alongside the external trigger.
+  workflow_dispatch: {}
 
 permissions:
   contents: read                 # read-only -- we no longer commit anything back to the repo
