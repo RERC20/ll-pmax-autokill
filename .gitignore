@@ -1,10 +1,16 @@
 # *** NEVER COMMIT — real credentials live here (local laptop only) ***
 _secrets_local.py
 
-# hourly Excel reports are emailed, not needed in the repo
+# reports + run logs are emailed/telegrammed, not needed in the repo — and they MUST stay
+# untracked so a server's `git pull` never conflicts with its own local logs
 auto_kill_report_*.xlsx
+auto_kill_12h_*.xlsx
 kill_list_google.xlsx
 kill_list_pythago.xlsx
+kill_engine_auto_runs.log
+kills_log_auto.csv
+kill_engine_google_runs.log
+kills_log_google.csv
 
 # python
 __pycache__/
