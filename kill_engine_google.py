@@ -76,10 +76,11 @@ def shopify_revenue(tok, run_date):
     # GROSS sales by design — we do NOT subtract refunds. A refund is usually an order
     # issue (size/shipping/changed mind), not a sign the product is bad; if it sold, it
     # counts. So a refunded sale still proves the product can sell and won't be killed for it.
+    # Discounts DO count (2026-07-03): revenue = amount actually paid after ALL discounts (incl order-level).
     since=(run_date-datetime.timedelta(days=31)).isoformat()
     now_uk=datetime.datetime.now(UK)                                 # precise clock for rolling N×24h windows (include today)
     Q=('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s"){'
-       'pageInfo{hasNextPage endCursor} edges{node{id createdAt '
+       'pageInfo{hasNextPage endCursor} edges{node{id createdAt subtotalPriceSet{shopMoney{amount}} '
        'lineItems(first:100){edges{node{product{legacyResourceId} discountedTotalSet{shopMoney{amount}}}}}}}}}' % since)
     rev=collections.defaultdict(lambda:[0.0,0.0,0.0])
     orders=collections.defaultdict(lambda:[set(),set(),set()])
@@ -87,13 +88,20 @@ def shopify_revenue(tok, run_date):
     while True:
         c=_gql(tok,Q,{'c':cur})['data']['orders']
         for e in c['edges']:
-            oid=e['node']['id']
-            ca_dt=datetime.datetime.fromisoformat(e['node']['createdAt'].replace('Z','+00:00')).astimezone(UK)
+            node=e['node']; oid=node['id']
+            ca_dt=datetime.datetime.fromisoformat(node['createdAt'].replace('Z','+00:00')).astimezone(UK)
             delta=(now_uk-ca_dt).total_seconds()/86400.0        # rolling age in days -> window = last N×24h INCLUDING today
-            for li in e['node']['lineItems']['edges']:
+            # DISCOUNT ALLOCATION: order-level "ACROSS" discounts (Buy-2-10%-off) are NOT pushed into line
+            # discountedTotalSet, so summing lines over-states revenue. subtotalPriceSet = revenue after ALL
+            # discounts, GROSS of refunds (original field) -> scale each line so rev = what it actually sold for.
+            line_sum=sum(float(li['node']['discountedTotalSet']['shopMoney']['amount'])
+                         for li in node['lineItems']['edges'] if li['node'].get('product'))
+            _sub=(node.get('subtotalPriceSet') or {}).get('shopMoney',{}).get('amount')
+            factor=((float(_sub)/line_sum) if (_sub is not None and line_sum>0) else 1.0)
+            for li in node['lineItems']['edges']:
                 pr=li['node'].get('product')
                 if not pr: continue
-                pid=norm(pr['legacyResourceId']); amt=float(li['node']['discountedTotalSet']['shopMoney']['amount'])
+                pid=norm(pr['legacyResourceId']); amt=float(li['node']['discountedTotalSet']['shopMoney']['amount'])*factor
                 for i,d in enumerate((7,14,30)):
                     if 0<=delta<=d: rev[pid][i]+=amt; orders[pid][i].add(oid)   # rolling, INCLUDES today
         if c['pageInfo']['hasNextPage']: cur=c['pageInfo']['endCursor']
