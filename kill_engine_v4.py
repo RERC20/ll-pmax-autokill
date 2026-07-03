@@ -224,6 +224,13 @@ def evaluate(p, run_date, is_monday):
             return ('KILL','Tier 3',f'stale: £{cost30:.2f}, £0 rev')
         if is_monday and dl>=21 and clk<5:
             return ('KILL','Tier 4',f'ghost: {clk} clicks/{dl}d')
+    # ---- Tier 7 backstop: slow dribblers under Tier 6's radar (owner 2026-07-03) ----
+    # Tier 6 needs cost7>=5 (>= £0.71/day), so a product bleeding £3-4/week at ROAS<2 never
+    # trips it. 30d window = burn rates down to ~£0.33/day AND a less noisy ROAS at tiny
+    # spend (one order flips a 7d read). Evaluated LAST so fast bleeders keep Tier 1-6
+    # labels; the 14d-sale shield does NOT apply (this is performance-based, like Tier 6).
+    if cost30>=10 and rev30<1.5*cost30:
+        return ('KILL','Tier 7',f'dribbler: ROAS30={(rev30/cost30):.2f}<1.5, £{cost30:.2f}/30d')
     return ('KEEP',None,'no tier triggered')
 
 # ── logging ──────────────────────────────────────────────────────────────
