@@ -140,6 +140,20 @@ def do_end(tok, today, dry, force):
     rows[today.isoformat()] = row; write_history(rows)
     send_telegram(msg)
 
+def resolve_mode(now, event, explicit):
+    """Decide start / end / skip.
+      - explicit start|end always wins (manual / gh runs).
+      - repository_dispatch = the ONE dedicated grid cron (fires 00:11, 00:49, 23:11, 23:49 UK).
+        Minute-aware so only the two INTENDED snapshots act: 00:11->start, 23:49->end; the other
+        two ticks -> skip (idempotency would catch them anyway; this just avoids a wasted count).
+      - schedule / other = tolerant hour-only split (survives GitHub's best-effort lateness)."""
+    if explicit in ('start', 'end'): return explicit
+    h, m = now.hour, now.minute
+    if event == 'repository_dispatch':
+        if h < 12:  return 'start' if m < 30 else 'skip'
+        return 'end' if m >= 30 else 'skip'
+    return 'start' if h < 12 else 'end'
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--mode', choices=['start', 'end', 'auto'], default='auto')
@@ -147,9 +161,11 @@ def main():
     ap.add_argument('--force', action='store_true')
     a = ap.parse_args()
     now = datetime.datetime.now(UK); today = now.date()
-    mode = a.mode
-    if mode == 'auto': mode = 'start' if now.hour < 12 else 'end'
+    explicit = a.mode if a.mode in ('start', 'end') else None
+    mode = resolve_mode(now, os.environ.get('GITHUB_EVENT_NAME', ''), explicit)
     print(f"daily_product_count | UK now={now:%Y-%m-%d %H:%M} | mode={mode}{' (dry)' if a.dry else ''}")
+    if mode == 'skip':
+        print("grid tick outside the intended 00:11 / 23:49 windows — nothing to do."); return
     tok = shopify_token()
     (do_start if mode == 'start' else do_end)(tok, today, a.dry, a.force)
 
