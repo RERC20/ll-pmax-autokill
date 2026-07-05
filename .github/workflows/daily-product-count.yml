@@ -17,6 +17,13 @@ name: Daily Product Count (start + end of day)
 #      cron-job.org, which handles DST automatically. Auto-mode + idempotency keep it safe either way.
 
 on:
+  # PRIMARY: one DEDICATED cron-job.org job hits this via repository_dispatch with the unique
+  # event type "daily-product-count" -- a different mechanism + name from the kill engine's
+  # workflow_dispatch, so the two cron jobs can never be confused or overlap. The single job
+  # fires at BOTH 00:11 and 23:49 (Europe/London); mode auto-resolves from the UK clock.
+  repository_dispatch:
+    types: [daily-product-count]
+  # manual / gh-cli runs (pick a mode, or leave auto)
   workflow_dispatch:
     inputs:
       mode:
@@ -25,6 +32,8 @@ on:
         default: 'auto'
         type: choice
         options: [auto, start, end]
+  # BACKUP only: GitHub's own schedule (best-effort, set for BST). Cannot overlap the kill engine
+  # (that workflow has no schedule). Safe to leave on; the dedicated cron above is the punctual one.
   schedule:
     - cron: '11 23 * * *'   # 00:11 BST  -> START of day (backup)
     - cron: '49 22 * * *'   # 23:49 BST  -> END of day   (backup)
