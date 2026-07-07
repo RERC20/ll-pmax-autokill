@@ -82,6 +82,57 @@ def write_history(rows):
 
 def fmt_date(d): return d.strftime('%a %-d %b %Y') if os.name != 'nt' else d.strftime('%a ') + str(d.day) + d.strftime(' %b %Y')
 
+def usd_rate():
+    """Live GBP->USD (open.er-api primary, frankfurter/ECB fallback, sanity-guarded, last-resort const)."""
+    for url in ('https://open.er-api.com/v6/latest/GBP', 'https://api.frankfurter.app/latest?from=GBP&to=USD'):
+        try:
+            r = (requests.get(url, timeout=15).json().get('rates') or {}).get('USD')
+            if r and 0.5 < float(r) < 3.0: return float(r)
+        except Exception: pass
+    return 1.27
+
+def todays_money(tok, today):
+    """Today's Shopify NET revenue (GBP, PNL basis) + order & item counts, and Google ad spend today (GBP)."""
+    since = (today - datetime.timedelta(days=1)).isoformat()
+    Q = ('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s"){pageInfo{hasNextPage endCursor} '
+         'edges{node{createdAt currentTotalPriceSet{shopMoney{amount}} lineItems(first:100){edges{node{quantity}}}}}}}' % since)
+    rev = 0.0; orders = 0; items = 0; cur = None
+    while True:
+        d = _gql(tok, Q, {'c': cur})['data']['orders']
+        for e in d['edges']:
+            dt = datetime.datetime.fromisoformat(e['node']['createdAt'].replace('Z', '+00:00')).astimezone(UK).date()
+            if dt != today: continue
+            orders += 1
+            rev += float((e['node'].get('currentTotalPriceSet') or {}).get('shopMoney', {}).get('amount') or 0)
+            items += sum(int(li['node'].get('quantity', 0) or 0) for li in e['node']['lineItems']['edges'])
+        if not d['pageInfo']['hasNextPage']: break
+        cur = d['pageInfo']['endCursor']
+    cost = None                                                     # Google ad spend today; graceful if unavailable
+    try:
+        import google_ads_connect as ga
+        r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/googleAds:search",
+                          headers=ga._headers(ga.get_access_token()),
+                          json={'query': "SELECT metrics.cost_micros FROM customer WHERE segments.date DURING TODAY"}, timeout=60)
+        if r.status_code == 200:
+            cost = sum(int(row['metrics'].get('costMicros', 0)) / 1e6 for row in r.json().get('results', []))
+    except Exception as ex:
+        print(f"(ad spend unavailable: {str(ex)[:80]})")
+    return dict(rev_gbp=rev, orders=orders, items=items, cost_gbp=cost)
+
+def money_block(m):
+    """USD-first money summary appended under the product stats in the END message."""
+    rate = usd_rate(); rev_u = m['rev_gbp'] * rate
+    cost_g = m['cost_gbp']; cost_u = (cost_g * rate) if cost_g is not None else None
+    roas = (m['rev_gbp'] / cost_g) if (cost_g and cost_g > 0) else None
+    cpt = (cost_u / m['orders']) if (cost_u is not None and m['orders'] > 0) else None
+    L = [f"Sales revenue  ${rev_u:,.2f}  (£{m['rev_gbp']:,.2f})",
+         "Ad spend       " + (f"${cost_u:,.2f}  (£{cost_g:,.2f})" if cost_u is not None else "n/a"),
+         "ROAS           " + (f"{roas:.2f}" if roas is not None else "-"),
+         "Cost / txn     " + (f"${cpt:,.2f}" if cpt is not None else "-"),
+         f"Orders         {m['orders']}",
+         f"Items ordered  {m['items']}"]
+    return f"━━━━━━━━━━━\n\U0001F4B0 <b>TODAY</b>  (USD @ {rate:.3f})\n<pre>" + "\n".join(L) + "</pre>"
+
 def do_start(tok, today, dry, force):
     if not force and os.path.exists(STATE_FILE):
         try: st = json.load(open(STATE_FILE, encoding='utf-8'))
@@ -134,8 +185,10 @@ def do_end(tok, today, dry, force):
                "━━━━━━━━━━━\n"
                f"Active at end: <b>{end_n}</b>\n"
                "<i>(start-of-day snapshot missing — no diff this day)</i>")
-    print(f"[END {today}] start={start_n} end={end_n} published={published} killed={killed} net={net}")
-    print(msg.replace('<b>','').replace('</b>','').replace('<i>','').replace('</i>',''))
+    m = todays_money(tok, today); msg += "\n" + money_block(m)     # money block UNDER the product stats
+    print(f"[END {today}] start={start_n} end={end_n} published={published} killed={killed} net={net} | "
+          f"rev£{m['rev_gbp']:.2f} spend£{(m['cost_gbp'] or 0):.2f} orders={m['orders']} items={m['items']}")
+    print(msg.replace('<b>','').replace('</b>','').replace('<i>','').replace('</i>','').replace('<pre>','').replace('</pre>',''))
     if dry: print("(dry-run: not sending / not writing history)"); return
     row = rows.get(today.isoformat(), {c: '' for c in HIST_COLS}); row['date'] = today.isoformat()
     if start_n is not None and (row.get('start_count') in ('', None)): row['start_count'] = start_n

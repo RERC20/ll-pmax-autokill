@@ -80,6 +80,11 @@ jobs:
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_SUMMARY_BOT_TOKEN: ${{ secrets.TELEGRAM_SUMMARY_BOT_TOKEN }}
           TELEGRAM_SUMMARY_CHAT_ID:   ${{ secrets.TELEGRAM_SUMMARY_CHAT_ID }}
+          GOOGLE_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_DEVELOPER_TOKEN }}
+          GOOGLE_CLIENT_ID:       ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET:   ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN:   ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GOOGLE_CUSTOMER_ID:     ${{ secrets.GOOGLE_CUSTOMER_ID }}
         run: python daily_product_count.py --mode ${{ github.event.inputs.mode || 'auto' }}
 
       - name: Save count state
