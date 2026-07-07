@@ -78,7 +78,12 @@ def shopify_revenue(tok, run_date):
     # counts. So a refunded sale still proves the product can sell and won't be killed for it.
     # Discounts DO count (2026-07-03): revenue = amount actually paid after ALL discounts (incl order-level).
     since=(run_date-datetime.timedelta(days=31)).isoformat()
-    now_uk=datetime.datetime.now(UK)                                 # precise clock for rolling N×24h windows (include today)
+    # CALENDAR windows aligned to the Google cost query (segments.date BETWEEN start..today) AND the
+    # dashboard, so revenue and cost cover the SAME dates (owner 2026-07-07). Replaced the rolling
+    # 7x24h window, which counted a sale's revenue against a cost window that excluded that sale's day —
+    # letting an old sale shield no-sale / below-2.0 products. An order counts in window N iff its UK
+    # calendar date is within [run_date-(N-1), run_date].
+    win_start=[run_date-datetime.timedelta(days=6), run_date-datetime.timedelta(days=13), run_date-datetime.timedelta(days=29)]
     Q=('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s"){'
        'pageInfo{hasNextPage endCursor} edges{node{id createdAt subtotalPriceSet{shopMoney{amount}} '
        'lineItems(first:100){edges{node{product{legacyResourceId} discountedTotalSet{shopMoney{amount}}}}}}}}}' % since)
@@ -89,8 +94,7 @@ def shopify_revenue(tok, run_date):
         c=_gql(tok,Q,{'c':cur})['data']['orders']
         for e in c['edges']:
             node=e['node']; oid=node['id']
-            ca_dt=datetime.datetime.fromisoformat(node['createdAt'].replace('Z','+00:00')).astimezone(UK)
-            delta=(now_uk-ca_dt).total_seconds()/86400.0        # rolling age in days -> window = last N×24h INCLUDING today
+            ca_date=datetime.datetime.fromisoformat(node['createdAt'].replace('Z','+00:00')).astimezone(UK).date()  # UK calendar date
             # DISCOUNT ALLOCATION: order-level "ACROSS" discounts (Buy-2-10%-off) are NOT pushed into line
             # discountedTotalSet, so summing lines over-states revenue. subtotalPriceSet = revenue after ALL
             # discounts, GROSS of refunds (original field) -> scale each line so rev = what it actually sold for.
@@ -102,8 +106,8 @@ def shopify_revenue(tok, run_date):
                 pr=li['node'].get('product')
                 if not pr: continue
                 pid=norm(pr['legacyResourceId']); amt=float(li['node']['discountedTotalSet']['shopMoney']['amount'])*factor
-                for i,d in enumerate((7,14,30)):
-                    if 0<=delta<=d: rev[pid][i]+=amt; orders[pid][i].add(oid)   # rolling, INCLUDES today
+                for i in range(3):                                              # 0=7d, 1=14d, 2=30d
+                    if win_start[i]<=ca_date<=run_date: rev[pid][i]+=amt; orders[pid][i].add(oid)   # calendar, matches cost
         if c['pageInfo']['hasNextPage']: cur=c['pageInfo']['endCursor']
         else: break
     cnt={pid:[len(s) for s in sets] for pid,sets in orders.items()}
