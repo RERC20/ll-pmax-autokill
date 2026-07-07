@@ -185,9 +185,12 @@ def do_end(tok, today, dry, force):
                "━━━━━━━━━━━\n"
                f"Active at end: <b>{end_n}</b>\n"
                "<i>(start-of-day snapshot missing — no diff this day)</i>")
-    m = todays_money(tok, today); msg += "\n" + money_block(m)     # money block UNDER the product stats
-    print(f"[END {today}] start={start_n} end={end_n} published={published} killed={killed} net={net} | "
-          f"rev£{m['rev_gbp']:.2f} spend£{(m['cost_gbp'] or 0):.2f} orders={m['orders']} items={m['items']}")
+    try:                                                           # money block UNDER the product stats;
+        m = todays_money(tok, today); msg += "\n" + money_block(m)  # NEVER let a money-fetch error block the
+        print(f"[END {today}] start={start_n} end={end_n} published={published} killed={killed} net={net} | "  # daily send
+              f"rev£{m['rev_gbp']:.2f} spend£{(m['cost_gbp'] or 0):.2f} orders={m['orders']} items={m['items']}")
+    except Exception as ex:
+        print(f"[END {today}] money block FAILED, sending counts only: {str(ex)[:140]}")
     print(msg.replace('<b>','').replace('</b>','').replace('<i>','').replace('</i>','').replace('<pre>','').replace('</pre>',''))
     if dry: print("(dry-run: not sending / not writing history)"); return
     row = rows.get(today.isoformat(), {c: '' for c in HIST_COLS}); row['date'] = today.isoformat()
