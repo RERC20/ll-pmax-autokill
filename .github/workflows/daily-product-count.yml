@@ -78,6 +78,8 @@ jobs:
           SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
           TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_SUMMARY_BOT_TOKEN: ${{ secrets.TELEGRAM_SUMMARY_BOT_TOKEN }}
+          TELEGRAM_SUMMARY_CHAT_ID:   ${{ secrets.TELEGRAM_SUMMARY_CHAT_ID }}
         run: python daily_product_count.py --mode ${{ github.event.inputs.mode || 'auto' }}
 
       - name: Save count state

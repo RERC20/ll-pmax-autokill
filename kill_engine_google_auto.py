@@ -23,7 +23,7 @@
 #   RESEND_API_KEY  (free key from resend.com; twice-daily digest; signup inbox == EMAIL_TO)
 # Any unset channel is simply skipped (the run still drafts + logs).
 # ---------------------------------------------------------------------------
-import sys, os, csv, base64, datetime, collections, requests
+import sys, os, csv, base64, html, datetime, collections, requests
 from openpyxl import Workbook
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 from zoneinfo import ZoneInfo
@@ -44,6 +44,20 @@ TELEGRAM_CHAT  = cred('TELEGRAM_CHAT_ID')       # your numeric chat id (@userinf
 SUMMARY_HOURS  = (9, 21)                        # UK hours for the twice-a-day (every 12h) email digest
 RUN_LOG        = 'kill_engine_auto_runs.log'
 KILLS_LOG      = 'kills_log_auto.csv'
+
+# ── Telegram kill formatting: plain-English tier + the rule's reason + core metrics ──
+TIER_LABEL = {
+    'Tier 1': 'Tier 1 — no sale (70+ clicks)', 'Tier 2': 'Tier 2 — no sale (£5+ or 40+ clicks)',
+    'Tier 3': 'Tier 3 — Mon stale no-sale',    'Tier 4': 'Tier 4 — Mon ghost (<5 clicks)',
+    'Tier 5': 'Tier 5 — stalled winner',       'Tier 6': 'Tier 6 — below 2.0 ROAS (7d)',
+    'Tier 7': 'Tier 7 — slow dribbler (30d)'}
+def _fmt_kill(p, tier, why, run_date):
+    dl = (run_date - datetime.date.fromisoformat(p['pub'])).days
+    return (f"• <b>{html.escape(p['name'][:46])}</b>\n"
+            f"  <code>{p['pid']}</code> · <b>{TIER_LABEL.get(tier, tier)}</b> · {dl}d live\n"
+            f"  ↳ why: {html.escape(str(why))}\n"
+            f"  ↳ spend 7d £{p['cost7']:.2f} / 30d £{p['cost30']:.2f} · ROAS7 {p['roas7']:.2f} · "
+            f"rev 30d £{p['rev30']:.2f} · {p['clicks30']} clk")
 
 def _days_live(p, run_date):
     return (run_date - datetime.date.fromisoformat(p['pub'])).days
@@ -232,9 +246,10 @@ def main():
               f"{ts} UK · {run_date.strftime('%a')}\n"
               f"Active: {len(feed)} | kills found: {len(kills)} | drafted: {n}")
         if to_draft:
-            tg += "\n\n" + "\n".join(f"• <code>{p['pid']}</code> [{tier}] {p['name'][:38]}"
-                                     for p, tier, why in to_draft[:25])
-            if len(to_draft) > 25: tg += f"\n…+{len(to_draft)-25} more"
+            DETAIL = 15                                     # full reason+metrics for up to 15; rest in the Excel
+            tg += "\n\n" + "\n\n".join(_fmt_kill(p, tier, why, run_date) for p, tier, why in to_draft[:DETAIL])
+            if len(to_draft) > DETAIL:
+                tg += f"\n\n…+{len(to_draft)-DETAIL} more — full reasons &amp; metrics in the attached Excel."
         send_telegram(tg, xlsx)
 
         # RESEND email — twice a day (SUMMARY_HOURS): TEXT digest of last 12h + the .xlsx

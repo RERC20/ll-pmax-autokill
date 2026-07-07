@@ -32,8 +32,11 @@ UK = ZoneInfo('Europe/London')
 STATE_FILE   = '_product_count_state.json'
 HISTORY_FILE = '_product_count_history.csv'
 HIST_COLS    = ['date', 'start_count', 'end_count', 'published', 'killed', 'net']
-TG_TOKEN = cred('TELEGRAM_BOT_TOKEN')
-TG_CHAT  = cred('TELEGRAM_CHAT_ID')
+# DEDICATED bot for the daily summary / active-product counts, so these land in a SEPARATE chat
+# from the auto-kill messages (owner 2026-07-07). Falls back to the shared auto-kill bot if the
+# SUMMARY_* vars aren't set yet, so nothing breaks before the 2nd bot is created.
+TG_TOKEN = cred('TELEGRAM_SUMMARY_BOT_TOKEN') or cred('TELEGRAM_BOT_TOKEN')
+TG_CHAT  = cred('TELEGRAM_SUMMARY_CHAT_ID')  or cred('TELEGRAM_CHAT_ID')
 
 def _gql(tok, q, v=None):
     return requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
