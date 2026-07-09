@@ -18,12 +18,15 @@ permissions:
   contents: read                 # read-only -- we no longer commit anything back to the repo
 
 concurrency:
-  group: auto-kill               # never let two runs overlap
-  cancel-in-progress: false
+  group: auto-kill               # one run at a time; a new 8-min trigger SUPERSEDES a stuck/queued
+  cancel-in-progress: true       # run instead of piling up. Safe: the engine re-evaluates every run
+                                 # (idempotent), so cancelling a stale run loses nothing.
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 6           # a hung execution fails fast so the next 8-min run isn't delayed
+                                 # (normal run is ~20-40s; GitHub runner-queue waits are separate)
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
