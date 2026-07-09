@@ -5,38 +5,39 @@ name: Daily Product Count (start + end of day)
 # Shopify keeps no such history, so this is our own permanent record (kept in the private Actions
 # cache, never committed — same privacy model as the kill engine's kills_log).
 #
-# TIMING (UK): start ~00:11 (12:01 AM + ~10 min latency buffer), end ~23:49 (11:59 PM - ~10 min).
-# The mode is auto-resolved from the UK clock (hour < 12 = start, else end), and every action is
-# idempotent-by-UK-date, so an extra/late trigger can never double-send.
+# TIMING (UK): a single ROLLOVER just after midnight (00:11). It sends YESTERDAY's END + PNL
+# (numbers now settled -- Google ad spend for a still-live day isn't final until the day closes)
+# AND today's START, in one run. The 00:49 grid tick repeats it as a free idempotent RETRY if the
+# 00:11 run was dropped by a GitHub runner blip. Every action is idempotent-by-UK-date, so an
+# extra/late/retry trigger can never double-send.
 #
-# PRIMARY trigger = external cron (cron-job.org, Europe/London, DST-correct) hitting the
-# workflow_dispatch API at 00:11 and 23:49 with inputs.mode = start / end (punctual).
+# PRIMARY trigger = external cron (cron-job.org, Europe/London, DST-correct). Its grid still hits
+# this at 00:11/00:49/23:11/23:49; the script now acts ONLY on the morning ticks (rollover) and
+# skips the rest -- so NOTHING needs changing on cron-job.org.
 # BACKUP trigger  = GitHub's own schedule below (best-effort, set for BST / summer).
-#   >> DST NOTE: the two schedule lines are UTC and tuned for BST (UTC+1). When the UK falls back
-#      to GMT (late Oct), shift both by +1h (11 23 -> 11 0, 49 22 -> 49 23) OR just rely on
-#      cron-job.org, which handles DST automatically. Auto-mode + idempotency keep it safe either way.
+#   >> DST NOTE: the schedule line is UTC, tuned for BST (UTC+1). In GMT (late Oct) shift it
+#      (11 23 -> 11 0) OR just rely on cron-job.org, which handles DST automatically.
 
 on:
   # PRIMARY: one DEDICATED cron-job.org job hits this via repository_dispatch with the unique
   # event type "daily-product-count" -- a different mechanism + name from the kill engine's
-  # workflow_dispatch, so the two cron jobs can never be confused or overlap. The single job
-  # fires at BOTH 00:11 and 23:49 (Europe/London); mode auto-resolves from the UK clock.
+  # workflow_dispatch, so the two cron jobs can never be confused or overlap. Its grid fires
+  # 00:11/00:49/23:11/23:49 (Europe/London); the script acts only on the morning ticks (rollover).
   repository_dispatch:
     types: [daily-product-count]
   # manual / gh-cli runs (pick a mode, or leave auto)
   workflow_dispatch:
     inputs:
       mode:
-        description: 'start | end | auto'
+        description: 'start | end | rollover | auto'
         required: false
         default: 'auto'
         type: choice
-        options: [auto, start, end]
+        options: [auto, rollover, start, end]
   # BACKUP only: GitHub's own schedule (best-effort, set for BST). Cannot overlap the kill engine
   # (that workflow has no schedule). Safe to leave on; the dedicated cron above is the punctual one.
   schedule:
-    - cron: '11 23 * * *'   # 00:11 BST  -> START of day (backup)
-    - cron: '49 22 * * *'   # 23:49 BST  -> END of day   (backup)
+    - cron: '11 23 * * *'   # 00:11 BST  -> ROLLOVER (yesterday END+PNL, today START) — backup only
 
 permissions:
   contents: read            # never commits back; state lives in the private cache

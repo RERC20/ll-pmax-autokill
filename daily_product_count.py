@@ -112,7 +112,7 @@ def todays_money(tok, today):
         import google_ads_connect as ga
         r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/googleAds:search",
                           headers=ga._headers(ga.get_access_token()),
-                          json={'query': "SELECT metrics.cost_micros FROM customer WHERE segments.date DURING TODAY"}, timeout=60)
+                          json={'query': f"SELECT metrics.cost_micros FROM customer WHERE segments.date = '{today.isoformat()}'"}, timeout=60)
         if r.status_code == 200:
             cost = sum(int(row['metrics'].get('costMicros', 0)) / 1e6 for row in r.json().get('results', []))
     except Exception as ex:
@@ -131,7 +131,7 @@ def money_block(m):
          "Cost / txn     " + (f"${cpt:,.2f}" if cpt is not None else "-"),
          f"Orders         {m['orders']}",
          f"Items ordered  {m['items']}"]
-    return f"━━━━━━━━━━━\n\U0001F4B0 <b>TODAY</b>  (USD @ {rate:.3f})\n<pre>" + "\n".join(L) + "</pre>"
+    return f"━━━━━━━━━━━\n\U0001F4B0 <b>DAY PNL</b>  (USD @ {rate:.3f})\n<pre>" + "\n".join(L) + "</pre>"
 
 def do_start(tok, today, dry, force):
     if not force and os.path.exists(STATE_FILE):
@@ -200,33 +200,35 @@ def do_end(tok, today, dry, force):
     send_telegram(msg)
 
 def resolve_mode(now, event, explicit):
-    """Decide start / end / skip.
-      - explicit start|end always wins (manual / gh runs).
-      - repository_dispatch = the ONE dedicated grid cron (fires 00:11, 00:49, 23:11, 23:49 UK).
-        Minute-aware so only the two INTENDED snapshots act: 00:11->start, 23:49->end; the other
-        two ticks -> skip (idempotency would catch them anyway; this just avoids a wasted count).
-      - schedule / other = tolerant hour-only split (survives GitHub's best-effort lateness)."""
-    if explicit in ('start', 'end'): return explicit
-    h, m = now.hour, now.minute
-    if event == 'repository_dispatch':
-        if h < 12:  return 'start' if m < 30 else 'skip'
-        return 'end' if m >= 30 else 'skip'
-    return 'start' if h < 12 else 'end'
+    """Decide rollover / start / end / skip.
+      - explicit start|end|rollover always wins (manual / gh runs).
+      - 'rollover' fires just after midnight (the grid's 00:11 UK tick): it closes out YESTERDAY
+        (END + now-settled PNL) AND opens TODAY (START) in one run — so the PNL reports a FINISHED
+        day, not a still-live one. The grid's 00:49 tick also -> rollover: a free idempotent RETRY
+        if the 00:11 run was dropped by a GitHub runner blip.
+      - all afternoon/evening ticks (23:11, 23:49 UK) -> skip."""
+    if explicit in ('start', 'end', 'rollover'): return explicit
+    return 'rollover' if now.hour < 12 else 'skip'
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', choices=['start', 'end', 'auto'], default='auto')
+    ap.add_argument('--mode', choices=['start', 'end', 'rollover', 'auto'], default='auto')
     ap.add_argument('--dry', action='store_true')
     ap.add_argument('--force', action='store_true')
     a = ap.parse_args()
     now = datetime.datetime.now(UK); today = now.date()
-    explicit = a.mode if a.mode in ('start', 'end') else None
+    explicit = a.mode if a.mode in ('start', 'end', 'rollover') else None
     mode = resolve_mode(now, os.environ.get('GITHUB_EVENT_NAME', ''), explicit)
     print(f"daily_product_count | UK now={now:%Y-%m-%d %H:%M} | mode={mode}{' (dry)' if a.dry else ''}")
     if mode == 'skip':
-        print("grid tick outside the intended 00:11 / 23:49 windows — nothing to do."); return
+        print("grid tick outside the 00:11 rollover window — nothing to do."); return
     tok = shopify_token()
-    (do_start if mode == 'start' else do_end)(tok, today, a.dry, a.force)
+    if mode == 'rollover':                          # just after midnight: close yesterday, open today
+        yest = today - datetime.timedelta(days=1)
+        do_end(tok, yest, a.dry, a.force)           # yesterday's END + settled PNL (reads yesterday's START)
+        do_start(tok, today, a.dry, a.force)        # today's START (overwrites state)
+    else:
+        (do_start if mode == 'start' else do_end)(tok, today, a.dry, a.force)
 
 if __name__ == '__main__':
     main()
