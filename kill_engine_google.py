@@ -23,7 +23,17 @@ from kill_engine_v4 import evaluate, norm, shopify_token, shopify_draft, _Tee, S
 from zoneinfo import ZoneInfo
 UK = ZoneInfo('Europe/London')                              # store + Google Ads account run on UK time
 
-PMAX_CAMPAIGN_ID = '23620737018'                             # PMAX | Feed Only | All Products | UK (FYI)
+PMAX_CAMPAIGN_ID = '23620737018'                             # now "PMax | Winners | UK" (was all-products)
+# ── CAMPAIGN SPLIT (2026-07-11) ──────────────────────────────────────────────
+# After the Testing/Winners split, the kill engine judges ONLY the Testing
+# campaign. Winners are exempt anyway (tag-skip in the auto runner), but scoping
+# the Google spend query to Testing makes it unambiguous: kills are driven purely
+# by how a product performs in Testing, never by Winners-campaign spend.
+# NOTE (transition): spend before the 11-Jul split lived in the old all-products
+# campaign (id 23620737018, now Winners), so it drops out of this scoped view.
+# That's intentional - products get a clean evaluation slate in the new Testing
+# campaign; the £40/day budget caps any bleed while data re-accumulates.
+TESTING_CAMPAIGN_ID = '24027270949'                          # PMax | Testing | UK — the only campaign killed
 RUN_LOG   = 'kill_engine_google_runs.log'
 KILLS_LOG = 'kills_log_google.csv'
 
@@ -46,8 +56,9 @@ def google_product_perf(run_date):
     end=run_date.isoformat()                                        # TODAY (included)
     for win,days in (('7',7),('30',30)):
         start=(run_date-datetime.timedelta(days=days-1)).isoformat()  # today + (N-1) prior days = N dates
-        q=(f"SELECT segments.product_item_id, metrics.cost_micros, metrics.clicks "
-           f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{end}'")
+        q=(f"SELECT campaign.id, segments.product_item_id, metrics.cost_micros, metrics.clicks "
+           f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{end}' "
+           f"AND campaign.id = {TESTING_CAMPAIGN_ID}")   # ONLY the Testing campaign (split 2026-07-11)
         for row in search(q):
             parts=str(row['segments']['productItemId']).split('_')      # shopify_zz_<pid>_<vid>
             pid=norm(parts[2]) if len(parts)>=3 else None
