@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 # reuse the EXACT feed + rules + Shopify write + logging from the existing engines
 from kill_engine_google import build_feed
-from kill_engine_v4 import evaluate, shopify_token, shopify_draft, _Tee
+from kill_engine_v4 import evaluate, shopify_token, shopify_draft, _Tee, SHOP, SHOP_API
 from creds import cred                          # env -> _secrets_local.py -> '' (so local testing works too)
 
 UK = ZoneInfo('Europe/London')                 # store + Google Ads account run on UK time
@@ -61,6 +61,46 @@ def _fmt_kill(p, tier, why, run_date):
 
 def _days_live(p, run_date):
     return (run_date - datetime.date.fromisoformat(p['pub'])).days
+
+# ── WINNERS (w_campaign): tag + exempt (owner-approved 2026-07-11) ──────────
+# A product with >=1 Shopify sale (GROUND TRUTH — never depends on Google's
+# under-reporting) that is still ACTIVE is a "winner". It gets the w_campaign
+# tag, which does two things:
+#   (a) Simprosys rule maps tag -> custom_label_1=w_campaign -> the product hops
+#       from the Testing PMax campaign to the Winners campaign on the next
+#       feed sync (near-real-time, tag changes fire Shopify webhooks);
+#   (b) EXEMPTS it from this engine's kill rules — winners will get their OWN
+#       rules later; until then NO product with a sale is ever drafted here.
+#       Only never-sold products (Tiers 1-4 territory) keep dying.
+# First sales always appear in rev30 (live Shopify orders pull) within one
+# 8-min run. Sales older than 30d were tagged by the one-off backfill
+# (backfill_winner_tags.py, run 2026-07-11) — so rev30>0 is a complete signal
+# for every NEW first sale going forward.
+WINNER_TAG = 'w_campaign'
+
+def shopify_add_tag(tok, pid, tag):
+    m = 'mutation($id:ID!,$t:[String!]!){tagsAdd(id:$id,tags:$t){userErrors{message}}}'
+    try:
+        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                          json={'query': m, 'variables': {'id': f"gid://shopify/Product/{pid}", 't': [tag]}},
+                          timeout=30).json()
+        errs = (j.get('data', {}).get('tagsAdd') or {}).get('userErrors') or []
+        return 'ok' if not errs else f"err: {errs[0].get('message', '?')[:60]}"
+    except Exception as ex:
+        return f"err: {ex}"
+
+def tag_new_winners(feed, dry):
+    """Tag every ACTIVE product with a Shopify sale (rev30>0) not yet tagged w_campaign."""
+    new = [p for p in feed if p['rev30'] > 0 and WINNER_TAG not in p['tags']]
+    if not new:
+        return []
+    tok = None if dry else shopify_token()
+    for p in new:
+        res = 'DRY (not tagged)' if dry else shopify_add_tag(tok, p['pid'], WINNER_TAG)
+        print(f"  {'would tag' if dry else 'tag'} winner {p['pid']} -> {res} | {p['name'][:42]}")
+        p['tags'].append(WINNER_TAG)     # exempt from kill rules in THIS same run too
+    return new
 
 def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry):
     wb = Workbook()
@@ -215,8 +255,15 @@ def main():
                         f"PMax auto-kill — {ts} (UK)\nMode: {'DRY-RUN' if dry else 'LIVE'}\n\n{msg}")
             return
 
+        # WINNERS first: tag new 1+ sale actives, then EXEMPT all tagged from the kill rules
+        new_winners = tag_new_winners(feed, dry)
+        exempt = sum(1 for p in feed if WINNER_TAG in p['tags'])
+        print(f"winners: +{len(new_winners)} newly tagged | {exempt} total exempt from kill rules")
+
         kills = []
         for p in feed:
+            if WINNER_TAG in p['tags']:
+                continue                      # winners: separate rules later — never killed here
             dec, tier, why = evaluate(p, run_date, is_monday)
             if dec == 'KILL':
                 kills.append((p, tier, why))
@@ -244,7 +291,11 @@ def main():
         n = len(to_draft) if dry else drafted
         tg = (f"🤖 <b>Auto-Kill</b> — {n} drafted{' (DRY)' if dry else ''}\n"
               f"{ts} UK · {run_date.strftime('%a')}\n"
-              f"Active: {len(feed)} | kills found: {len(kills)} | drafted: {n}")
+              f"Active: {len(feed)} | winners exempt: {exempt} | kills found: {len(kills)} | drafted: {n}")
+        if new_winners:
+            tg += ("\n🏆 <b>new winners → w_campaign:</b> "
+                   + ", ".join(f"<code>{p['pid']}</code>" for p in new_winners[:10])
+                   + (f" +{len(new_winners)-10} more" if len(new_winners) > 10 else ""))
         if to_draft:
             DETAIL = 15                                     # full reason+metrics for up to 15; rest in the Excel
             tg += "\n\n" + "\n\n".join(_fmt_kill(p, tier, why, run_date) for p, tier, why in to_draft[:DETAIL])
