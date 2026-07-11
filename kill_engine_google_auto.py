@@ -90,6 +90,23 @@ def shopify_add_tag(tok, pid, tag):
     except Exception as ex:
         return f"err: {ex}"
 
+def shopify_set_label_metafield(tok, pid):
+    """Also write Simprosys's own attribute metafield (mm-google-shopping.custom_label_1).
+    The app's bulk-edit stores labels app-side, but it READS this metafield on its syncs —
+    so future winners pick up the feed label without a human touching the app. The Ads-API
+    item-ID mover (added after the campaigns exist) is the guaranteed instant path."""
+    m = ('mutation($mf:[MetafieldsSetInput!]!){metafieldsSet(metafields:$mf){userErrors{message}}}')
+    v = {'mf': [{'ownerId': f"gid://shopify/Product/{pid}", 'namespace': 'mm-google-shopping',
+                 'key': 'custom_label_1', 'type': 'single_line_text_field', 'value': WINNER_TAG}]}
+    try:
+        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                          json={'query': m, 'variables': v}, timeout=30).json()
+        errs = (j.get('data', {}).get('metafieldsSet') or {}).get('userErrors') or []
+        return 'ok' if not errs else f"err: {errs[0].get('message', '?')[:60]}"
+    except Exception as ex:
+        return f"err: {ex}"
+
 def tag_new_winners(feed, dry):
     """Tag every ACTIVE product with a Shopify sale (rev30>0) not yet tagged w_campaign."""
     new = [p for p in feed if p['rev30'] > 0 and WINNER_TAG not in p['tags']]
@@ -98,7 +115,8 @@ def tag_new_winners(feed, dry):
     tok = None if dry else shopify_token()
     for p in new:
         res = 'DRY (not tagged)' if dry else shopify_add_tag(tok, p['pid'], WINNER_TAG)
-        print(f"  {'would tag' if dry else 'tag'} winner {p['pid']} -> {res} | {p['name'][:42]}")
+        mres = 'DRY' if dry else shopify_set_label_metafield(tok, p['pid'])
+        print(f"  {'would tag' if dry else 'tag'} winner {p['pid']} -> {res} (label metafield: {mres}) | {p['name'][:42]}")
         p['tags'].append(WINNER_TAG)     # exempt from kill rules in THIS same run too
     return new
 
