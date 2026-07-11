@@ -44,7 +44,9 @@ jobs:
       - name: Restore kills history
         uses: actions/cache/restore@v4
         with:
-          path: kills_log_auto.csv
+          path: |
+            kills_log_auto.csv
+            winner_kills_log.csv
           key: kills-log-${{ github.run_id }}
           restore-keys: |
             kills-log-
@@ -69,5 +71,7 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: kills_log_auto.csv
+          path: |
+            kills_log_auto.csv
+            winner_kills_log.csv
           key: kills-log-${{ github.run_id }}

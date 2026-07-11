@@ -4,9 +4,12 @@
 # UNATTENDED Google-direct auto-kill — for running on a schedule (e.g. Claude
 # schedule / GitHub repo, hourly). Runs once when CALLED, no user input:
 #   1. Pull the live feed (Google Ads cost/clicks + Shopify revenue, UK tz).
-#   2. Apply the SAME v4 rules (evaluate) as the manual engine.
-#   3. DRAFT every flagged product in Shopify (no yes/no prompt).
-#   4. NOTIFY:
+#   2. Tag new winners (any Shopify sale) + fast-path them into the Winners campaign.
+#   3. WINNER PACE RULE (v11): kill winners whose Winners-campaign spend since
+#      their last sale exceeds that sale's revenue / 2.3 (see block below).
+#   4. Apply the SAME v4 rules (evaluate) to the TESTING pool (winners exempt).
+#   5. DRAFT every flagged product in Shopify (no yes/no prompt).
+#   6. NOTIFY:
 #        - TELEGRAM every run  -> run stats + the .xlsx (instant push, no daily cap)
 #        - RESEND email twice/day (SUMMARY_HOURS) -> a TEXT digest of the last 12h kills + the .xlsx
 #
@@ -29,7 +32,7 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 from zoneinfo import ZoneInfo
 
 # reuse the EXACT feed + rules + Shopify write + logging from the existing engines
-from kill_engine_google import build_feed
+from kill_engine_google import build_feed, PMAX_CAMPAIGN_ID as WINNERS_CAMPAIGN_ID
 from kill_engine_v4 import evaluate, shopify_token, shopify_draft, _Tee, SHOP, SHOP_API
 from creds import cred                          # env -> _secrets_local.py -> '' (so local testing works too)
 
@@ -77,6 +80,8 @@ def _days_live(p, run_date):
 # (backfill_winner_tags.py, run 2026-07-11) — so rev30>0 is a complete signal
 # for every NEW first sale going forward.
 WINNER_TAG = 'w_campaign'
+LOST_TAG   = 'l_camp'      # "lost" — WAS a winner, killed by the pace rule (v11). Set on winner
+                           # kills; stripped again if the product is ever resurrected and re-sells.
 
 def shopify_add_tag(tok, pid, tag):
     m = 'mutation($id:ID!,$t:[String!]!){tagsAdd(id:$id,tags:$t){userErrors{message}}}'
@@ -86,6 +91,18 @@ def shopify_add_tag(tok, pid, tag):
                           json={'query': m, 'variables': {'id': f"gid://shopify/Product/{pid}", 't': [tag]}},
                           timeout=30).json()
         errs = (j.get('data', {}).get('tagsAdd') or {}).get('userErrors') or []
+        return 'ok' if not errs else f"err: {errs[0].get('message', '?')[:60]}"
+    except Exception as ex:
+        return f"err: {ex}"
+
+def shopify_remove_tag(tok, pid, tag):
+    m = 'mutation($id:ID!,$t:[String!]!){tagsRemove(id:$id,tags:$t){userErrors{message}}}'
+    try:
+        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                          json={'query': m, 'variables': {'id': f"gid://shopify/Product/{pid}", 't': [tag]}},
+                          timeout=30).json()
+        errs = (j.get('data', {}).get('tagsRemove') or {}).get('userErrors') or []
         return 'ok' if not errs else f"err: {errs[0].get('message', '?')[:60]}"
     except Exception as ex:
         return f"err: {ex}"
@@ -116,6 +133,8 @@ def tag_new_winners(feed, dry):
     for p in new:
         res = 'DRY (not tagged)' if dry else shopify_add_tag(tok, p['pid'], WINNER_TAG)
         mres = 'DRY' if dry else shopify_set_label_metafield(tok, p['pid'])
+        if LOST_TAG in p['tags'] and not dry:
+            shopify_remove_tag(tok, p['pid'], LOST_TAG)   # resurrected + sold again: no longer "lost"
         print(f"  {'would tag' if dry else 'tag'} winner {p['pid']} -> {res} (label metafield: {mres}) | {p['name'][:42]}")
         p['tags'].append(WINNER_TAG)     # exempt from kill rules in THIS same run too
     return new
@@ -200,6 +219,207 @@ def ads_fast_path(new_winners, stok):
     except Exception as ex:
         print(f"  !! fast-path FAILED (harmless - label path still moves it on next feed sync): {ex}")
         return 0, str(ex)[:150]
+
+# ── WINNER PACE RULE (v11 — owner-approved 2026-07-12) ──────────────────────
+# The Winners campaign has ONE kill rule, the "2.3-pace" rule:
+#
+#     KILL when Winners-campaign spend SINCE THE LAST SALE > that sale's revenue / 2.3
+#     (winner with no sale in the lookback: allowance = product price / 2.3)
+#
+# Why 2.3: a kill line at 2.3-pace makes ~2.4 the survival standard, holding the
+# Winners campaign blended at the owner's 2.4+ target. Every sale opens a fresh
+# cycle and prepays EXACTLY its own revenue/2.3 of runway. Allowances never
+# stack — past glory never pays for the present.
+#
+# Owner-approved design decisions (2026-07-12 session):
+#   • Sales truth = Shopify, ANY channel (ads / organic / social / cross-sell).
+#     Google conversions & attribution are NEVER consulted. Revenue is GROSS
+#     with the same order-level discount scaling as the feed; refunds ignored.
+#   • Spend = Winners campaign ONLY, per-product per-DAY (Google's finest grain).
+#     The sale's own day is credited to the product — its new cycle is charged
+#     from the NEXT day. Kills can only fire late (~1 day of that product's
+#     spend), never early.
+#   • ANCHORED cycles: judged from the REAL last sale — "if it's a real winner
+#     it will hold". No fresh start at activation, no grace, no shields.
+#   • Kill = DRAFT + tags draft_bad_product + l_camp + pub: stamp, and the
+#     w_campaign tag is REMOVED. PERMANENT — no demotion back to Testing (a
+#     demoted ex-winner's conversion history would out-compete cold imports for
+#     Testing's Max-Conversions budget). Manual reactivation stays possible;
+#     if it then sells, tag_new_winners re-promotes it and strips l_camp.
+#   • Zero-spend products can never die (no spend, no crime): cross-sell and
+#     organic sellers are immortal and only lift the blended.
+#   • DORMANT until WINNER_KILL_START — before that date every run computes and
+#     reports would-kills (Telegram preview) but drafts nothing.
+#   • FAIL-SAFE: any error in this section skips winner kills for the run and
+#     warns — it can never block or distort the testing kills. A glitchy run
+#     that flags more than WINNER_KILL_CAP winners aborts (data glitch guard,
+#     same philosophy as the testing KILL_CAP).
+WINNER_PACE_ROAS  = 2.3                            # the ONE tunable constant
+WINNER_KILL_START = datetime.date(2026, 7, 25)     # live from this UK date (preview before)
+WINNER_LOOKBACK_D = 60                             # last-sale + spend lookback window
+WINNER_KILL_CAP   = 10                             # >N winner kills in one run = glitch -> abort + alert
+WINNER_POOL_ALERT = 25                             # warn when the winner pool drops below this
+WINNER_KILLS_LOG  = 'winner_kills_log.csv'
+
+def _winner_products(tok):
+    """Live winners (ACTIVE + w_campaign) -> {pid: {name, price}} (min variant price)."""
+    Q = ('query($c:String){products(first:250,after:$c,query:"tag:w_campaign status:active"){'
+         'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId title '
+         'priceRangeV2{minVariantPrice{amount}}}}}}')
+    out = {}; cur = None
+    while True:
+        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                          json={'query': Q, 'variables': {'c': cur}}, timeout=60).json()
+        c = j['data']['products']
+        for e in c['edges']:
+            n = e['node']
+            out[str(n['legacyResourceId'])] = dict(
+                name=n.get('title', ''),
+                price=float((n.get('priceRangeV2') or {}).get('minVariantPrice', {}).get('amount') or 0))
+        if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
+        else: break
+    return out
+
+def _winner_last_sales(tok, run_date):
+    """pid -> {ts, date (UK), rev} of the LATEST order containing the product.
+    Cancelled orders excluded; revenue = this product's lines in that order,
+    scaled by the order-level discount factor (same GROSS convention as the feed)."""
+    since = (run_date - datetime.timedelta(days=WINNER_LOOKBACK_D)).isoformat()
+    Q = ('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s -status:cancelled"){'
+         'pageInfo{hasNextPage endCursor} edges{node{createdAt subtotalPriceSet{shopMoney{amount}} '
+         'lineItems(first:100){edges{node{product{legacyResourceId} '
+         'discountedTotalSet{shopMoney{amount}}}}}}}}}' % since)
+    last = {}; cur = None; n_orders = 0
+    while True:
+        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                          json={'query': Q, 'variables': {'c': cur}}, timeout=90).json()
+        c = j['data']['orders']
+        for e in c['edges']:
+            node = e['node']; n_orders += 1; ts = node['createdAt']
+            d = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone(UK).date().isoformat()
+            lines = [(str(li['node']['product']['legacyResourceId']),
+                      float(li['node']['discountedTotalSet']['shopMoney']['amount']))
+                     for li in node['lineItems']['edges'] if li['node'].get('product')]
+            line_sum = sum(a for _, a in lines)
+            _sub = (node.get('subtotalPriceSet') or {}).get('shopMoney', {}).get('amount')
+            factor = (float(_sub) / line_sum) if (_sub is not None and line_sum > 0) else 1.0
+            per = collections.defaultdict(float)
+            for pid, amt in lines: per[pid] += amt * factor
+            for pid, rev in per.items():
+                if pid not in last or ts > last[pid]['ts']:
+                    last[pid] = dict(ts=ts, date=d, rev=rev)
+        if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
+        else: break
+    return last, n_orders
+
+def _winners_daily_spend(run_date, pids):
+    """pid -> [(date_iso, GBP), ...] spend rows in the WINNERS campaign, lookback window."""
+    import google_ads_connect as ga
+    gt = ga.get_access_token()
+    start = (run_date - datetime.timedelta(days=WINNER_LOOKBACK_D)).isoformat()
+    q = (f"SELECT campaign.id, segments.date, segments.product_item_id, metrics.cost_micros "
+         f"FROM shopping_performance_view "
+         f"WHERE segments.date BETWEEN '{start}' AND '{run_date.isoformat()}' "
+         f"AND campaign.id = {WINNERS_CAMPAIGN_ID} AND metrics.cost_micros > 0")
+    out = collections.defaultdict(list)
+    for row in _ads_search(ga, gt, q):
+        parts = str(row['segments']['productItemId']).lower().split('_')
+        pid = parts[2] if len(parts) >= 3 and parts[0] == 'shopify' else None
+        if pid and pid in pids:
+            out[pid].append((row['segments']['date'], int(row['metrics'].get('costMicros', 0)) / 1e6))
+    return out
+
+def shopify_winner_kill(tok, pid):
+    """DRAFT + add draft_bad_product / l_camp / pub: stamp + REMOVE w_campaign.
+    Same publishedAt-preservation trick as shopify_draft (draft wipes publishedAt)."""
+    gid = f"gid://shopify/Product/{pid}"
+    pj = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                       headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                       json={'query': '{product(id:"%s"){publishedAt}}' % gid}, timeout=30).json()
+    pub = ((pj.get('data') or {}).get('product') or {}).get('publishedAt')
+    tags = ['draft_bad_product', LOST_TAG] + (['pub:' + str(pub)[:10]] if pub else [])
+    M = '''mutation($id:ID!,$tags:[String!]!,$rm:[String!]!){
+      productUpdate(input:{id:$id,status:DRAFT}){userErrors{message}}
+      tagsAdd(id:$id,tags:$tags){userErrors{message}}
+      tagsRemove(id:$id,tags:$rm){userErrors{message}} }'''
+    j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                      headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                      json={'query': M, 'variables': {'id': gid, 'tags': tags, 'rm': [WINNER_TAG]}},
+                      timeout=30).json()
+    if j.get('errors'): return str(j['errors'])[:120]
+    d = j.get('data') or {}
+    errs = sum([((d.get(k) or {}).get('userErrors') or []) for k in ('productUpdate', 'tagsAdd', 'tagsRemove')], [])
+    return 'ok' if not errs else str(errs)[:120]
+
+def _write_winner_kills_log(rows, run_date):
+    import csv as _csv, os as _os
+    new = not _os.path.exists(WINNER_KILLS_LOG)
+    with open(WINNER_KILLS_LOG, 'a', newline='', encoding='utf-8') as f:
+        w = _csv.writer(f)
+        if new: w.writerow(['timestamp', 'data_date', 'product_id', 'name', 'cycle_opened_by',
+                            'allowance', 'spent', 'outcome'])
+        ts = datetime.datetime.now(UK).strftime('%Y-%m-%d %H:%M:%S')
+        for r in rows:
+            w.writerow([ts, run_date.isoformat(), r['pid'], r['name'], r['opened'],
+                        round(r['allow'], 2), round(r['spent'], 2), r.get('outcome', '')])
+
+def winner_pace_run(run_date, dry):
+    """Evaluate every winner against the pace rule. Kills only when live (>= start
+    date and not --dry). Returns dict(live, evaluated, flagged, killed, pool, err, closest)."""
+    live = (run_date >= WINNER_KILL_START) and not dry
+    res = dict(live=live, evaluated=0, flagged=[], killed=0, pool=0, err=None, closest=[])
+    try:
+        tok = shopify_token()
+        winners = _winner_products(tok)
+        res['evaluated'] = len(winners); res['pool'] = len(winners)
+        if not winners: return res
+        sales, n_orders = _winner_last_sales(tok, run_date)
+        if n_orders == 0:   # glitch guard: a live store ALWAYS has orders in 60d
+            res['err'] = f'orders pull returned 0 orders in {WINNER_LOOKBACK_D}d — glitch; winner kills skipped'
+            return res
+        spend = _winners_daily_spend(run_date, set(winners))
+        rows = []
+        for pid, m in winners.items():
+            ls = sales.get(pid)
+            if ls:
+                allow = ls['rev'] / WINNER_PACE_ROAS
+                spent = sum(v for d, v in spend.get(pid, ()) if d > ls['date'])   # charged from the day AFTER the sale
+                opened = f"sale £{ls['rev']:.2f} on {ls['date']}"
+            else:   # no sale in the lookback (stale) — allowance from price, spend from whole window
+                allow = m['price'] / WINNER_PACE_ROAS
+                spent = sum(v for _, v in spend.get(pid, ()))
+                opened = f"no sale in {WINNER_LOOKBACK_D}d (price £{m['price']:.2f})"
+            rows.append(dict(pid=pid, name=m['name'], allow=allow, spent=spent, opened=opened,
+                             pct=(spent / allow * 100) if allow > 0 else 0.0))
+        rows.sort(key=lambda x: -x['pct'])
+        res['closest'] = [r for r in rows if 60 <= r['pct'] <= 100][:5]
+        flagged = [r for r in rows if r['spent'] > r['allow']]
+        res['flagged'] = flagged
+        if not flagged: return res
+        if len(flagged) > WINNER_KILL_CAP:
+            res['err'] = (f'SAFETY STOP: {len(flagged)} winner kills > cap {WINNER_KILL_CAP} — '
+                          f'looks like a data glitch; NOTHING drafted, investigate')
+            res['flagged'] = []          # do not act, do not spam details
+            return res
+        for r in flagged:
+            if live:
+                r['outcome'] = shopify_winner_kill(tok, r['pid'])
+                print(f"  winner KILL {r['pid']} -> {r['outcome']} | spent £{r['spent']:.2f} > "
+                      f"allowance £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+            else:
+                r['outcome'] = 'DRY' if dry else 'PREVIEW (dormant)'
+                print(f"  winner would-KILL {r['pid']} | spent £{r['spent']:.2f} > "
+                      f"allowance £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+        if live:
+            res['killed'] = sum(1 for r in flagged if r.get('outcome') == 'ok')
+            res['pool'] = len(winners) - res['killed']
+            _write_winner_kills_log(flagged, run_date)
+        return res
+    except Exception as ex:
+        res['err'] = f'winner rule error (skipped this run; testing kills unaffected): {str(ex)[:150]}'
+        return res
 
 def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry):
     wb = Workbook()
@@ -362,6 +582,15 @@ def main():
         if new_winners and not dry:
             _, fp_err = ads_fast_path(new_winners, shopify_token())   # instant campaign move (label = backup)
 
+        # WINNER PACE RULE (v11): judge the Winners campaign at 2.3-pace
+        w = winner_pace_run(run_date, dry)
+        print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
+              f"{len(w['flagged'])} over allowance | killed {w['killed']} | "
+              f"{'LIVE' if w['live'] else ('DRY' if dry else 'dormant -> live ' + WINNER_KILL_START.isoformat())}"
+              + (f" | !! {w['err']}" if w['err'] else ""))
+        for r in w['closest']:
+            print(f"  pace watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+
         kills = []
         for p in feed:
             if WINNER_TAG in p['tags']:
@@ -405,6 +634,22 @@ def main():
             tg += "\n\n" + "\n\n".join(_fmt_kill(p, tier, why, run_date) for p, tier, why in to_draft[:DETAIL])
             if len(to_draft) > DETAIL:
                 tg += f"\n\n…+{len(to_draft)-DETAIL} more — full reasons &amp; metrics in the attached Excel."
+
+        # WINNERS pace section — one status line every run + detail per kill/preview
+        tg += (f"\n\n🎯 <b>Winners pace {WINNER_PACE_ROAS}</b>: {w['evaluated']} checked, "
+               f"{len(w['flagged'])} over allowance"
+               + ("" if w['live'] else (" (DRY)" if dry else f" — dormant, live {WINNER_KILL_START.strftime('%d %b')}")))
+        for r in w['flagged'][:8]:
+            tg += (f"\n🔻 <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
+                   f"   spent £{r['spent']:.2f} &gt; allowance £{r['allow']:.2f} ({html.escape(r['opened'])})"
+                   + (f" → {html.escape(str(r.get('outcome', '')))}" if w['live'] else " → would kill"))
+        if len(w['flagged']) > 8:
+            tg += f"\n   …+{len(w['flagged']) - 8} more — see winner_kills_log.csv"
+        if w['err']:
+            tg += f"\n⚠️ {html.escape(w['err'])}"
+        if w['live'] and w['killed'] and w['pool'] < WINNER_POOL_ALERT:
+            tg += (f"\n⚠️ <b>WINNER POOL LOW: {w['pool']} left</b> (&lt;{WINNER_POOL_ALERT}) — "
+                   f"consider cutting the Winners £100/day budget (your manual call).")
         send_telegram(tg, xlsx)
 
         # RESEND email — twice a day (SUMMARY_HOURS): TEXT digest of last 12h + the .xlsx
