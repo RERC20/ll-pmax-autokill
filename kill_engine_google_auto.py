@@ -120,6 +120,87 @@ def tag_new_winners(feed, dry):
         p['tags'].append(WINNER_TAG)     # exempt from kill rules in THIS same run too
     return new
 
+# ── ADS FAST-PATH: move new winners between the two PMax campaigns INSTANTLY ─
+# The Testing/Winners split (2026-07-11) filters on custom_label_1=w_campaign,
+# but that label rides Simprosys's feed sync (minutes-to-hours). This path skips
+# the wait: the moment a product wins, its variant item-ids are written straight
+# into the campaigns' listing trees via the Ads API —
+#   Winners  (asset group 6684080392): item-ids UNIT_INCLUDED  (serves NOW)
+#   Testing  (asset group 6729681029): item-ids UNIT_EXCLUDED  (stops NOW)
+# Both trees' "everything else" branches were pre-converted to item-id
+# subdivisions on 2026-07-11, so this is a plain node-add. Idempotent (checks
+# existing nodes first). If it ever fails, the label path still moves the
+# product on the next feed sync — so failures WARN, never break the kill run.
+WINNERS_AG_ID = '6684080392'
+TESTING_AG_ID = '6729681029'
+
+def _ads_search(ga, gt, query):
+    out = []; tok = None
+    while True:
+        body = {'query': query}
+        if tok: body['pageToken'] = tok
+        r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/googleAds:search",
+                          headers=ga._headers(gt), json=body, timeout=60).json()
+        if 'error' in r: raise RuntimeError(str(r)[:300])
+        out += r.get('results', []); tok = r.get('nextPageToken')
+        if not tok: return out
+
+def _variant_item_ids(stok, pid):
+    q = 'query($id:ID!){product(id:$id){variants(first:100){edges{node{legacyResourceId}}}}}'
+    j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                      headers={'X-Shopify-Access-Token': stok, 'Content-Type': 'application/json'},
+                      json={'query': q, 'variables': {'id': f"gid://shopify/Product/{pid}"}}, timeout=30).json()
+    vs = [e['node']['legacyResourceId'] for e in j['data']['product']['variants']['edges']]
+    return [f"shopify_zz_{pid}_{v}".lower() for v in vs]
+
+def ads_fast_path(new_winners, stok):
+    try:
+        import google_ads_connect as ga
+        gt = ga.get_access_token()
+        rows = _ads_search(ga, gt,
+            "SELECT asset_group.id, asset_group_listing_group_filter.resource_name, "
+            "asset_group_listing_group_filter.type, asset_group_listing_group_filter.parent_listing_group_filter, "
+            "asset_group_listing_group_filter.case_value.product_custom_attribute.index, "
+            "asset_group_listing_group_filter.case_value.product_custom_attribute.value, "
+            "asset_group_listing_group_filter.case_value.product_item_id.value "
+            "FROM asset_group_listing_group_filter WHERE asset_group.id IN (6684080392,6729681029)")
+        info = {}
+        for agid in (WINNERS_AG_ID, TESTING_AG_ID):
+            ag = [x for x in rows if str(x['assetGroup']['id']) == agid]
+            subdiv = None; have = set()
+            for x in ag:   # the item-id subdivision = the SUBDIVISION whose case is attr1-with-no-value
+                f = x['assetGroupListingGroupFilter']; cv = f.get('caseValue', {})
+                pca = cv.get('productCustomAttribute')
+                if f['type'] == 'SUBDIVISION' and pca is not None and 'value' not in pca:
+                    subdiv = f['resourceName']
+            for x in ag:
+                f = x['assetGroupListingGroupFilter']; cv = f.get('caseValue', {})
+                if f.get('parentListingGroupFilter') == subdiv and cv.get('productItemId', {}).get('value'):
+                    have.add(cv['productItemId']['value'].lower())
+            if not subdiv: raise RuntimeError(f"item-id subdivision not found in AG {agid}")
+            info[agid] = (subdiv, have)
+        made = 0
+        for agid, node_type in ((WINNERS_AG_ID, 'UNIT_INCLUDED'), (TESTING_AG_ID, 'UNIT_EXCLUDED')):
+            subdiv, have = info[agid]
+            ops = []
+            for p in new_winners:
+                for iid in _variant_item_ids(stok, p['pid']):
+                    if iid not in have:
+                        ops.append({"create": {"assetGroup": f"customers/{ga.CUSTOMER_ID}/assetGroups/{agid}",
+                                               "type": node_type, "listingSource": "SHOPPING",
+                                               "parentListingGroupFilter": subdiv,
+                                               "caseValue": {"productItemId": {"value": iid}}}})
+            if ops:
+                r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
+                                  headers=ga._headers(gt), json={"operations": ops}, timeout=60).json()
+                if 'error' in r: raise RuntimeError(str(r)[:300])
+                made += len(ops)
+        print(f"  fast-path: {made} item-id nodes written (Winners include / Testing exclude)")
+        return made, None
+    except Exception as ex:
+        print(f"  !! fast-path FAILED (harmless - label path still moves it on next feed sync): {ex}")
+        return 0, str(ex)[:150]
+
 def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry):
     wb = Workbook()
     s = wb.active; s.title = 'Summary'
@@ -277,6 +358,9 @@ def main():
         new_winners = tag_new_winners(feed, dry)
         exempt = sum(1 for p in feed if WINNER_TAG in p['tags'])
         print(f"winners: +{len(new_winners)} newly tagged | {exempt} total exempt from kill rules")
+        fp_err = None
+        if new_winners and not dry:
+            _, fp_err = ads_fast_path(new_winners, shopify_token())   # instant campaign move (label = backup)
 
         kills = []
         for p in feed:
@@ -314,6 +398,8 @@ def main():
             tg += ("\n🏆 <b>new winners → w_campaign:</b> "
                    + ", ".join(f"<code>{p['pid']}</code>" for p in new_winners[:10])
                    + (f" +{len(new_winners)-10} more" if len(new_winners) > 10 else ""))
+            tg += ("\n⚡ moved to Winners campaign instantly" if not fp_err
+                   else f"\n⚠️ fast-path failed ({html.escape(fp_err[:80])}) — label moves it on next feed sync")
         if to_draft:
             DETAIL = 15                                     # full reason+metrics for up to 15; rest in the Excel
             tg += "\n\n" + "\n\n".join(_fmt_kill(p, tier, why, run_date) for p, tier, why in to_draft[:DETAIL])
