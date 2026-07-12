@@ -220,6 +220,54 @@ def ads_fast_path(new_winners, stok):
         print(f"  !! fast-path FAILED (harmless - label path still moves it on next feed sync): {ex}")
         return 0, str(ex)[:150]
 
+# ── BEST SELLERS COLLECTION AUTO-ADD (owner request 2026-07-13) ─────────────
+# Every ACTIVE winner (w_campaign) is ensured a member of the manual "Best
+# Sellers" collection (handle best-sellers, shown on the storefront/product
+# pages). ADD-ONLY by design: a winner later drafted/killed STAYS a member
+# (owner call — drafts don't render on the storefront anyway, and a
+# reactivated product is already in place). Collection sortOrder is
+# BEST_SELLING, so Shopify auto-ranks the page by real sales. Idempotent
+# every 8-min run; failures WARN, never break the run.
+BESTSELLER_COLLECTION_ID = '690375426428'    # "Best Sellers" (manual collection)
+
+def sync_bestseller_collection(tok, dry):
+    """Add any active winner missing from the Best Sellers collection. Returns (added, err)."""
+    try:
+        cgid = f"gid://shopify/Collection/{BESTSELLER_COLLECTION_ID}"
+        Q = ('query($id:ID!,$c:String){collection(id:$id){products(first:250,after:$c){'
+             'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId}}}}}')
+        have = set(); cur = None
+        while True:
+            j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                              headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                              json={'query': Q, 'variables': {'id': cgid, 'c': cur}}, timeout=60).json()
+            co = (j.get('data') or {}).get('collection')
+            if co is None: return 0, 'Best Sellers collection not found'
+            pp = co['products']
+            for e in pp['edges']: have.add(str(e['node']['legacyResourceId']))
+            if not pp['pageInfo']['hasNextPage']: break
+            cur = pp['pageInfo']['endCursor']
+        missing = [p for p in _winner_products(tok) if p not in have]
+        if not missing: return 0, None
+        if dry:
+            print(f"  would add {len(missing)} winner(s) to Best Sellers collection (DRY)")
+            return 0, None
+        M = ('mutation($id:ID!,$pids:[ID!]!){collectionAddProductsV2(id:$id,productIds:$pids){'
+             'userErrors{field message}}}')
+        added = 0
+        for i in range(0, len(missing), 250):
+            batch = [f"gid://shopify/Product/{p}" for p in missing[i:i + 250]]
+            j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                              headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                              json={'query': M, 'variables': {'id': cgid, 'pids': batch}}, timeout=60).json()
+            errs = ((j.get('data') or {}).get('collectionAddProductsV2') or {}).get('userErrors') or []
+            if errs: return added, f"collection add: {str(errs)[:100]}"
+            added += len(batch)
+        print(f"  Best Sellers collection: +{added} winner(s) added")
+        return added, None
+    except Exception as ex:
+        return 0, f'Best Sellers sync error: {str(ex)[:120]}'
+
 # ── WINNER PACE RULE (v11 — owner-approved 2026-07-12) ──────────────────────
 # The Winners campaign has ONE kill rule, the "2.3-pace" rule:
 #
@@ -582,6 +630,9 @@ def main():
         if new_winners and not dry:
             _, fp_err = ads_fast_path(new_winners, shopify_token())   # instant campaign move (label = backup)
 
+        # BEST SELLERS: every active winner belongs to the storefront collection (add-only)
+        bs_added, bs_err = sync_bestseller_collection(shopify_token(), dry)
+
         # WINNER PACE RULE (v11): judge the Winners campaign at 2.3-pace
         w = winner_pace_run(run_date, dry)
         print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
@@ -647,6 +698,10 @@ def main():
             tg += f"\n   …+{len(w['flagged']) - 8} more — see winner_kills_log.csv"
         if w['err']:
             tg += f"\n⚠️ {html.escape(w['err'])}"
+        if bs_added:
+            tg += f"\n🛍️ Best Sellers collection: +{bs_added} winner(s) added"
+        if bs_err:
+            tg += f"\n⚠️ {html.escape(bs_err)}"
         if w['live'] and w['killed'] and w['pool'] < WINNER_POOL_ALERT:
             tg += (f"\n⚠️ <b>WINNER POOL LOW: {w['pool']} left</b> (&lt;{WINNER_POOL_ALERT}) — "
                    f"consider cutting the Winners £100/day budget (your manual call).")
