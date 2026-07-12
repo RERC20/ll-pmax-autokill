@@ -95,8 +95,10 @@ def todays_money(tok, today):
     """Today's Shopify NET revenue (GBP, PNL basis) + order & item counts, and Google ad spend today (GBP)."""
     since = (today - datetime.timedelta(days=1)).isoformat()
     Q = ('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s"){pageInfo{hasNextPage endCursor} '
-         'edges{node{createdAt currentTotalPriceSet{shopMoney{amount}} lineItems(first:100){edges{node{quantity}}}}}}}' % since)
-    rev = 0.0; orders = 0; items = 0; cur = None
+         'edges{node{createdAt currentTotalPriceSet{shopMoney{amount}} '
+         'transactions{kind status fees{amount{amount}}} '            # actual Shopify Payments fees = true card/txn cost
+         'lineItems(first:100){edges{node{quantity}}}}}}}' % since)
+    rev = 0.0; orders = 0; items = 0; fees = 0.0; cur = None
     while True:
         d = _gql(tok, Q, {'c': cur})['data']['orders']
         for e in d['edges']:
@@ -105,6 +107,10 @@ def todays_money(tok, today):
             orders += 1
             rev += float((e['node'].get('currentTotalPriceSet') or {}).get('shopMoney', {}).get('amount') or 0)
             items += sum(int(li['node'].get('quantity', 0) or 0) for li in e['node']['lineItems']['edges'])
+            for t in (e['node'].get('transactions') or []):        # sum card fees on the day's successful sales (GROSS; refunds don't refund the fee)
+                if t.get('kind') in ('SALE', 'CAPTURE') and t.get('status') == 'SUCCESS':
+                    for f in (t.get('fees') or []):
+                        fees += float((f.get('amount') or {}).get('amount') or 0)
         if not d['pageInfo']['hasNextPage']: break
         cur = d['pageInfo']['endCursor']
     cost = None                                                     # Google ad spend today; graceful if unavailable
@@ -117,18 +123,20 @@ def todays_money(tok, today):
             cost = sum(int(row['metrics'].get('costMicros', 0)) / 1e6 for row in r.json().get('results', []))
     except Exception as ex:
         print(f"(ad spend unavailable: {str(ex)[:80]})")
-    return dict(rev_gbp=rev, orders=orders, items=items, cost_gbp=cost)
+    return dict(rev_gbp=rev, orders=orders, items=items, cost_gbp=cost, fees_gbp=fees)
 
 def money_block(m):
     """USD-first money summary appended under the product stats in the END message."""
     rate = usd_rate(); rev_u = m['rev_gbp'] * rate
     cost_g = m['cost_gbp']; cost_u = (cost_g * rate) if cost_g is not None else None
+    fee_g = m.get('fees_gbp'); fee_u = (fee_g * rate) if fee_g is not None else None   # real Shopify Payments card fees
     roas = (m['rev_gbp'] / cost_g) if (cost_g and cost_g > 0) else None
-    cpt = (cost_u / m['orders']) if (cost_u is not None and m['orders'] > 0) else None
+    cpa = (cost_u / m['orders']) if (cost_u is not None and m['orders'] > 0) else None   # ad spend / orders = customer-acquisition cost (NOT the card fee)
     L = [f"Sales revenue  ${rev_u:,.2f}  (£{m['rev_gbp']:,.2f})",
          "Ad spend       " + (f"${cost_u:,.2f}  (£{cost_g:,.2f})" if cost_u is not None else "n/a"),
+         "Card fees      " + (f"${fee_u:,.2f}  (£{fee_g:,.2f})" if fee_u is not None else "-"),
          "ROAS           " + (f"{roas:.2f}" if roas is not None else "-"),
-         "Cost / txn     " + (f"${cpt:,.2f}" if cpt is not None else "-"),
+         "CPA            " + (f"${cpa:,.2f}" if cpa is not None else "-"),
          f"Orders         {m['orders']}",
          f"Items ordered  {m['items']}"]
     return f"━━━━━━━━━━━\n\U0001F4B0 <b>DAY PNL</b>  (USD @ {rate:.3f})\n<pre>" + "\n".join(L) + "</pre>"
