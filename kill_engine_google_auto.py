@@ -39,7 +39,7 @@ from creds import cred                          # env -> _secrets_local.py -> ''
 UK = ZoneInfo('Europe/London')                 # store + Google Ads account run on UK time
 
 # ---- notifications ----
-EMAIL_TO       = 'redacted@example.com'
+EMAIL_TO       = cred('EMAIL_TO')               # digest inbox — from Secrets/_secrets_local, never in public code
 RESEND_API_KEY = cred('RESEND_API_KEY')
 RESEND_FROM    = cred('RESEND_FROM') or 'onboarding@resend.dev'
 TELEGRAM_TOKEN = cred('TELEGRAM_BOT_TOKEN')     # from @BotFather — every-run push
@@ -499,8 +499,8 @@ def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry
     return fname
 
 def send_report(subject, body, xlsx_path=None):
-    if not RESEND_API_KEY:
-        print("!! EMAIL NOT SENT — set the RESEND_API_KEY secret (free key from resend.com).")
+    if not (RESEND_API_KEY and EMAIL_TO):
+        print("!! EMAIL NOT SENT — set the RESEND_API_KEY + EMAIL_TO secrets.")
         if xlsx_path: print(f"   report saved locally: {xlsx_path}")
         return False
     try:
