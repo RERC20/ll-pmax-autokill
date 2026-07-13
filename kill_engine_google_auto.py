@@ -303,7 +303,7 @@ def sync_bestseller_collection(tok, dry):
 #     that flags more than WINNER_KILL_CAP winners aborts (data glitch guard,
 #     same philosophy as the testing KILL_CAP).
 WINNER_PACE_ROAS  = 2.3                            # the ONE tunable constant
-WINNER_KILL_START = datetime.date(2026, 7, 25)     # live from this UK date (preview before)
+WINNER_KILL_START = datetime.date(2026, 7, 13)     # LIVE (owner 2026-07-13: "if a winner hits the rules kill it, don't wait for Jul 25")
 WINNER_LOOKBACK_D = 60                             # last-sale + spend lookback window
 WINNER_KILL_CAP   = 10                             # >N winner kills in one run = glitch -> abort + alert
 WINNER_POOL_ALERT = 25                             # warn when the winner pool drops below this
