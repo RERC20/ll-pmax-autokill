@@ -94,7 +94,7 @@ def usd_rate():
 def todays_money(tok, today):
     """Today's Shopify NET revenue (GBP, PNL basis) + order & item counts, and Google ad spend today (GBP)."""
     since = (today - datetime.timedelta(days=1)).isoformat()
-    Q = ('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s"){pageInfo{hasNextPage endCursor} '
+    Q = ('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s -status:cancelled"){pageInfo{hasNextPage endCursor} '
          'edges{node{createdAt currentTotalPriceSet{shopMoney{amount}} '
          'transactions{kind status fees{amount{amount}}} '            # actual Shopify Payments fees = true card/txn cost
          'lineItems(first:100){edges{node{quantity}}}}}}}' % since)

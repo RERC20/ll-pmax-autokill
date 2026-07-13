@@ -89,13 +89,17 @@ def shopify_revenue(tok, run_date):
     # counts. So a refunded sale still proves the product can sell and won't be killed for it.
     # Discounts DO count (2026-07-03): revenue = amount actually paid after ALL discounts (incl order-level).
     since=(run_date-datetime.timedelta(days=31)).isoformat()
+    # -status:cancelled (2026-07-13, owner: duplicate order #551450): CANCELLED orders never count —
+    # a cancelled order is not a sale and must not shield a tester from the no-sale tiers or inflate
+    # rev windows. REFUNDS still count (firm rule: refund = order issue, not product failure) —
+    # cancellation and refund are different events. Same convention as the winner-pace modules.
     # CALENDAR windows aligned to the Google cost query (segments.date BETWEEN start..today) AND the
     # dashboard, so revenue and cost cover the SAME dates (owner 2026-07-07). Replaced the rolling
     # 7x24h window, which counted a sale's revenue against a cost window that excluded that sale's day —
     # letting an old sale shield no-sale / below-2.0 products. An order counts in window N iff its UK
     # calendar date is within [run_date-(N-1), run_date].
     win_start=[run_date-datetime.timedelta(days=6), run_date-datetime.timedelta(days=13), run_date-datetime.timedelta(days=29)]
-    Q=('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s"){'
+    Q=('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s -status:cancelled"){'
        'pageInfo{hasNextPage endCursor} edges{node{id createdAt subtotalPriceSet{shopMoney{amount}} '
        'lineItems(first:100){edges{node{product{legacyResourceId} discountedTotalSet{shopMoney{amount}}}}}}}}}' % since)
     rev=collections.defaultdict(lambda:[0.0,0.0,0.0])
