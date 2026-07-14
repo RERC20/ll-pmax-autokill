@@ -211,20 +211,25 @@ def evaluate(p, run_date, is_monday):
         return ('KILL','Tier 6',f'below 2.0 target: ROAS7={roas7:.2f}, £{cost7:.2f}/7d')
     if has_rev and recent14 and zero7 and cpa is not None and cost7>=2*cpa:
         return ('KILL','Tier 5',f'stalled winner: £0 rev 7d, £{cost7:.2f}>=2xCPA(£{cpa:.2f})')
-    # ---- NO-SALE testing gate: price/7 (owner 2026-07-15, "7x to be born") ----
+    # ---- NO-SALE testing gate: min(price/7, £5) (owner 2026-07-15, "7x to be born") ----
     # Backtested on all 60 winners-ever: every winner's FIRST sale arrived at >=7.2x implied pace
     # (median 22.6x, £1.08 median pre-sale spend; only exception 4.8x = footwear, category being
-    # phased out). A never-sold product whose spend exceeds price/7 is already outside the winner
-    # distribution -> kill NOW. Allowance scales with price (£28->£4.00, £35->£5.00); with the <£35
-    # import price law no wasted product costs more than ~£5. K sweep on history: K=5/6/7 all keep
-    # 59/60 winners; K>=8 starts killing real dress winners — 7 is the data's edge, don't raise it
-    # without re-profiling. Fallback when price unknown/0: old £5 flat gate (v4 Tier-2 behaviour).
+    # phased out). A never-sold product whose spend exceeds its allowance is already outside the
+    # winner distribution -> kill NOW. Allowance scales with price and is HARD-CAPPED at £5
+    # (owner 2026-07-15: lock worst-case waste per product so the daily testing burn is bounded):
+    # £28->£4.00, £35->£5.00, £45->£5.00 (=9x bar), £60->£5.00 (=12x bar). The cap only binds
+    # >£35 products — under the <£35 import price law it never triggers; it tightens the legacy
+    # expensive items (anti-DNA categories) and any future expensive experiment. Historical cost
+    # of the cap: 1 extra winner of 60 (a £36.95 playsuit at £5.15 pre-sale — 15p over). K sweep:
+    # K=5/6/7 keep 59/60 winners; K>=8 kills real dress winners — don't raise K without
+    # re-profiling. Fallback when price unknown/0: £5 flat (v4 Tier-2 behaviour).
     NO_SALE_K = 7.0
+    GATE_CAP  = 5.0                               # hard max allowance per never-sold product
     price = p.get('price', 0.0) or 0.0
-    gate = (price / NO_SALE_K) if price > 0 else 5.0
+    gate = min(price / NO_SALE_K, GATE_CAP) if price > 0 else GATE_CAP
     if not recent14:                              # a sale in 14d shields (same shield as before)
         if cost30 > gate and zero30:
-            return ('KILL','Tier 2',f'no-sale past price/7 gate: £{cost30:.2f} > £{gate:.2f} (price £{price:.2f}), £0 rev')
+            return ('KILL','Tier 2',f'no-sale past gate: £{cost30:.2f} > £{gate:.2f} (min(price/7,£5), price £{price:.2f}), £0 rev')
         if is_monday and dl>=21 and clk<5:
             return ('KILL','Tier 4',f'ghost: {clk} clicks/{dl}d')
     # -- REVERT BLOCK: pre-2026-07-15 no-sale tiers (flat £5 / 40 / 70 clicks). To switch back,
