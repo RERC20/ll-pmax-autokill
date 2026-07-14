@@ -70,14 +70,16 @@ def google_product_perf(run_date):
 # ── Shopify: live ACTIVE products (id, title, publishedAt, tags) ──
 def shopify_active_products(tok):
     Q=('query($c:String){products(first:100,after:$c,query:"status:active"){'
-       'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId title publishedAt tags}}}}')
+       'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId title publishedAt tags '
+       'priceRangeV2{minVariantPrice{amount}}}}}}')
     prods={}; cur=None
     while True:
         c=_gql(tok,Q,{'c':cur})['data']['products']
         for e in c['edges']:
             n=e['node']; pid=norm(n['legacyResourceId'])
             prods[pid]=dict(name=n.get('title',''), pub=str(n.get('publishedAt') or '')[:10] or '2000-01-01',
-                            tags=n.get('tags') or [])
+                            tags=n.get('tags') or [],
+                            price=float(((n.get('priceRangeV2') or {}).get('minVariantPrice') or {}).get('amount') or 0))
         if c['pageInfo']['hasNextPage']: cur=c['pageInfo']['endCursor']
         else: break
     return prods
@@ -139,6 +141,7 @@ def build_feed(run_date):
         gp=g.get(pid, {}); r=rev.get(pid,[0.0,0.0,0.0]); c=cnt.get(pid,[0,0,0])
         cost7=gp.get('cost7',0.0)
         feed.append(dict(pid=pid, name=meta['name'], pub=meta['pub'], tags=meta['tags'],
+            price=meta.get('price',0.0),
             cost30=gp.get('cost30',0.0), cost7=cost7, clicks30=gp.get('clicks30',0),
             rev30=r[2], rev14=r[1], rev7=r[0],                       # Shopify = truth
             roas7=(r[0]/cost7) if cost7>0 else 0.0,                  # Shopify rev 7d / Google cost 7d

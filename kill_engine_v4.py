@@ -211,19 +211,34 @@ def evaluate(p, run_date, is_monday):
         return ('KILL','Tier 6',f'below 2.0 target: ROAS7={roas7:.2f}, £{cost7:.2f}/7d')
     if has_rev and recent14 and zero7 and cpa is not None and cost7>=2*cpa:
         return ('KILL','Tier 5',f'stalled winner: £0 rev 7d, £{cost7:.2f}>=2xCPA(£{cpa:.2f})')
-    # ---- NO-SALE testing tiers — SAME-DAY, NO grace period (owner 2026-07-01) ----
-    # ONLY change vs the v4 spec: removed the <3-day fresh-import grace AND Tier-2's dl>=4 wait, so a
-    # never-sold product is cut the moment it's over £5 (or 40 clicks) with £0 sales — no multi-day
-    # bleed. ALL thresholds unchanged (£5 / 40 / 70 clicks). A sale in the last 14d still shields it.
-    if not recent14:                              # a sale in 14d shields from Tiers 1-4
-        if clk>=70 and zero30:
-            return ('KILL','Tier 1',f'{clk} clicks, £0 rev')
-        if (clk>=40 or cost30>=5) and zero30:
-            return ('KILL','Tier 2',f'no-sale: {clk} clicks/£{cost30:.2f}, £0 rev')
-        if is_monday and dl>=7 and cost30>=5 and zero30:
-            return ('KILL','Tier 3',f'stale: £{cost30:.2f}, £0 rev')
+    # ---- NO-SALE testing gate: price/7 (owner 2026-07-15, "7x to be born") ----
+    # Backtested on all 60 winners-ever: every winner's FIRST sale arrived at >=7.2x implied pace
+    # (median 22.6x, £1.08 median pre-sale spend; only exception 4.8x = footwear, category being
+    # phased out). A never-sold product whose spend exceeds price/7 is already outside the winner
+    # distribution -> kill NOW. Allowance scales with price (£28->£4.00, £35->£5.00); with the <£35
+    # import price law no wasted product costs more than ~£5. K sweep on history: K=5/6/7 all keep
+    # 59/60 winners; K>=8 starts killing real dress winners — 7 is the data's edge, don't raise it
+    # without re-profiling. Fallback when price unknown/0: old £5 flat gate (v4 Tier-2 behaviour).
+    NO_SALE_K = 7.0
+    price = p.get('price', 0.0) or 0.0
+    gate = (price / NO_SALE_K) if price > 0 else 5.0
+    if not recent14:                              # a sale in 14d shields (same shield as before)
+        if cost30 > gate and zero30:
+            return ('KILL','Tier 2',f'no-sale past price/7 gate: £{cost30:.2f} > £{gate:.2f} (price £{price:.2f}), £0 rev')
         if is_monday and dl>=21 and clk<5:
             return ('KILL','Tier 4',f'ghost: {clk} clicks/{dl}d')
+    # -- REVERT BLOCK: pre-2026-07-15 no-sale tiers (flat £5 / 40 / 70 clicks). To switch back,
+    #    delete the price/7 block above and un-comment this (backup also in
+    #    Desktop\rules_backup_v4_20260715 and in git history). ------------------------------
+    # if not recent14:                              # a sale in 14d shields from Tiers 1-4
+    #     if clk>=70 and zero30:
+    #         return ('KILL','Tier 1',f'{clk} clicks, £0 rev')
+    #     if (clk>=40 or cost30>=5) and zero30:
+    #         return ('KILL','Tier 2',f'no-sale: {clk} clicks/£{cost30:.2f}, £0 rev')
+    #     if is_monday and dl>=7 and cost30>=5 and zero30:
+    #         return ('KILL','Tier 3',f'stale: £{cost30:.2f}, £0 rev')
+    #     if is_monday and dl>=21 and clk<5:
+    #         return ('KILL','Tier 4',f'ghost: {clk} clicks/{dl}d')
     # ---- Tier 7 backstop: slow dribblers under Tier 6's radar (owner 2026-07-03) ----
     # Tier 6 needs cost7>=5 (>= £0.71/day), so a product bleeding £3-4/week below target never
     # trips it. 30d window = burn rates down to ~£0.33/day AND a less noisy ROAS at tiny
