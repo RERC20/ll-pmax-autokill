@@ -107,14 +107,15 @@ def shopify_remove_tag(tok, pid, tag):
     except Exception as ex:
         return f"err: {ex}"
 
-def shopify_set_label_metafield(tok, pid):
+def shopify_set_label_metafield(tok, pid, value=WINNER_TAG):
     """Also write Simprosys's own attribute metafield (mm-google-shopping.custom_label_1).
     The app's bulk-edit stores labels app-side, but it READS this metafield on its syncs —
     so future winners pick up the feed label without a human touching the app. The Ads-API
-    item-ID mover (added after the campaigns exist) is the guaranteed instant path."""
+    item-ID mover (added after the campaigns exist) is the guaranteed instant path.
+    value: WINNER_TAG (winners) or CHAMPION_TAG (champions tier, 2026-07-20)."""
     m = ('mutation($mf:[MetafieldsSetInput!]!){metafieldsSet(metafields:$mf){userErrors{message}}}')
     v = {'mf': [{'ownerId': f"gid://shopify/Product/{pid}", 'namespace': 'mm-google-shopping',
-                 'key': 'custom_label_1', 'type': 'single_line_text_field', 'value': WINNER_TAG}]}
+                 'key': 'custom_label_1', 'type': 'single_line_text_field', 'value': value}]}
     try:
         j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
                           headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
@@ -362,15 +363,16 @@ def _winner_last_sales(tok, run_date):
         else: break
     return last, n_orders
 
-def _winners_daily_spend(run_date, pids):
-    """pid -> [(date_iso, GBP), ...] spend rows in the WINNERS campaign, lookback window."""
+def _campaign_daily_spend(run_date, pids, campaign_id):
+    """pid -> [(date_iso, GBP), ...] spend rows in ONE campaign, lookback window.
+    Campaign-scoped by design: each tier's rule judges only that tier's spend."""
     import google_ads_connect as ga
     gt = ga.get_access_token()
     start = (run_date - datetime.timedelta(days=WINNER_LOOKBACK_D)).isoformat()
     q = (f"SELECT campaign.id, segments.date, segments.product_item_id, metrics.cost_micros "
          f"FROM shopping_performance_view "
          f"WHERE segments.date BETWEEN '{start}' AND '{run_date.isoformat()}' "
-         f"AND campaign.id = {WINNERS_CAMPAIGN_ID} AND metrics.cost_micros > 0")
+         f"AND campaign.id = {campaign_id} AND metrics.cost_micros > 0")
     out = collections.defaultdict(list)
     for row in _ads_search(ga, gt, q):
         parts = str(row['segments']['productItemId']).lower().split('_')
@@ -378,6 +380,9 @@ def _winners_daily_spend(run_date, pids):
         if pid and pid in pids:
             out[pid].append((row['segments']['date'], int(row['metrics'].get('costMicros', 0)) / 1e6))
     return out
+
+def _winners_daily_spend(run_date, pids):
+    return _campaign_daily_spend(run_date, pids, WINNERS_CAMPAIGN_ID)
 
 def shopify_winner_kill(tok, pid):
     """DRAFT + add draft_bad_product / l_camp / pub: stamp + REMOVE w_campaign.
@@ -421,6 +426,11 @@ def winner_pace_run(run_date, dry):
     try:
         tok = shopify_token()
         winners = _winner_products(tok)
+        # CHAMPIONS EXEMPT (2026-07-20): champions keep w_campaign but serve in the Champions
+        # campaign — their winners-campaign spend is residual, and their last sale can be stale,
+        # so judging them here would false-kill. They have their OWN trailing-2.0 demotion rule.
+        champs = _champion_pids(tok)
+        winners = {pid: m for pid, m in winners.items() if pid not in champs}
         res['evaluated'] = len(winners); res['pool'] = len(winners)
         if not winners: return res
         sales, n_orders = _winner_last_sales(tok, run_date)
@@ -467,6 +477,261 @@ def winner_pace_run(run_date, dry):
         return res
     except Exception as ex:
         res['err'] = f'winner rule error (skipped this run; testing kills unaffected): {str(ex)[:150]}'
+        return res
+
+# ── CHAMPIONS TIER (owner-approved 2026-07-20) ──────────────────────────────
+# Third campaign for PROVEN repeat-sellers: PMax | Champions | UK (MCV, tROAS 2.0, £50/day).
+# Only repeat-sellers ever absorbed extra spend productively (Jul-16 analysis) — this tier
+# gives them a looser target so Google buys volume, watched by a per-product trailing floor.
+#
+#   ENTRY      3 lifetime orders (order count, not units; cancelled excluded)
+#              -> tag c_champion (w_campaign KEPT), feed label -> c_champion,
+#                 item-ids: Champions AG include + Winners AG include-nodes removed.
+#   DEMOTE     Champions-campaign spend since the 3rd-last sale
+#                > (revenue of the last TWO sales) / 2.0
+#              = the trailing-ROAS-2.0 floor smoothed over two sale-gaps (owner-corrected
+#              2026-07-20: counting 3 sales' revenue would double-count the anchor sale and
+#              only enforce ~1.33). Spend charged from the day AFTER the anchor sale — late,
+#              never early. Demotion is a SOFT landing: back to Winners, NOT drafted; the
+#              winners pace clock restarts anchored on its own last sale.
+#   RE-ENTER   2 NEW sales (dates strictly after the champ_demoted: stamp) while in Winners.
+#   2nd FAIL   nothing special here — a demoted champion is a normal winner again; if it
+#              breaches the winners 2.3 pace, the existing winner rule drafts it (permanent).
+#   GUARDS     promotions capped (glitch), demotions capped (glitch), zero-orders pull skips
+#              the whole section; failures WARN and never touch the testing/winner kills.
+CHAMPION_TAG            = 'c_champion'
+CHAMPION_DEMOTED_PREFIX = 'champ_demoted:'          # champ_demoted:YYYY-MM-DD, set on demotion
+CHAMPIONS_CAMPAIGN_ID   = '24047674442'             # PMax | Champions | UK  (created 2026-07-20)
+CHAMPIONS_AG_ID         = '6731971798'              # its asset group (listing tree mirrors Winners)
+CHAMPION_ENTRY_ORDERS   = 3
+CHAMPION_PACE_ROAS      = 2.0
+CHAMPION_REPROMOTE_SALES = 2
+CHAMPION_PROMOTE_CAP    = 25                        # >N promotions in one run = glitch -> abort section
+CHAMPION_DEMOTE_CAP     = 10                        # >N demotions in one run = glitch -> abort section
+CHAMPION_LOG            = 'champion_moves_log.csv'
+LIFETIME_SINCE          = '2026-01-01'              # predates the store — lifetime = complete
+
+def _champion_pids(tok):
+    """ACTIVE products tagged c_champion -> set of pids."""
+    Q = ('query($c:String){products(first:250,after:$c,query:"tag:c_champion status:active"){'
+         'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId}}}}')
+    out = set(); cur = None
+    while True:
+        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                          json={'query': Q, 'variables': {'c': cur}}, timeout=60).json()
+        c = j['data']['products']
+        for e in c['edges']: out.add(str(e['node']['legacyResourceId']))
+        if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
+        else: break
+    return out
+
+def _lifetime_sales(tok):
+    """pid -> chronological [{ts, date(UK), rev}, ...] — ONE entry per ORDER containing the
+    product, all orders lifetime. Cancelled excluded; per-order product revenue with the same
+    order-level discount scaling as the feed (GROSS, refunds ignored). ~10 pages / run."""
+    Q = ('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s -status:cancelled"){'
+         'pageInfo{hasNextPage endCursor} edges{node{createdAt subtotalPriceSet{shopMoney{amount}} '
+         'lineItems(first:100){edges{node{product{legacyResourceId} '
+         'discountedTotalSet{shopMoney{amount}}}}}}}}}' % LIFETIME_SINCE)
+    sales = collections.defaultdict(list); cur = None; n_orders = 0
+    while True:
+        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                          json={'query': Q, 'variables': {'c': cur}}, timeout=90).json()
+        c = j['data']['orders']
+        for e in c['edges']:
+            node = e['node']; n_orders += 1; ts = node['createdAt']
+            d = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone(UK).date().isoformat()
+            lines = [(str(li['node']['product']['legacyResourceId']),
+                      float(li['node']['discountedTotalSet']['shopMoney']['amount']))
+                     for li in node['lineItems']['edges'] if li['node'].get('product')]
+            line_sum = sum(a for _, a in lines)
+            _sub = (node.get('subtotalPriceSet') or {}).get('shopMoney', {}).get('amount')
+            factor = (float(_sub) / line_sum) if (_sub is not None and line_sum > 0) else 1.0
+            per = collections.defaultdict(float)
+            for pid, amt in lines: per[pid] += amt * factor
+            for pid, rev in per.items():
+                sales[pid].append(dict(ts=ts, date=d, rev=rev))
+        if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
+        else: break
+    for pid in sales: sales[pid].sort(key=lambda s: s['ts'])
+    return sales, n_orders
+
+def _demoted_date(tags):
+    """Latest champ_demoted:YYYY-MM-DD stamp, or None."""
+    ds = [t[len(CHAMPION_DEMOTED_PREFIX):] for t in tags if str(t).startswith(CHAMPION_DEMOTED_PREFIX)]
+    return max(ds) if ds else None
+
+def _ag_listing_state(ga, gt, ag_ids):
+    """agid -> (item_subdiv_resource_name, {item_id_lower: node_resource_name}).
+    Same discovery as ads_fast_path: the item-id subdivision is the SUBDIVISION whose
+    case is attr1-with-no-value."""
+    rows = _ads_search(ga, gt,
+        "SELECT asset_group.id, asset_group_listing_group_filter.resource_name, "
+        "asset_group_listing_group_filter.type, asset_group_listing_group_filter.parent_listing_group_filter, "
+        "asset_group_listing_group_filter.case_value.product_custom_attribute.index, "
+        "asset_group_listing_group_filter.case_value.product_custom_attribute.value, "
+        "asset_group_listing_group_filter.case_value.product_item_id.value "
+        f"FROM asset_group_listing_group_filter WHERE asset_group.id IN ({','.join(ag_ids)})")
+    info = {}
+    for agid in ag_ids:
+        ag = [x for x in rows if str(x['assetGroup']['id']) == agid]
+        subdiv = None; have = {}
+        for x in ag:
+            f = x['assetGroupListingGroupFilter']; cv = f.get('caseValue', {})
+            pca = cv.get('productCustomAttribute')
+            if f['type'] == 'SUBDIVISION' and pca is not None and 'value' not in pca:
+                subdiv = f['resourceName']
+        for x in ag:
+            f = x['assetGroupListingGroupFilter']; cv = f.get('caseValue', {})
+            if f.get('parentListingGroupFilter') == subdiv and cv.get('productItemId', {}).get('value'):
+                have[cv['productItemId']['value'].lower()] = f['resourceName']
+        if not subdiv: raise RuntimeError(f"item-id subdivision not found in AG {agid}")
+        info[agid] = (subdiv, have)
+    return info
+
+def champion_ads_move(promote_pids, demote_pids, stok):
+    """Instant listing-tree moves (label path = backup, as with winners):
+       PROMOTE: Champions AG += item UNIT_INCLUDED | Winners AG -= its include-nodes
+       DEMOTE : Champions AG -= its item nodes     | Winners AG += item UNIT_INCLUDED
+    Idempotent; any failure WARNs — the c_champion/w_campaign label still moves the
+    product on the next feed sync, and rules stay campaign-scoped either way."""
+    if not (promote_pids or demote_pids): return 0, None
+    try:
+        import google_ads_connect as ga
+        gt = ga.get_access_token()
+        info = _ag_listing_state(ga, gt, [CHAMPIONS_AG_ID, WINNERS_AG_ID])
+        ch_sub, ch_have = info[CHAMPIONS_AG_ID]
+        wi_sub, wi_have = info[WINNERS_AG_ID]
+        ops = []
+        def _include(agid, subdiv, have, iid):
+            if iid not in have:
+                ops.append({'create': {'assetGroup': f"customers/{ga.CUSTOMER_ID}/assetGroups/{agid}",
+                                       'type': 'UNIT_INCLUDED', 'listingSource': 'SHOPPING',
+                                       'parentListingGroupFilter': subdiv,
+                                       'caseValue': {'productItemId': {'value': iid}}}})
+        for pid in promote_pids:
+            for iid in _variant_item_ids(stok, pid):
+                _include(CHAMPIONS_AG_ID, ch_sub, ch_have, iid)
+                if iid in wi_have: ops.append({'remove': wi_have[iid]})
+        for pid in demote_pids:
+            for iid in _variant_item_ids(stok, pid):
+                _include(WINNERS_AG_ID, wi_sub, wi_have, iid)
+                if iid in ch_have: ops.append({'remove': ch_have[iid]})
+        if ops:
+            r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
+                              headers=ga._headers(gt), json={'operations': ops}, timeout=60).json()
+            if 'error' in r: raise RuntimeError(str(r)[:300])
+        print(f"  champion fast-path: {len(ops)} listing ops (promote {len(promote_pids)} / demote {len(demote_pids)})")
+        return len(ops), None
+    except Exception as ex:
+        print(f"  !! champion fast-path FAILED (label path moves them on next feed sync): {ex}")
+        return 0, str(ex)[:150]
+
+def _write_champion_log(rows):
+    import csv as _csv, os as _os
+    new = not _os.path.exists(CHAMPION_LOG)
+    with open(CHAMPION_LOG, 'a', newline='', encoding='utf-8') as f:
+        w = _csv.writer(f)
+        if new: w.writerow(['timestamp', 'run_date', 'action', 'product_id', 'name',
+                            'lifetime_orders', 'allowance', 'spent', 'outcome'])
+        for r in rows: w.writerow(r)
+
+def champion_run(feed, run_date, dry):
+    """Promotions (3 lifetime orders / 2 fresh post-demotion) + demotions (trailing 2.0).
+    Returns dict(roster, promoted, demoted, flagged, watch, err). Fail-safe: any error
+    skips the section and warns — testing/winner kills are never affected."""
+    res = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
+    try:
+        tok = shopify_token()
+        active = {p['pid']: p for p in feed}
+        champs = {pid: p for pid, p in active.items() if CHAMPION_TAG in p['tags']}
+        res['roster'] = len(champs)
+        sales, n_orders = _lifetime_sales(tok)
+        if n_orders == 0:
+            res['err'] = 'lifetime orders pull returned 0 — glitch; champion moves skipped'
+            return res
+
+        # ---- PROMOTIONS: winners with 3+ lifetime orders (or 2 fresh ones post-demotion) ----
+        cands = []
+        for pid, p in active.items():
+            if CHAMPION_TAG in p['tags'] or WINNER_TAG not in p['tags']: continue
+            slist = sales.get(pid, [])
+            if len(slist) < CHAMPION_ENTRY_ORDERS: continue
+            dem = _demoted_date(p['tags'])
+            if dem and len([s for s in slist if s['date'] > dem]) < CHAMPION_REPROMOTE_SALES:
+                continue                       # demoted: must RE-EARN with fresh sales
+            cands.append((pid, p, len(slist), dem))
+        if len(cands) > CHAMPION_PROMOTE_CAP:
+            res['err'] = (f'SAFETY STOP: {len(cands)} promotions > cap {CHAMPION_PROMOTE_CAP} — '
+                          f'looks like a data glitch; NO champion moves this run')
+            return res
+        log_rows = []; ts = datetime.datetime.now(UK).strftime('%Y-%m-%d %H:%M:%S')
+        for pid, p, n_life, dem in cands:
+            if dry:
+                out = 'DRY'
+            else:
+                r1 = shopify_add_tag(tok, pid, CHAMPION_TAG)
+                r2 = shopify_set_label_metafield(tok, pid, CHAMPION_TAG)
+                for t in [t for t in p['tags'] if str(t).startswith(CHAMPION_DEMOTED_PREFIX)]:
+                    shopify_remove_tag(tok, pid, t)          # clean re-entry
+                out = 'ok' if (r1 == 'ok' and r2 == 'ok') else f'{r1}/{r2}'
+                p['tags'].append(CHAMPION_TAG)
+            res['promoted'].append(dict(pid=pid, name=p['name'], orders=n_life,
+                                        re=bool(dem), outcome=out))
+            log_rows.append([ts, run_date.isoformat(), 'RE-PROMOTE' if dem else 'PROMOTE',
+                             pid, p['name'], n_life, '', '', out])
+            print(f"  {'would promote' if dry else 'promote'} {'(re) ' if dem else ''}champion "
+                  f"{pid} ({n_life} lifetime orders) -> {out} | {p['name'][:40]}")
+
+        # ---- DEMOTIONS: trailing floor — champion spend since 3rd-last sale vs last-2-rev/2.0 ----
+        flagged = []
+        judged = {pid: p for pid, p in champs.items()}        # only pre-existing champions
+        if judged:
+            spend = _campaign_daily_spend(run_date, set(judged), CHAMPIONS_CAMPAIGN_ID)
+            for pid, p in judged.items():
+                slist = sales.get(pid, [])
+                if len(slist) < CHAMPION_ENTRY_ORDERS: continue      # can't compute window
+                anchor = slist[-3]
+                allow = (slist[-1]['rev'] + slist[-2]['rev']) / CHAMPION_PACE_ROAS
+                spent = sum(v for d, v in spend.get(pid, ()) if d > anchor['date'])   # day AFTER anchor
+                pct = (spent / allow * 100) if allow > 0 else 0.0
+                row = dict(pid=pid, name=p['name'], allow=allow, spent=spent, pct=pct,
+                           opened=f"last-2 rev £{slist[-1]['rev'] + slist[-2]['rev']:.2f}, 3rd-last {anchor['date']}")
+                if spent > allow: flagged.append(row)
+                elif pct >= 60: res['watch'].append(row)
+            res['watch'].sort(key=lambda x: -x['pct']); res['watch'] = res['watch'][:5]
+            if len(flagged) > CHAMPION_DEMOTE_CAP:
+                res['err'] = (f'SAFETY STOP: {len(flagged)} demotions > cap {CHAMPION_DEMOTE_CAP} — '
+                              f'looks like a data glitch; NO demotions this run')
+                flagged = []
+            res['flagged'] = flagged
+            for r in flagged:
+                pid = r['pid']; p = judged[pid]
+                if dry:
+                    r['outcome'] = 'DRY'
+                else:
+                    r1 = shopify_remove_tag(tok, pid, CHAMPION_TAG)
+                    r2 = shopify_add_tag(tok, pid, f"{CHAMPION_DEMOTED_PREFIX}{run_date.isoformat()}")
+                    r3 = shopify_set_label_metafield(tok, pid, WINNER_TAG)
+                    r['outcome'] = 'ok' if (r1 == r2 == r3 == 'ok') else f'{r1}/{r2}/{r3}'
+                    if CHAMPION_TAG in p['tags']: p['tags'].remove(CHAMPION_TAG)
+                res['demoted'].append(r)
+                log_rows.append([ts, run_date.isoformat(), 'DEMOTE', pid, p['name'], len(sales.get(pid, [])),
+                                 round(r['allow'], 2), round(r['spent'], 2), r['outcome']])
+                print(f"  {'would demote' if dry else 'demote'} champion {pid} | spent £{r['spent']:.2f} > "
+                      f"allowance £{r['allow']:.2f} ({r['opened']}) | {p['name'][:40]}")
+
+        # ---- instant Ads listing moves for everything that changed ----
+        if not dry and (res['promoted'] or res['demoted']):
+            _, fp_err = champion_ads_move([x['pid'] for x in res['promoted'] if x['outcome'] == 'ok'],
+                                          [x['pid'] for x in res['demoted'] if x.get('outcome') == 'ok'], tok)
+            if fp_err: res['err'] = f'fast-path: {fp_err}'
+        if not dry and log_rows: _write_champion_log(log_rows)
+        return res
+    except Exception as ex:
+        res['err'] = f'champion rule error (section skipped; other kills unaffected): {str(ex)[:150]}'
         return res
 
 def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry):
@@ -633,6 +898,16 @@ def main():
         # BEST SELLERS: every active winner belongs to the storefront collection (add-only)
         bs_added, bs_err = sync_bestseller_collection(shopify_token(), dry)
 
+        # CHAMPIONS TIER (2026-07-20): promote 3-lifetime-order winners into the Champions
+        # campaign; demote champions whose trailing 2-gap window fell below 2.0. Runs BEFORE
+        # the winner pace rule so fresh promotions are already champion-exempt this same run.
+        ch = champion_run(feed, run_date, dry)
+        print(f"champions: roster {ch['roster']} | promoted {len(ch['promoted'])} | "
+              f"demoted {len(ch['demoted'])}" + (f" | !! {ch['err']}" if ch['err'] else ""))
+        for r in ch['watch']:
+            print(f"  champion watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of "
+                  f"£{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+
         # WINNER PACE RULE (v11): judge the Winners campaign at 2.3-pace
         w = winner_pace_run(run_date, dry)
         print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
@@ -698,6 +973,25 @@ def main():
             tg += f"\n   …+{len(w['flagged']) - 8} more — see winner_kills_log.csv"
         if w['err']:
             tg += f"\n⚠️ {html.escape(w['err'])}"
+
+        # CHAMPIONS section — roster + every move, every run
+        ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
+                  - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY')))
+        tg += (f"\n\n👑 <b>Champions (tROAS 2.0, trailing pace {CHAMPION_PACE_ROAS})</b>: "
+               f"roster {ch_now} | promoted {len(ch['promoted'])} | demoted {len(ch['demoted'])}")
+        for x in ch['promoted'][:10]:
+            tg += (f"\n⬆️ <b>{html.escape(x['name'][:42])}</b> <code>{x['pid']}</code> — "
+                   f"{x['orders']} lifetime orders{' (re-promoted)' if x['re'] else ''}"
+                   + (f" → {html.escape(str(x['outcome']))}" if x['outcome'] not in ('ok', 'DRY') else ''))
+        for r in ch['demoted'][:10]:
+            tg += (f"\n⬇️ <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
+                   f"   spent £{r['spent']:.2f} &gt; allowance £{r['allow']:.2f} "
+                   f"({html.escape(r['opened'])}) → back to Winners")
+        for r in ch['watch'][:3]:
+            tg += (f"\n👀 champion watch {r['pct']:.0f}%: <code>{r['pid']}</code> "
+                   f"£{r['spent']:.2f} of £{r['allow']:.2f}")
+        if ch['err']:
+            tg += f"\n⚠️ {html.escape(ch['err'])}"
         if bs_added:
             tg += f"\n🛍️ Best Sellers collection: +{bs_added} winner(s) added"
         if bs_err:
