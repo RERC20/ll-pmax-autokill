@@ -591,13 +591,16 @@ def _ag_listing_state(ga, gt, ag_ids):
         info[agid] = (subdiv, have)
     return info
 
-def champion_ads_move(promote_pids, demote_pids, stok):
-    """Instant listing-tree moves (label path = backup, as with winners):
-       PROMOTE: Champions AG += item UNIT_INCLUDED | Winners AG -= its include-nodes
-       DEMOTE : Champions AG -= its item nodes     | Winners AG += item UNIT_INCLUDED
-    Idempotent; any failure WARNs — the c_champion/w_campaign label still moves the
-    product on the next feed sync, and rules stay campaign-scoped either way."""
-    if not (promote_pids or demote_pids): return 0, None
+def champion_ads_move(roster_pids, demote_pids, stok):
+    """Listing-tree RECONCILIATION, every run (label path = backup, as with winners):
+       - every roster champion's item-ids: Champions AG include + Winners include-nodes removed
+       - freshly demoted: Winners AG include restored
+       - STRAY champions nodes (item-ids of products no longer in the roster): removed
+    Fully idempotent + self-healing: an interrupted run (e.g. the 8-min cron cancelling a
+    manual run mid-promotion) leaves tags without listing moves — the next run repairs it.
+    Any failure WARNs — the c_champion/w_campaign label still moves the product on the
+    next feed sync, and the rules stay campaign-scoped either way."""
+    if not (roster_pids or demote_pids): return 0, None
     try:
         import google_ads_connect as ga
         gt = ga.get_access_token()
@@ -611,19 +614,22 @@ def champion_ads_move(promote_pids, demote_pids, stok):
                                        'type': 'UNIT_INCLUDED', 'listingSource': 'SHOPPING',
                                        'parentListingGroupFilter': subdiv,
                                        'caseValue': {'productItemId': {'value': iid}}}})
-        for pid in promote_pids:
+        roster_iids = set()
+        for pid in roster_pids:
             for iid in _variant_item_ids(stok, pid):
+                roster_iids.add(iid)
                 _include(CHAMPIONS_AG_ID, ch_sub, ch_have, iid)
                 if iid in wi_have: ops.append({'remove': wi_have[iid]})
         for pid in demote_pids:
             for iid in _variant_item_ids(stok, pid):
                 _include(WINNERS_AG_ID, wi_sub, wi_have, iid)
-                if iid in ch_have: ops.append({'remove': ch_have[iid]})
+        for iid, rn in ch_have.items():                     # stray cleanup (covers demotions too)
+            if iid not in roster_iids: ops.append({'remove': rn})
         if ops:
             r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
                               headers=ga._headers(gt), json={'operations': ops}, timeout=60).json()
             if 'error' in r: raise RuntimeError(str(r)[:300])
-        print(f"  champion fast-path: {len(ops)} listing ops (promote {len(promote_pids)} / demote {len(demote_pids)})")
+            print(f"  champion fast-path: {len(ops)} listing ops (roster {len(roster_pids)} / demoted {len(demote_pids)})")
         return len(ops), None
     except Exception as ex:
         print(f"  !! champion fast-path FAILED (label path moves them on next feed sync): {ex}")
@@ -723,9 +729,11 @@ def champion_run(feed, run_date, dry):
                 print(f"  {'would demote' if dry else 'demote'} champion {pid} | spent £{r['spent']:.2f} > "
                       f"allowance £{r['allow']:.2f} ({r['opened']}) | {p['name'][:40]}")
 
-        # ---- instant Ads listing moves for everything that changed ----
-        if not dry and (res['promoted'] or res['demoted']):
-            _, fp_err = champion_ads_move([x['pid'] for x in res['promoted'] if x['outcome'] == 'ok'],
+        # ---- Ads listing reconciliation: the WHOLE roster, every run (self-healing) ----
+        if not dry:
+            roster_now = ({pid for pid in champs} - {x['pid'] for x in res['demoted'] if x.get('outcome') == 'ok'}
+                          ) | {x['pid'] for x in res['promoted'] if x['outcome'] == 'ok'}
+            _, fp_err = champion_ads_move(sorted(roster_now),
                                           [x['pid'] for x in res['demoted'] if x.get('outcome') == 'ok'], tok)
             if fp_err: res['err'] = f'fast-path: {fp_err}'
         if not dry and log_rows: _write_champion_log(log_rows)
