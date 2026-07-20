@@ -594,6 +594,10 @@ def _ag_listing_state(ga, gt, ag_ids):
 def champion_ads_move(roster_pids, demote_pids, stok):
     """Listing-tree RECONCILIATION, every run (label path = backup, as with winners):
        - every roster champion's item-ids: Champions AG include + Winners include-nodes removed
+         + TESTING AG item-BLOCK enforced (label-era winners were only blocked from Testing by
+           custom_label_1=w_campaign; the c_champion label ends that block, so without an
+           item-id exclude a champion becomes Testing-eligible again — found by the
+           segmentation proof 2026-07-20, 11/14 champions leaked)
        - freshly demoted: Winners AG include restored
        - STRAY champions nodes (item-ids of products no longer in the roster): removed
     Fully idempotent + self-healing: an interrupted run (e.g. the 8-min cron cancelling a
@@ -604,21 +608,25 @@ def champion_ads_move(roster_pids, demote_pids, stok):
     try:
         import google_ads_connect as ga
         gt = ga.get_access_token()
-        info = _ag_listing_state(ga, gt, [CHAMPIONS_AG_ID, WINNERS_AG_ID])
+        info = _ag_listing_state(ga, gt, [CHAMPIONS_AG_ID, WINNERS_AG_ID, TESTING_AG_ID])
         ch_sub, ch_have = info[CHAMPIONS_AG_ID]
         wi_sub, wi_have = info[WINNERS_AG_ID]
+        te_sub, te_have = info[TESTING_AG_ID]
         ops = []
-        def _include(agid, subdiv, have, iid):
+        def _node(agid, subdiv, have, iid, node_type):
             if iid not in have:
                 ops.append({'create': {'assetGroup': f"customers/{ga.CUSTOMER_ID}/assetGroups/{agid}",
-                                       'type': 'UNIT_INCLUDED', 'listingSource': 'SHOPPING',
+                                       'type': node_type, 'listingSource': 'SHOPPING',
                                        'parentListingGroupFilter': subdiv,
                                        'caseValue': {'productItemId': {'value': iid}}}})
+        def _include(agid, subdiv, have, iid):
+            _node(agid, subdiv, have, iid, 'UNIT_INCLUDED')
         roster_iids = set()
         for pid in roster_pids:
             for iid in _variant_item_ids(stok, pid):
                 roster_iids.add(iid)
                 _include(CHAMPIONS_AG_ID, ch_sub, ch_have, iid)
+                _node(TESTING_AG_ID, te_sub, te_have, iid, 'UNIT_EXCLUDED')   # never back into Testing
                 if iid in wi_have: ops.append({'remove': wi_have[iid]})
         for pid in demote_pids:
             for iid in _variant_item_ids(stok, pid):
