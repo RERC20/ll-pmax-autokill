@@ -375,7 +375,13 @@ def _campaign_daily_spend(run_date, pids, campaign_id):
          f"AND campaign.id = {campaign_id} AND metrics.cost_micros > 0")
     out = collections.defaultdict(list)
     for row in _ads_search(ga, gt, q):
-        parts = str(row['segments']['productItemId']).lower().split('_')
+        # Google omits productItemId on non-shopping PMax rows (e.g. a £0.003
+        # Champions row 2026-07-21) — a bare ['productItemId'] KeyError'd here and
+        # silently skipped the champion demotion check for every run after it.
+        item = row.get('segments', {}).get('productItemId')
+        if not item:
+            continue
+        parts = str(item).lower().split('_')
         pid = parts[2] if len(parts) >= 3 and parts[0] == 'shopify' else None
         if pid and pid in pids:
             out[pid].append((row['segments']['date'], int(row['metrics'].get('costMicros', 0)) / 1e6))
