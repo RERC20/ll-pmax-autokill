@@ -31,6 +31,7 @@ from creds import cred
 UK = ZoneInfo('Europe/London')
 STATE_FILE   = '_product_count_state.json'
 HISTORY_FILE = '_product_count_history.csv'
+PNL_FILE     = '_eod_pnl.json'          # midnight PNL snapshot + settled-send marker (per day)
 HIST_COLS    = ['date', 'start_count', 'end_count', 'published', 'killed', 'net']
 # DEDICATED bot for the daily summary / active-product counts, so these land in a SEPARATE chat
 # from the auto-kill messages (owner 2026-07-07). Falls back to the shared auto-kill bot if the
@@ -193,6 +194,7 @@ def do_end(tok, today, dry, force):
                "━━━━━━━━━━━\n"
                f"Active at end: <b>{end_n}</b>\n"
                "<i>(start-of-day snapshot missing — no diff this day)</i>")
+    m = None
     try:                                                           # money block UNDER the product stats;
         m = todays_money(tok, today); msg += "\n" + money_block(m)  # NEVER let a money-fetch error block the
         print(f"[END {today}] start={start_n} end={end_n} published={published} killed={killed} net={net} | "  # daily send
@@ -205,36 +207,82 @@ def do_end(tok, today, dry, force):
     if start_n is not None and (row.get('start_count') in ('', None)): row['start_count'] = start_n
     row['end_count'] = end_n; row['published'] = published; row['killed'] = killed; row['net'] = net
     rows[today.isoformat()] = row; write_history(rows)
+    if m is not None:                                # midnight PNL snapshot for the 3h settled re-pull
+        json.dump({'date': today.isoformat(), 'cost_gbp': m['cost_gbp'], 'rev_gbp': m['rev_gbp'],
+                   'orders': m['orders']}, open(PNL_FILE, 'w', encoding='utf-8'))
+    send_telegram(msg)
+
+
+def do_settle(tok, day, dry, force):
+    """~3h after midnight: re-pull the CLOSED day's money (Google restates overnight ad spend for
+    a few hours after day close) and send a clearly-bannered SETTLED PNL. Idempotent per day."""
+    snap = {}
+    if os.path.exists(PNL_FILE):
+        try: snap = json.load(open(PNL_FILE, encoding='utf-8'))
+        except Exception: snap = {}
+    if not force and snap.get('settled_date') == day.isoformat():
+        print(f"SETTLED already sent for {day}. Skipping (idempotent)."); return
+    try:
+        m = todays_money(tok, day)
+    except Exception as ex:
+        print(f"[SETTLE {day}] money re-pull FAILED: {str(ex)[:140]}"); return
+    msg = ("⏱ <b>DAY PNL — SETTLED</b>  <i>(3h re-pull)</i>\n"
+           f"\U0001F5D3 {fmt_date(day)}\n"
+           "<i>Google restates overnight ad spend after day close — these are the final figures; "
+           "trust these over the midnight PNL.</i>\n" + money_block(m))
+    # delta vs the midnight snapshot, when we have it for the same day
+    if snap.get('date') == day.isoformat() and snap.get('cost_gbp') is not None and m['cost_gbp'] is not None:
+        c0, c1 = float(snap['cost_gbp']), float(m['cost_gbp'])
+        r0 = (float(snap['rev_gbp']) / c0) if c0 > 0 else None
+        r1 = (m['rev_gbp'] / c1) if c1 > 0 else None
+        if abs(c1 - c0) >= 0.005:
+            msg += (f"\nΔ vs midnight: ad spend £{c0:,.2f} → £{c1:,.2f} ({'+' if c1 >= c0 else '−'}£{abs(c1-c0):,.2f})"
+                    + (f", ROAS {r0:.2f} → {r1:.2f}" if r0 and r1 else ""))
+        else:
+            msg += "\nΔ vs midnight: no change — midnight figures were already final."
+    print(f"[SETTLE {day}] rev£{m['rev_gbp']:.2f} spend£{(m['cost_gbp'] or 0):.2f} orders={m['orders']}")
+    print(msg.replace('<b>','').replace('</b>','').replace('<i>','').replace('</i>','').replace('<pre>','').replace('</pre>',''))
+    if dry: print("(dry-run: not sending / not writing state)"); return
+    snap['settled_date'] = day.isoformat()
+    json.dump(snap, open(PNL_FILE, 'w', encoding='utf-8'))
     send_telegram(msg)
 
 def resolve_mode(now, event, explicit):
-    """Decide rollover / start / end / skip.
-      - explicit start|end|rollover always wins (manual / gh runs).
-      - 'rollover' fires just after midnight (the grid's 00:11 UK tick): it closes out YESTERDAY
-        (END + now-settled PNL) AND opens TODAY (START) in one run — so the PNL reports a FINISHED
-        day, not a still-live one. The grid's 00:49 tick also -> rollover: a free idempotent RETRY
-        if the 00:11 run was dropped by a GitHub runner blip.
+    """Decide rollover / settle / start / end / skip.
+      - explicit start|end|rollover|settle always wins (manual / gh runs).
+      - 'rollover' fires just after midnight (the grid's 00:11/00:49 UK ticks): it closes out
+        YESTERDAY (END + midnight PNL) AND opens TODAY (START) in one run.
+      - 'settle' fires ~3h later (the 03:11 UK tick): Google restates overnight ad spend after
+        day close, so we re-pull yesterday's money and send a bannered SETTLED PNL. The settle
+        run also re-runs rollover first (idempotent), so it doubles as a free retry if both
+        midnight ticks were dropped.
       - all afternoon/evening ticks (23:11, 23:49 UK) -> skip."""
-    if explicit in ('start', 'end', 'rollover'): return explicit
-    return 'rollover' if now.hour < 12 else 'skip'
+    if explicit in ('start', 'end', 'rollover', 'settle'): return explicit
+    if now.hour < 2:  return 'rollover'
+    if now.hour < 12: return 'settle'
+    return 'skip'
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', choices=['start', 'end', 'rollover', 'auto'], default='auto')
+    ap.add_argument('--mode', choices=['start', 'end', 'rollover', 'settle', 'auto'], default='auto')
     ap.add_argument('--dry', action='store_true')
     ap.add_argument('--force', action='store_true')
     a = ap.parse_args()
     now = datetime.datetime.now(UK); today = now.date()
-    explicit = a.mode if a.mode in ('start', 'end', 'rollover') else None
+    explicit = a.mode if a.mode in ('start', 'end', 'rollover', 'settle') else None
     mode = resolve_mode(now, os.environ.get('GITHUB_EVENT_NAME', ''), explicit)
     print(f"daily_product_count | UK now={now:%Y-%m-%d %H:%M} | mode={mode}{' (dry)' if a.dry else ''}")
     if mode == 'skip':
-        print("grid tick outside the 00:11 rollover window — nothing to do."); return
+        print("grid tick outside the rollover/settle windows — nothing to do."); return
     tok = shopify_token()
+    yest = today - datetime.timedelta(days=1)
     if mode == 'rollover':                          # just after midnight: close yesterday, open today
-        yest = today - datetime.timedelta(days=1)
-        do_end(tok, yest, a.dry, a.force)           # yesterday's END + settled PNL (reads yesterday's START)
+        do_end(tok, yest, a.dry, a.force)           # yesterday's END + midnight PNL (reads yesterday's START)
         do_start(tok, today, a.dry, a.force)        # today's START (overwrites state)
+    elif mode == 'settle':                          # ~03:11 UK: settled PNL re-send (+ free rollover retry)
+        do_end(tok, yest, a.dry, False)             # idempotent — only acts if midnight ticks were dropped
+        do_start(tok, today, a.dry, False)
+        do_settle(tok, yest, a.dry, a.force)
     else:
         (do_start if mode == 'start' else do_end)(tok, today, a.dry, a.force)
 

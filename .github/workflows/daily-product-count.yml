@@ -29,15 +29,21 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'start | end | rollover | auto'
+        description: 'start | end | rollover | settle | auto'
         required: false
         default: 'auto'
         type: choice
-        options: [auto, rollover, start, end]
+        options: [auto, rollover, settle, start, end]
   # BACKUP only: GitHub's own schedule (best-effort, set for BST). Cannot overlap the kill engine
   # (that workflow has no schedule). Safe to leave on; the dedicated cron above is the punctual one.
+  # The 02:11 UTC line (03:11 BST) drives the SETTLED PNL re-send: Google restates overnight ad
+  # spend after day close, so the midnight PNL is provisional; the settle message is the final one.
+  # GitHub schedule lateness (0-30 min) is harmless here. For punctuality, a cron-job.org tick at
+  # 03:11 Europe/London on the same repository_dispatch also works — the script routes any
+  # 02:00-11:59 UK tick to settle automatically.
   schedule:
     - cron: '11 23 * * *'   # 00:11 BST  -> ROLLOVER (yesterday END+PNL, today START) — backup only
+    - cron: '11 2 * * *'    # 03:11 BST  -> SETTLE (bannered settled-PNL re-send for yesterday)
 
 permissions:
   contents: read            # never commits back; state lives in the private cache
@@ -68,6 +74,7 @@ jobs:
           path: |
             _product_count_state.json
             _product_count_history.csv
+            _eod_pnl.json
           key: product-count-${{ github.run_id }}
           restore-keys: |
             product-count-
@@ -95,4 +102,5 @@ jobs:
           path: |
             _product_count_state.json
             _product_count_history.csv
+            _eod_pnl.json
           key: product-count-${{ github.run_id }}
