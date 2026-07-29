@@ -1,7 +1,12 @@
-name: PMax Auto-Kill (every 8 min)
+name: PMax Auto-Kill (15-min cadence)
 
 # Runs kill_engine_google_auto.py on GitHub's servers (no laptop/VM needed).
 # Drafts losing products, sends a Telegram message every run + a Resend email digest every 12h.
+#
+# CADENCE (owner 2026-07-29): the external cron still ticks every 8 min (unchanged on
+# cron-job.org), but a gate below only lets the engine run if >=15 min passed since the
+# last run — halves Google Ads API ops (Basic Access 15k/day quota was exhausting).
+# Skipped ticks exit in seconds without touching Google. To change cadence, edit GATE_S.
 #
 # PRIVACY: this repo is PUBLIC only so Actions minutes are free & unlimited. The CODE is public;
 # your API creds are NOT -- they live in encrypted repo Secrets (never in the code, masked in logs,
@@ -31,27 +36,50 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # Restore the rolling kills history (used by the 12h email digest) from a PRIVATE Actions
-      # cache -- not committed to the repo, not web-visible. restore-keys grabs the newest saved copy.
+      # Restore the rolling kills history (used by the 12h email digest) + the cadence
+      # timestamp from a PRIVATE Actions cache -- not committed, not web-visible.
       - name: Restore kills history
         uses: actions/cache/restore@v4
         with:
           path: |
             kills_log_auto.csv
             winner_kills_log.csv
+            _last_run_epoch.txt
           key: kills-log-${{ github.run_id }}
           restore-keys: |
             kills-log-
 
+      # 15-MINUTE CADENCE GATE: the 8-min grid tick only proceeds if >=870s since the
+      # last engine run. The epoch is stamped BEFORE the engine runs, so even a failed
+      # run counts as a tick (prevents retry-hammering Google during quota exhaustion).
+      - name: Cadence gate (15 min)
+        id: gate
+        run: |
+          GATE_S=870
+          now=$(date +%s)
+          last=$(cat _last_run_epoch.txt 2>/dev/null || echo 0)
+          age=$((now - last))
+          if [ "$age" -lt "$GATE_S" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tick skipped — last engine run ${age}s ago (< ${GATE_S}s gate)"
+          else
+            echo "$now" > _last_run_epoch.txt
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "gate open — last engine run ${age}s ago"
+          fi
+
+      - name: Set up Python
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: steps.gate.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+
       - name: Run the auto-kill engine
+        if: steps.gate.outputs.skip != 'true'
         env:
           GOOGLE_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_DEVELOPER_TOKEN }}
           GOOGLE_CLIENT_ID:       ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -66,7 +94,7 @@ jobs:
           TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python kill_engine_google_auto.py
 
-      # Save the updated kills history back to the PRIVATE cache for the next run.
+      # Save the updated kills history + cadence timestamp back to the PRIVATE cache.
       - name: Save kills history
         if: always()
         uses: actions/cache/save@v4
@@ -74,4 +102,5 @@ jobs:
           path: |
             kills_log_auto.csv
             winner_kills_log.csv
+            _last_run_epoch.txt
           key: kills-log-${{ github.run_id }}
