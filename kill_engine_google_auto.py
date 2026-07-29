@@ -597,7 +597,12 @@ def _ag_listing_state(ga, gt, ag_ids):
         info[agid] = (subdiv, have)
     return info
 
-def champion_ads_move(roster_pids, demote_pids, stok):
+def _iid_pid(iid):
+    """'shopify_zz_{pid}_{vid}' -> pid ('' if the value has an unexpected shape)."""
+    parts = iid.split('_')
+    return parts[2] if len(parts) >= 4 else ''
+
+def champion_ads_move(roster_pids, demote_pids, stok, winner_pids=None):
     """Listing-tree RECONCILIATION, every run (label path = backup, as with winners):
        - every roster champion's item-ids: Champions AG include + Winners include-nodes removed
          + TESTING AG item-BLOCK enforced (label-era winners were only blocked from Testing by
@@ -618,33 +623,55 @@ def champion_ads_move(roster_pids, demote_pids, stok):
         ch_sub, ch_have = info[CHAMPIONS_AG_ID]
         wi_sub, wi_have = info[WINNERS_AG_ID]
         te_sub, te_have = info[TESTING_AG_ID]
-        ops = []
+        creates, removes = [], set()
         def _node(agid, subdiv, have, iid, node_type):
             if iid not in have:
-                ops.append({'create': {'assetGroup': f"customers/{ga.CUSTOMER_ID}/assetGroups/{agid}",
-                                       'type': node_type, 'listingSource': 'SHOPPING',
-                                       'parentListingGroupFilter': subdiv,
-                                       'caseValue': {'productItemId': {'value': iid}}}})
+                creates.append({'create': {'assetGroup': f"customers/{ga.CUSTOMER_ID}/assetGroups/{agid}",
+                                           'type': node_type, 'listingSource': 'SHOPPING',
+                                           'parentListingGroupFilter': subdiv,
+                                           'caseValue': {'productItemId': {'value': iid}}}})
         def _include(agid, subdiv, have, iid):
             _node(agid, subdiv, have, iid, 'UNIT_INCLUDED')
         roster_iids = set()
+        roster_set = {str(p) for p in roster_pids}
         for pid in roster_pids:
             for iid in _variant_item_ids(stok, pid):
                 roster_iids.add(iid)
                 _include(CHAMPIONS_AG_ID, ch_sub, ch_have, iid)
                 _node(TESTING_AG_ID, te_sub, te_have, iid, 'UNIT_EXCLUDED')   # never back into Testing
-                if iid in wi_have: ops.append({'remove': wi_have[iid]})
+                if iid in wi_have: removes.add(wi_have[iid])
         for pid in demote_pids:
             for iid in _variant_item_ids(stok, pid):
                 _include(WINNERS_AG_ID, wi_sub, wi_have, iid)
         for iid, rn in ch_have.items():                     # stray cleanup (covers demotions too)
-            if iid not in roster_iids: ops.append({'remove': rn})
-        if ops:
+            if iid not in roster_iids: removes.add(rn)
+        # STALE PRUNE (2026-07-29): dead winners' item-id nodes were never removed, so the
+        # Winners/Testing trees crept to the 1,000-node cap and every create bounced with
+        # RESOURCE_LIMIT. Each run now drops nodes whose product is no longer an active
+        # winner/champion. Sanity-gated: an implausibly small winner set skips the prune.
+        if winner_pids and len(winner_pids) >= 20:
+            keep_wi = winner_pids - roster_set              # champions serve from Champions AG
+            keep_te = winner_pids | roster_set
+            for iid, rn in wi_have.items():
+                if _iid_pid(iid) not in keep_wi: removes.add(rn)
+            for iid, rn in te_have.items():
+                if _iid_pid(iid) not in keep_te: removes.add(rn)
+        # removes FIRST (frees node slots), then creates — both chunked; never one giant
+        # atomic mutate again (that is what wedged at the cap).
+        rm_ops = [{'remove': rn} for rn in sorted(removes)]
+        for i in range(0, len(rm_ops), 500):
             r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
-                              headers=ga._headers(gt), json={'operations': ops}, timeout=60).json()
+                              headers=ga._headers(gt), json={'operations': rm_ops[i:i + 500]}, timeout=120).json()
             if 'error' in r: raise RuntimeError(str(r)[:300])
-            print(f"  champion fast-path: {len(ops)} listing ops (roster {len(roster_pids)} / demoted {len(demote_pids)})")
-        return len(ops), None
+        for i in range(0, len(creates), 500):
+            r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
+                              headers=ga._headers(gt), json={'operations': creates[i:i + 500]}, timeout=120).json()
+            if 'error' in r: raise RuntimeError(str(r)[:300])
+        n_ops = len(creates) + len(removes)
+        if n_ops:
+            print(f"  champion fast-path: {len(creates)} creates / {len(removes)} removes "
+                  f"(roster {len(roster_pids)} / demoted {len(demote_pids)})")
+        return n_ops, None
     except Exception as ex:
         print(f"  !! champion fast-path FAILED (label path moves them on next feed sync): {ex}")
         return 0, str(ex)[:150]
@@ -748,7 +775,8 @@ def champion_run(feed, run_date, dry):
             roster_now = ({pid for pid in champs} - {x['pid'] for x in res['demoted'] if x.get('outcome') == 'ok'}
                           ) | {x['pid'] for x in res['promoted'] if x['outcome'] == 'ok'}
             _, fp_err = champion_ads_move(sorted(roster_now),
-                                          [x['pid'] for x in res['demoted'] if x.get('outcome') == 'ok'], tok)
+                                          [x['pid'] for x in res['demoted'] if x.get('outcome') == 'ok'], tok,
+                                          winner_pids={str(p['pid']) for p in feed if WINNER_TAG in p['tags']})
             if fp_err: res['err'] = f'fast-path: {fp_err}'
         if not dry and log_rows: _write_champion_log(log_rows)
         return res
