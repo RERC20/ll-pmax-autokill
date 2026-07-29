@@ -13,7 +13,7 @@
 #   python kill_engine_google.py          # interactive: shows kills, asks yes/no
 #   python kill_engine_google.py --auto   # unattended (for the hourly task): drafts + logs, no prompt
 # ---------------------------------------------------------------------------
-import sys, argparse, datetime, collections, requests
+import sys, argparse, datetime, collections, requests, time
 from openpyxl import Workbook
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
@@ -47,8 +47,15 @@ def google_product_perf(run_date):
     tok=ga.get_access_token()
     base=ga.ADS_BASE; cid=ga.CUSTOMER_ID
     def search(q):
-        r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json={'query':q}, timeout=60)
-        r.raise_for_status(); return r.json().get('results', [])
+        # 429-aware: brief backoff for per-minute throttles; a persistent 429 means the
+        # DEVELOPER token's daily op quota (Basic Access 15k/day) is spent — raise a
+        # recognisable error so the runner reports "quota exhausted, skipped" not FAILED.
+        for attempt in range(3):
+            r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json={'query':q}, timeout=60)
+            if r.status_code == 429:
+                if attempt < 2: time.sleep(10*(attempt+1)); continue
+                raise RuntimeError(f"GOOGLE_QUOTA_EXHAUSTED: 429 after retries — {r.text[:200]}")
+            r.raise_for_status(); return r.json().get('results', [])
     g=collections.defaultdict(lambda: {'cost7':0.0,'cost30':0.0,'clicks30':0})
     # Windows = ROLLING last N days, INCLUDING today (matches the dashboard timing fix). A same-day
     # sale counts immediately, so a cross-sell / low-spend sale isn't mis-read as £0 revenue and

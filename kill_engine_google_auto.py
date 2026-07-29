@@ -1028,13 +1028,26 @@ def main():
     except Exception:
         import traceback
         err = traceback.format_exc()
-        print("!! AUTO-KILL RUN FAILED — nothing further drafted:\n" + err)
-        try:
-            send_telegram(f"❌ <b>Auto-Kill FAILED</b>\n{ts} UK\n<pre>{err[-500:]}</pre>")
-            send_report(f"AUTO-KILL FAILED — {run_date}",
-                        f"auto-kill run FAILED at {ts} (UK).\n\nError:\n{err}")
-        except Exception:
-            pass
+        quota = any(sig in err for sig in
+                    ('GOOGLE_QUOTA_EXHAUSTED', 'RESOURCE_EXHAUSTED', '429 Client Error'))
+        if quota:
+            # Google Ads DEVELOPER-token daily op quota spent (Basic Access 15k/day,
+            # resets 00:00 PT = 08:00 UK BST). Not a fault: skip quietly, next grid
+            # tick retries. Shopify state untouched; no kills were needed to be safe.
+            print("!! run skipped — Google Ads daily API quota exhausted:\n" + err[-300:])
+            try:
+                send_telegram(f"⏸ <b>Auto-Kill SKIPPED</b> — Google Ads daily API quota exhausted\n"
+                              f"{ts} UK\nResets 08:00 UK; next grid tick retries. Shopify untouched.")
+            except Exception:
+                pass
+        else:
+            print("!! AUTO-KILL RUN FAILED — nothing further drafted:\n" + err)
+            try:
+                send_telegram(f"❌ <b>Auto-Kill FAILED</b>\n{ts} UK\n<pre>{err[-500:]}</pre>")
+                send_report(f"AUTO-KILL FAILED — {run_date}",
+                            f"auto-kill run FAILED at {ts} (UK).\n\nError:\n{err}")
+            except Exception:
+                pass
     finally:
         sys.stdout = real
         logf.close()
