@@ -490,7 +490,7 @@ def winner_pace_run(run_date, dry):
 # Only repeat-sellers ever absorbed extra spend productively (Jul-16 analysis) — this tier
 # gives them a looser target so Google buys volume, watched by a per-product trailing floor.
 #
-#   ENTRY      3 lifetime orders (order count, not units; cancelled excluded)
+#   ENTRY      4 lifetime orders (order count, not units; cancelled excluded; raised 3->4 2026-07-31)
 #              -> tag c_champion (w_campaign KEPT), feed label -> c_champion,
 #                 item-ids: Champions AG include + Winners AG include-nodes removed.
 #   DEMOTE     Champions-campaign spend since the 3rd-last sale
@@ -509,7 +509,11 @@ CHAMPION_TAG            = 'c_champion'
 CHAMPION_DEMOTED_PREFIX = 'champ_demoted:'          # champ_demoted:YYYY-MM-DD, set on demotion
 CHAMPIONS_CAMPAIGN_ID   = '24047674442'             # PMax | Champions | UK  (created 2026-07-20)
 CHAMPIONS_AG_ID         = '6731971798'              # its asset group (listing tree mirrors Winners)
-CHAMPION_ENTRY_ORDERS   = 3
+CHAMPION_ENTRY_ORDERS   = 4   # raised 3->4 (owner 2026-07-31): cohort audit — of 23 products that
+                              # ever entered at 3 sales, the 10 that never resold burned 24% of all
+                              # champion spend for £0 return (ROAS 0.00), while 4-5-sale entrants ran
+                              # 3.14 and 6+ ran 4.20. Sale #4 filters the whole dud class at minimal
+                              # star-delay; 5+ would only delay the profitable 4-5 cohort.
 CHAMPION_PACE_ROAS      = 2.0
 CHAMPION_REPROMOTE_SALES = 2
 CHAMPION_PROMOTE_CAP    = 25                        # >N promotions in one run = glitch -> abort section
@@ -686,7 +690,7 @@ def _write_champion_log(rows):
         for r in rows: w.writerow(r)
 
 def champion_run(feed, run_date, dry):
-    """Promotions (3 lifetime orders / 2 fresh post-demotion) + demotions (trailing 2.0).
+    """Promotions (4 lifetime orders / 2 fresh post-demotion) + demotions (trailing 2.0).
     Returns dict(roster, promoted, demoted, flagged, watch, err). Fail-safe: any error
     skips the section and warns — testing/winner kills are never affected."""
     res = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
@@ -700,7 +704,7 @@ def champion_run(feed, run_date, dry):
             res['err'] = 'lifetime orders pull returned 0 — glitch; champion moves skipped'
             return res
 
-        # ---- PROMOTIONS: winners with 3+ lifetime orders (or 2 fresh ones post-demotion) ----
+        # ---- PROMOTIONS: winners with 4+ lifetime orders (or 2 fresh ones post-demotion) ----
         cands = []
         for pid, p in active.items():
             if CHAMPION_TAG in p['tags'] or WINNER_TAG not in p['tags']: continue
