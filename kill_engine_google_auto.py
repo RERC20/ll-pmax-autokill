@@ -1053,6 +1053,28 @@ def main():
         if w['live'] and w['killed'] and w['pool'] < WINNER_POOL_ALERT:
             tg += (f"\n⚠️ <b>WINNER POOL LOW: {w['pool']} left</b> (&lt;{WINNER_POOL_ALERT}) — "
                    f"consider cutting the Winners £100/day budget (your manual call).")
+
+        # offer-slot guard: note if anything drafted this run carried a pp_offer_* tag
+        # (smart collections drop it instantly; the nightly rotation refills the pool)
+        pp_hit = [p['pid'] for p, _, _ in to_draft
+                  if outcomes.get(p['pid']) == 'ok' and any(t.startswith('pp_offer') for t in p.get('tags', []))]
+        wk = [str(r['pid']) for r in w['flagged'] if w['live'] and str(r.get('outcome')) == 'ok']
+        if wk:
+            try:
+                ids = ','.join(f'"gid://shopify/Product/{p}"' for p in wk)
+                jj = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                                   headers={'X-Shopify-Access-Token': shopify_token(),
+                                            'Content-Type': 'application/json'},
+                                   json={'query': '{nodes(ids:[%s]){... on Product{legacyResourceId tags}}}' % ids},
+                                   timeout=30).json()
+                pp_hit += [str(n['legacyResourceId']) for n in ((jj.get('data') or {}).get('nodes') or [])
+                           if n and any(t.startswith('pp_offer') for t in n.get('tags', []))]
+            except Exception:
+                pass
+        if pp_hit:
+            tg += ("\n🎁 <b>upsell-offer product drafted:</b> "
+                   + ", ".join(f"<code>{p}</code>" for p in pp_hit)
+                   + " — pool self-heals, refills tonight")
         send_telegram(tg, xlsx)
 
         # RESEND email — twice a day (SUMMARY_HOURS): TEXT digest of last 12h + the .xlsx
