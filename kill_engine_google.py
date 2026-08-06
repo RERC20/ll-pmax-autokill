@@ -50,12 +50,24 @@ def google_product_perf(run_date):
         # 429-aware: brief backoff for per-minute throttles; a persistent 429 means the
         # DEVELOPER token's daily op quota (Basic Access 15k/day) is spent — raise a
         # recognisable error so the runner reports "quota exhausted, skipped" not FAILED.
-        for attempt in range(3):
-            r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json={'query':q}, timeout=60)
+        # Google ALSO intermittently returns a transient 400 INVALID_ARGUMENT (and 5xx)
+        # on otherwise-valid large-window queries — verified 2026-08-06: the same 30-day
+        # query fails ~1-in-3 then succeeds on retry. Retrying with backoff fixes the
+        # daily "❌ Auto-Kill FAILED" spam. Only raise after all retries are exhausted.
+        last = None
+        for attempt in range(5):
+            r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json={'query':q}, timeout=90)
+            if r.status_code == 200:
+                return r.json().get('results', [])
+            last = r
             if r.status_code == 429:
-                if attempt < 2: time.sleep(10*(attempt+1)); continue
+                if attempt < 4: time.sleep(10*(attempt+1)); continue
                 raise RuntimeError(f"GOOGLE_QUOTA_EXHAUSTED: 429 after retries — {r.text[:200]}")
-            r.raise_for_status(); return r.json().get('results', [])
+            if r.status_code in (400, 500, 502, 503, 504) and attempt < 4:
+                time.sleep(4*(attempt+1)); continue      # transient Google flake -> retry
+            r.raise_for_status()
+        last.raise_for_status()                          # exhausted retries -> surface real error
+        return []
     g=collections.defaultdict(lambda: {'cost7':0.0,'cost30':0.0,'clicks30':0})
     # Windows = ROLLING last N days, INCLUDING today (matches the dashboard timing fix). A same-day
     # sale counts immediately, so a cross-sell / low-spend sale isn't mis-read as £0 revenue and
