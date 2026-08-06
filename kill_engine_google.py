@@ -33,7 +33,11 @@ PMAX_CAMPAIGN_ID = '23620737018'                             # now "PMax | Winne
 # campaign (id 23620737018, now Winners), so it drops out of this scoped view.
 # That's intentional - products get a clean evaluation slate in the new Testing
 # campaign; the £40/day budget caps any bleed while data re-accumulates.
-TESTING_CAMPAIGN_ID = '24027270949'                          # PMax | Testing | UK — the only campaign killed
+# CAMPAIGN SPLIT #2 (2026-08-07): autumn/winter imports test in their own campaign
+# 'PMax | Testing | AW | UK' (24116871559, serves ONLY GMC custom_label_2='aw26').
+# The engine judges spend across BOTH testing campaigns; Winners/Champions stay exempt.
+TESTING_CAMPAIGN_IDS = ('24027270949', '24116871559')        # Testing | UK  +  Testing | AW | UK
+TESTING_CAMPAIGN_ID = TESTING_CAMPAIGN_IDS[0]                # back-compat alias
 RUN_LOG   = 'kill_engine_google_runs.log'
 KILLS_LOG = 'kills_log_google.csv'
 
@@ -77,7 +81,7 @@ def google_product_perf(run_date):
         start=(run_date-datetime.timedelta(days=days-1)).isoformat()  # today + (N-1) prior days = N dates
         q=(f"SELECT campaign.id, segments.product_item_id, metrics.cost_micros, metrics.clicks "
            f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{end}' "
-           f"AND campaign.id = {TESTING_CAMPAIGN_ID}")   # ONLY the Testing campaign (split 2026-07-11)
+           f"AND campaign.id IN ({', '.join(TESTING_CAMPAIGN_IDS)})")   # BOTH testing campaigns (splits 2026-07-11 + 2026-08-07)
         for row in search(q):
             parts=str(row['segments']['productItemId']).split('_')      # shopify_zz_<pid>_<vid>
             pid=norm(parts[2]) if len(parts)>=3 else None
