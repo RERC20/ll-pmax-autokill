@@ -230,7 +230,10 @@ def evaluate(p, run_date, is_monday):
     if not recent14:                              # a sale in 14d shields (same shield as before)
         if cost30 > gate and zero30:
             return ('KILL','Tier 2',f'no-sale past gate: £{cost30:.2f} > £{gate:.2f} (min(price/7,£5), price £{price:.2f}), £0 rev')
-        if is_monday and dl>=21 and clk<5:
+        # Tier 4 age gate 21 -> 40 (owner 2026-08-07): with the 530-product AW batch
+        # sharing £30/day, a product can sit ~6p/day for weeks with <5 clicks through no
+        # fault of its own. 40d gives every product a real window before "ghost" applies.
+        if is_monday and dl>=40 and clk<5:
             return ('KILL','Tier 4',f'ghost: {clk} clicks/{dl}d')
     # -- REVERT BLOCK: pre-2026-07-15 no-sale tiers (flat £5 / 40 / 70 clicks). To switch back,
     #    delete the price/7 block above and un-comment this (backup also in

@@ -505,6 +505,13 @@ def winner_pace_run(run_date, dry):
 #              breaches the winners 2.3 pace, the existing winner rule drafts it (permanent).
 #   GUARDS     promotions capped (glitch), demotions capped (glitch), zero-orders pull skips
 #              the whole section; failures WARN and never touch the testing/winner kills.
+# ── CHAMPIONS DISABLED (owner 2026-08-07) ──────────────────────────────────
+# 20-day audit: Champions spent £953 at pixel 1.60 (W32: 0.75) with CPC £0.46 vs
+# Winners' 1.99 at £0.35 over the same period — a 7-product roster can't feed a
+# tROAS bidder. Campaign paused, roster folded back into Winners (c_champion tag
+# removed, feed label restored to w_campaign). Flip to True only when the roster
+# can be rebuilt at 25-30+ products.
+CHAMPIONS_ENABLED       = False
 CHAMPION_TAG            = 'c_champion'
 CHAMPION_DEMOTED_PREFIX = 'champ_demoted:'          # champ_demoted:YYYY-MM-DD, set on demotion
 CHAMPIONS_CAMPAIGN_ID   = '24047674442'             # PMax | Champions | UK  (created 2026-07-20)
@@ -955,12 +962,16 @@ def main():
         # CHAMPIONS TIER (2026-07-20): promote 3-lifetime-order winners into the Champions
         # campaign; demote champions whose trailing 2-gap window fell below 2.0. Runs BEFORE
         # the winner pace rule so fresh promotions are already champion-exempt this same run.
-        ch = champion_run(feed, run_date, dry)
-        print(f"champions: roster {ch['roster']} | promoted {len(ch['promoted'])} | "
-              f"demoted {len(ch['demoted'])}" + (f" | !! {ch['err']}" if ch['err'] else ""))
-        for r in ch['watch']:
-            print(f"  champion watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of "
-                  f"£{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+        if CHAMPIONS_ENABLED:
+            ch = champion_run(feed, run_date, dry)
+            print(f"champions: roster {ch['roster']} | promoted {len(ch['promoted'])} | "
+                  f"demoted {len(ch['demoted'])}" + (f" | !! {ch['err']}" if ch['err'] else ""))
+            for r in ch['watch']:
+                print(f"  champion watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of "
+                      f"£{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+        else:
+            ch = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
+            print("champions: DISABLED (campaign paused 2026-08-07 — roster folded into Winners)")
 
         # WINNER PACE RULE (v11): judge the Winners campaign at 2.3-pace
         w = winner_pace_run(run_date, dry)
@@ -1028,11 +1039,14 @@ def main():
         if w['err']:
             tg += f"\n⚠️ {html.escape(w['err'])}"
 
-        # CHAMPIONS section — roster + every move, every run
-        ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
-                  - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY')))
-        tg += (f"\n\n👑 <b>Champions (tROAS 2.0, trailing pace {CHAMPION_PACE_ROAS})</b>: "
-               f"roster {ch_now} | promoted {len(ch['promoted'])} | demoted {len(ch['demoted'])}")
+        # CHAMPIONS section — roster + every move, every run (single line while disabled)
+        if not CHAMPIONS_ENABLED:
+            tg += "\n\n👑 Champions: disabled (paused 2026-08-07, folded into Winners)"
+        else:
+            ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
+                      - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY')))
+            tg += (f"\n\n👑 <b>Champions (tROAS 2.0, trailing pace {CHAMPION_PACE_ROAS})</b>: "
+                   f"roster {ch_now} | promoted {len(ch['promoted'])} | demoted {len(ch['demoted'])}")
         for x in ch['promoted'][:10]:
             tg += (f"\n⬆️ <b>{html.escape(x['name'][:42])}</b> <code>{x['pid']}</code> — "
                    f"{x['orders']} lifetime orders{' (re-promoted)' if x['re'] else ''}"
