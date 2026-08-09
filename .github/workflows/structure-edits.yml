@@ -1,4 +1,4 @@
-name: Structure Edits (one-shot 00:10 UK Aug-11)
+name: Structure Edits (one-shot 00:10 UK Aug-10)
 
 # ONE-SHOT (owner 2026-08-10): Testing summer -> £100/day, Testing AW -> £60/day,
 # Winners -> tROAS 2.2 + £40/day. The PRIMARY trigger is the bridge step inside
@@ -11,7 +11,8 @@ name: Structure Edits (one-shot 00:10 UK Aug-11)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: '10 23 10 8 *'   # 23:10 UTC Aug 10 = 00:10 UK (BST) — backup only, best-effort
+    - cron: '10 23 9,10 8 *'   # 23:10 UTC Aug 9 = 00:10 UK Aug 10 (BST) — backup only, best-effort
+                               # (Aug 10 slot = second-night no-op backup; script is idempotent)
 
 permissions:
   contents: read

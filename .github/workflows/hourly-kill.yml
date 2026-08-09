@@ -52,16 +52,16 @@ jobs:
           restore-keys: |
             kills-log-
 
-      # ONE-SHOT BRIDGE (owner 2026-08-10): GitHub's own `schedule` is best-effort, so the
+      # ONE-SHOT BRIDGE (owner 2026-08-09): GitHub's own `schedule` is best-effort, so the
       # external 8-min cron that fires THIS workflow also triggers the structure-edits
-      # workflow ONCE, at the first tick on/after 23:10 UTC Aug 10 (= 00:10 UK Aug 11).
+      # workflow ONCE, at the first tick on/after 23:10 UTC Aug 9 (= 00:10 UK Aug 10).
       # The cached marker guarantees once-only; the window closes Aug 12 (the script has
       # its own date guard + idempotence as second/third nets). DELETE this step, the
       # `actions: write` permission above and the marker cache line after it fires.
-      - name: One-shot bridge -> structure edits (00:10 UK Aug-11)
+      - name: One-shot bridge -> structure edits (00:10 UK Aug-10)
         run: |
           if [ -f _structure_edits_fired.txt ]; then echo "bridge: already fired"; exit 0; fi
-          target=$(date -u -d '2026-08-10 23:10:00' +%s)
+          target=$(date -u -d '2026-08-09 23:10:00' +%s)
           expiry=$(date -u -d '2026-08-12 00:00:00' +%s)
           now=$(date +%s)
           if [ "$now" -lt "$target" ] || [ "$now" -gt "$expiry" ]; then

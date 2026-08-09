@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ONE-SHOT campaign structure edits (owner 2026-08-10, scheduled 00:10 UK Aug-11):
+"""ONE-SHOT campaign structure edits (owner 2026-08-09, scheduled 00:10 UK Aug-10):
 
     Testing|UK (summer)  24027270949   budget -> £100/day
     Testing|AW           24116871559   budget -> £60/day
@@ -19,8 +19,8 @@ ap.add_argument('--force', action='store_true', help='skip the Aug 10-12 2026 da
 A = ap.parse_args()
 
 today = datetime.datetime.now(datetime.timezone.utc).date()
-if not A.force and not (datetime.date(2026, 8, 10) <= today <= datetime.date(2026, 8, 12)):
-    print(f'date guard: {today} outside 2026-08-10..12 window — nothing done'); sys.exit(0)
+if not A.force and not (datetime.date(2026, 8, 9) <= today <= datetime.date(2026, 8, 12)):
+    print(f'date guard: {today} outside 2026-08-09..12 window — nothing done'); sys.exit(0)
 
 CID = ga.CUSTOMER_ID
 TOK = ga.get_access_token()
