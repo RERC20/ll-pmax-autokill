@@ -6,7 +6,7 @@
 #   1. Pull the live feed (Google Ads cost/clicks + Shopify revenue, UK tz).
 #   2. Tag new winners (any Shopify sale) + fast-path them into the Winners campaign.
 #   3. WINNER PACE RULE (v11): kill winners whose Winners-campaign spend since
-#      their last sale exceeds that sale's revenue / 2.3 (see block below).
+#      their last sale exceeds that sale's revenue / 2.8 (see block below).
 #   4. Apply the SAME v4 rules (evaluate) to the TESTING pool (winners exempt).
 #   5. DRAFT every flagged product in Shopify (no yes/no prompt).
 #   6. NOTIFY:
@@ -270,15 +270,16 @@ def sync_bestseller_collection(tok, dry):
         return 0, f'Best Sellers sync error: {str(ex)[:120]}'
 
 # ── WINNER PACE RULE (v11 — owner-approved 2026-07-12) ──────────────────────
-# The Winners campaign has ONE kill rule, the "2.3-pace" rule:
+# The Winners campaign has ONE kill rule, the "2.8-pace" rule:
 #
-#     KILL when Winners-campaign spend SINCE THE LAST SALE > that sale's revenue / 2.3
-#     (winner with no sale in the lookback: allowance = product price / 2.3)
+#     KILL when Winners-campaign spend SINCE THE LAST SALE > that sale's revenue / 2.8
+#     (winner with no sale in the lookback: allowance = product price / 2.8)
 #
-# Why 2.3: a kill line at 2.3-pace makes ~2.4 the survival standard, holding the
-# Winners campaign blended at the owner's 2.4+ target. Every sale opens a fresh
-# cycle and prepays EXACTLY its own revenue/2.3 of runway. Allowances never
-# stack — past glory never pays for the present.
+# Why 2.8 (owner 2026-08-10, raised from 2.3 alongside Winners tROAS 2.0 -> 2.2):
+# a kill line at 2.8-pace makes ~2.9 the survival standard, holding the Winners
+# campaign at the owner's TRUE-2.5+ doctrine (pixel 2.2 ≈ TRUE ~2.75). Every sale
+# opens a fresh cycle and prepays EXACTLY its own revenue/2.8 of runway. Allowances
+# never stack — past glory never pays for the present.
 #
 # Owner-approved design decisions (2026-07-12 session):
 #   • Sales truth = Shopify, ANY channel (ads / organic / social / cross-sell).
@@ -303,7 +304,7 @@ def sync_bestseller_collection(tok, dry):
 #     warns — it can never block or distort the testing kills. A glitchy run
 #     that flags more than WINNER_KILL_CAP winners aborts (data glitch guard,
 #     same philosophy as the testing KILL_CAP).
-WINNER_PACE_ROAS  = 2.3                            # the ONE tunable constant
+WINNER_PACE_ROAS  = 2.8                            # the ONE tunable constant (2.3 -> 2.8 owner 2026-08-10)
 WINNER_KILL_START = datetime.date(2026, 7, 13)     # LIVE (owner 2026-07-13: "if a winner hits the rules kill it, don't wait for Jul 25")
 WINNER_LOOKBACK_D = 60                             # last-sale + spend lookback window
 WINNER_KILL_CAP   = 10                             # >N winner kills in one run = glitch -> abort + alert
@@ -502,7 +503,7 @@ def winner_pace_run(run_date, dry):
 #              winners pace clock restarts anchored on its own last sale.
 #   RE-ENTER   2 NEW sales (dates strictly after the champ_demoted: stamp) while in Winners.
 #   2nd FAIL   nothing special here — a demoted champion is a normal winner again; if it
-#              breaches the winners 2.3 pace, the existing winner rule drafts it (permanent).
+#              breaches the winners 2.8 pace, the existing winner rule drafts it (permanent).
 #   GUARDS     promotions capped (glitch), demotions capped (glitch), zero-orders pull skips
 #              the whole section; failures WARN and never touch the testing/winner kills.
 # ── CHAMPIONS DISABLED (owner 2026-08-07) ──────────────────────────────────
@@ -973,7 +974,7 @@ def main():
             ch = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
             print("champions: DISABLED (campaign paused 2026-08-07 — roster folded into Winners)")
 
-        # WINNER PACE RULE (v11): judge the Winners campaign at 2.3-pace
+        # WINNER PACE RULE (v11): judge the Winners campaign at 2.8-pace
         w = winner_pace_run(run_date, dry)
         print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
               f"{len(w['flagged'])} over allowance | killed {w['killed']} | "

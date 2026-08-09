@@ -205,10 +205,12 @@ def evaluate(p, run_date, is_monday):
     zero7    = rev7==0
     cpa      = (cost30/oq) if oq>0 else None
     # ---- proven-product tiers: judged on PERFORMANCE regardless of age ----
-    # Tier 6 = ROAS floor. A product that has sold but sits below 2.0 is cut NOW,
+    # Tier 6 = ROAS floor. A product that has sold but sits below 2.4 is cut NOW,
     # even at 1 day live (e.g. a re-published product). The <3-day grace does NOT shield it.
-    if has_rev and cost7>=5 and roas7<2.0:
-        return ('KILL','Tier 6',f'below 2.0 target: ROAS7={roas7:.2f}, £{cost7:.2f}/7d')
+    # Floor 2.0 -> 2.4 (owner 2026-08-10): blended target is now TRUE 2.5+, so anything
+    # loitering in the 2.0-2.4 band dilutes the blend and holds budget from fresh tests.
+    if has_rev and cost7>=5 and roas7<2.4:
+        return ('KILL','Tier 6',f'below 2.4 target: ROAS7={roas7:.2f}, £{cost7:.2f}/7d')
     if has_rev and recent14 and zero7 and cpa is not None and cost7>=2*cpa:
         return ('KILL','Tier 5',f'stalled winner: £0 rev 7d, £{cost7:.2f}>=2xCPA(£{cpa:.2f})')
     # ---- NO-SALE testing gate: min(price/7, £5) (owner 2026-07-15, "7x to be born") ----
@@ -252,10 +254,11 @@ def evaluate(p, run_date, is_monday):
     # trips it. 30d window = burn rates down to ~£0.33/day AND a less noisy ROAS at tiny
     # spend (one order flips a 7d read). Evaluated LAST so fast bleeders keep Tier 1-6
     # labels; the 14d-sale shield does NOT apply (this is performance-based, like Tier 6).
-    # Floor = 2.0 (owner 2026-07-03, raised from 1.5): blended target is 2.0, so ANY burn
-    # rate below 2.0 drags the blended ROAS — same floor as Tier 6, measured on 30d.
-    if cost30>=10 and rev30<2.0*cost30:
-        return ('KILL','Tier 7',f'dribbler: ROAS30={(rev30/cost30):.2f}<2.0, £{cost30:.2f}/30d')
+    # Floor = 2.4 (owner 2026-08-10, raised from 2.0; before that 1.5): blended target is
+    # TRUE 2.5+, so ANY burn rate below 2.4 drags the blended ROAS — same floor as Tier 6,
+    # measured on 30d.
+    if cost30>=10 and rev30<2.4*cost30:
+        return ('KILL','Tier 7',f'dribbler: ROAS30={(rev30/cost30):.2f}<2.4, £{cost30:.2f}/30d')
     return ('KEEP',None,'no tier triggered')
 
 # ── logging ──────────────────────────────────────────────────────────────

@@ -21,6 +21,8 @@ on:
 
 permissions:
   contents: read                 # read-only -- we no longer commit anything back to the repo
+  actions: write                 # TEMP (owner 2026-08-10): lets the one-shot bridge step below
+                                 # dispatch structure-edits.yml; remove with the bridge after it fires
 
 concurrency:
   group: auto-kill               # one run at a time; a new 8-min trigger SUPERSEDES a stuck/queued
@@ -45,9 +47,33 @@ jobs:
             kills_log_auto.csv
             winner_kills_log.csv
             _last_run_epoch.txt
+            _structure_edits_fired.txt
           key: kills-log-${{ github.run_id }}
           restore-keys: |
             kills-log-
+
+      # ONE-SHOT BRIDGE (owner 2026-08-10): GitHub's own `schedule` is best-effort, so the
+      # external 8-min cron that fires THIS workflow also triggers the structure-edits
+      # workflow ONCE, at the first tick on/after 23:10 UTC Aug 10 (= 00:10 UK Aug 11).
+      # The cached marker guarantees once-only; the window closes Aug 12 (the script has
+      # its own date guard + idempotence as second/third nets). DELETE this step, the
+      # `actions: write` permission above and the marker cache line after it fires.
+      - name: One-shot bridge -> structure edits (00:10 UK Aug-11)
+        run: |
+          if [ -f _structure_edits_fired.txt ]; then echo "bridge: already fired"; exit 0; fi
+          target=$(date -u -d '2026-08-10 23:10:00' +%s)
+          expiry=$(date -u -d '2026-08-12 00:00:00' +%s)
+          now=$(date +%s)
+          if [ "$now" -lt "$target" ] || [ "$now" -gt "$expiry" ]; then
+            echo "bridge: outside window (now $(date -u))"; exit 0
+          fi
+          echo "bridge: window open — dispatching structure-edits.yml"
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/structure-edits.yml/dispatches" \
+            -d "{\"ref\":\"${{ github.ref_name }}\"}"
+          echo "fired $(date -u)" > _structure_edits_fired.txt
 
       # 15-MINUTE CADENCE GATE: the 8-min grid tick only proceeds if >=870s since the
       # last engine run. The epoch is stamped BEFORE the engine runs, so even a failed
@@ -103,4 +129,5 @@ jobs:
             kills_log_auto.csv
             winner_kills_log.csv
             _last_run_epoch.txt
+            _structure_edits_fired.txt
           key: kills-log-${{ github.run_id }}

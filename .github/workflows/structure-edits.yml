@@ -1,0 +1,46 @@
+name: Structure Edits (one-shot 00:10 UK Aug-11)
+
+# ONE-SHOT (owner 2026-08-10): Testing summer -> £100/day, Testing AW -> £60/day,
+# Winners -> tROAS 2.2 + £40/day. The PRIMARY trigger is the bridge step inside
+# hourly-kill.yml (the external 8-min cron is the only reliable clock in this repo);
+# the `schedule` below is a best-effort backup and workflow_dispatch allows a manual
+# fire. The script itself is idempotent AND date-guarded to Aug 10-12 2026, so any
+# combination of triggers (or a stray future schedule fire) is harmless.
+# Safe to delete this workflow + structure_edits.py + the bridge step after it runs.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '10 23 10 8 *'   # 23:10 UTC Aug 10 = 00:10 UK (BST) — backup only, best-effort
+
+permissions:
+  contents: read
+
+concurrency:
+  group: structure-edits
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply structure edits
+        env:
+          GOOGLE_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_DEVELOPER_TOKEN }}
+          GOOGLE_CLIENT_ID:       ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET:   ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN:   ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GOOGLE_CUSTOMER_ID:     ${{ secrets.GOOGLE_CUSTOMER_ID }}
+        run: python structure_edits.py --apply
