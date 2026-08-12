@@ -58,11 +58,22 @@ def google_product_perf(run_date):
         # on otherwise-valid large-window queries — verified 2026-08-06: the same 30-day
         # query fails ~1-in-3 then succeeds on retry. Retrying with backoff fixes the
         # daily "❌ Auto-Kill FAILED" spam. Only raise after all retries are exhausted.
+        # PAGINATED (2026-08-12): a v22 page caps at 10k rows; large windows now exceed
+        # that, and an unpaginated read silently truncates the tail (under-reads spend).
+        out = []; token = None
         last = None
         for attempt in range(5):
-            r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json={'query':q}, timeout=90)
+            body = {'query': q}
+            if token: body['pageToken'] = token
+            r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json=body, timeout=90)
             if r.status_code == 200:
-                return r.json().get('results', [])
+                j = r.json()
+                out += j.get('results', [])
+                token = j.get('nextPageToken')
+                if not token:
+                    return out
+                attempt = 0          # a successful page resets the retry budget
+                continue
             last = r
             if r.status_code == 429:
                 if attempt < 4: time.sleep(10*(attempt+1)); continue
