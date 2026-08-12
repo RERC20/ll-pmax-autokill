@@ -26,7 +26,7 @@ REFRESH_TOKEN     = cred('GOOGLE_REFRESH_TOKEN')
 LOGIN_CUSTOMER_ID = cred('GOOGLE_LOGIN_CUSTOMER_ID')   # empty → direct access (no manager account)
 CUSTOMER_ID       = cred('GOOGLE_CUSTOMER_ID')         # Google Ads customer id (from secret)
 
-API_VERSION = 'v21'   # if the 1st real call 404s with "version not found", bump this — Google ships ~3x/yr
+API_VERSION = 'v22'   # v21 BLOCKED by Google 2026-08-12 (rolling deprecation)   # if the 1st real call 404s with "version not found", bump this — Google ships ~3x/yr
 
 OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 ADS_BASE = f'https://googleads.googleapis.com/{API_VERSION}'
