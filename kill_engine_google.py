@@ -60,9 +60,11 @@ def google_product_perf(run_date):
         # daily "❌ Auto-Kill FAILED" spam. Only raise after all retries are exhausted.
         # PAGINATED (2026-08-12): a v22 page caps at 10k rows; large windows now exceed
         # that, and an unpaginated read silently truncates the tail (under-reads spend).
+        # Unlimited pages; the 5-try retry budget applies PER PAGE and resets on success.
         out = []; token = None
         last = None
-        for attempt in range(5):
+        attempt = 0
+        while True:
             body = {'query': q}
             if token: body['pageToken'] = token
             r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json=body, timeout=90)
@@ -72,8 +74,9 @@ def google_product_perf(run_date):
                 token = j.get('nextPageToken')
                 if not token:
                     return out
-                attempt = 0          # a successful page resets the retry budget
+                attempt = 0
                 continue
+            attempt += 1
             last = r
             if r.status_code == 429:
                 if attempt < 4: time.sleep(10*(attempt+1)); continue
