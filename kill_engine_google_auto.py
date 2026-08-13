@@ -80,6 +80,9 @@ def _days_live(p, run_date):
 # (backfill_winner_tags.py, run 2026-07-11) — so rev30>0 is a complete signal
 # for every NEW first sale going forward.
 WINNER_TAG = 'w_campaign'
+LC_TAG = 'lc_campaign'          # LAST CHANCE (owner 2026-08-13): pace-killed winners stay ACTIVE
+LC_CAMPAIGN_ID = '24127184079'  # 'PMax | Last Chance | UK' — £20/day, tROAS 2.4, UK presence-only
+LC_KILL_CAP = 15                # glitch guard for the lc exit rule
 LOST_TAG   = 'l_camp'      # "lost" — WAS a winner, killed by the pace rule (v11). Set on winner
                            # kills; stripped again if the product is ever resurrected and re-sells.
 
@@ -127,7 +130,8 @@ def shopify_set_label_metafield(tok, pid, value=WINNER_TAG):
 
 def tag_new_winners(feed, dry):
     """Tag every ACTIVE product with a Shopify sale (rev30>0) not yet tagged w_campaign."""
-    new = [p for p in feed if p['rev30'] > 0 and WINNER_TAG not in p['tags']]
+    new = [p for p in feed if p['rev30'] > 0 and WINNER_TAG not in p['tags']
+           and LC_TAG not in p['tags']]   # lc graduation is lc_run's job (post-stamp sales only)
     if not new:
         return []
     tok = None if dry else shopify_token()
@@ -391,27 +395,154 @@ def _campaign_daily_spend(run_date, pids, campaign_id):
 def _winners_daily_spend(run_date, pids):
     return _campaign_daily_spend(run_date, pids, WINNERS_CAMPAIGN_ID)
 
-def shopify_winner_kill(tok, pid):
-    """DRAFT + add draft_bad_product / l_camp / pub: stamp + REMOVE w_campaign.
-    Same publishedAt-preservation trick as shopify_draft (draft wipes publishedAt)."""
+def shopify_winner_kill(tok, pid, run_date=None):
+    """LAST CHANCE routing (owner 2026-08-13, replaces permanent DRAFT): the product
+    STAYS ACTIVE — tags l_camp + lc_campaign + lc:DATE stamp, w_campaign removed,
+    feed label -> lc_campaign so it serves ONLY in 'PMax | Last Chance | UK'.
+    The lc exit rule (lc_run) drafts it permanently if the last chance fails."""
     gid = f"gid://shopify/Product/{pid}"
-    pj = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                       headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                       json={'query': '{product(id:"%s"){publishedAt}}' % gid}, timeout=30).json()
-    pub = ((pj.get('data') or {}).get('product') or {}).get('publishedAt')
-    tags = ['draft_bad_product', LOST_TAG] + (['pub:' + str(pub)[:10]] if pub else [])
-    M = '''mutation($id:ID!,$tags:[String!]!,$rm:[String!]!){
-      productUpdate(input:{id:$id,status:DRAFT}){userErrors{message}}
-      tagsAdd(id:$id,tags:$tags){userErrors{message}}
-      tagsRemove(id:$id,tags:$rm){userErrors{message}} }'''
+    stamp = 'lc:' + (run_date or datetime.date.today()).isoformat()
+    tags = [LOST_TAG, LC_TAG, stamp]
+    M = ('mutation($id:ID!,$tags:[String!]!,$rm:[String!]!){'
+         'tagsAdd(id:$id,tags:$tags){userErrors{message}} '
+         'tagsRemove(id:$id,tags:$rm){userErrors{message}} }')
     j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
                       headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
                       json={'query': M, 'variables': {'id': gid, 'tags': tags, 'rm': [WINNER_TAG]}},
                       timeout=30).json()
     if j.get('errors'): return str(j['errors'])[:120]
     d = j.get('data') or {}
+    errs = sum([((d.get(k) or {}).get('userErrors') or []) for k in ('tagsAdd', 'tagsRemove')], [])
+    shopify_set_label_metafield(tok, pid, value=LC_TAG)
+    return 'ok -> last chance' if not errs else str(errs)[:120]
+
+
+def shopify_lc_draft(tok, pid):
+    """The last chance FAILED: permanent DRAFT (the old winner-kill behaviour) +
+    draft_bad_product; lc_campaign tag removed (l_camp + lc: stamp kept as history)."""
+    gid = f"gid://shopify/Product/{pid}"
+    pj = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                       headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                       json={'query': '{product(id:"%s"){publishedAt}}' % gid, 'variables': {}}, timeout=30).json()
+    pub = ((pj.get('data') or {}).get('product') or {}).get('publishedAt')
+    tags = ['draft_bad_product'] + (['pub:' + str(pub)[:10]] if pub else [])
+    M = ('mutation($id:ID!,$tags:[String!]!,$rm:[String!]!){'
+         'productUpdate(input:{id:$id,status:DRAFT}){userErrors{message}} '
+         'tagsAdd(id:$id,tags:$tags){userErrors{message}} '
+         'tagsRemove(id:$id,tags:$rm){userErrors{message}} }')
+    j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                      headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                      json={'query': M, 'variables': {'id': gid, 'tags': tags, 'rm': [LC_TAG]}},
+                      timeout=30).json()
+    if j.get('errors'): return str(j['errors'])[:120]
+    d = j.get('data') or {}
     errs = sum([((d.get(k) or {}).get('userErrors') or []) for k in ('productUpdate', 'tagsAdd', 'tagsRemove')], [])
     return 'ok' if not errs else str(errs)[:120]
+
+
+def ads_remove_winner_item_nodes(pids):
+    """Remove UNIT_INCLUDED item-id nodes of these pids from the WINNERS asset group.
+    Item-id includes serve regardless of feed label, so a pace-killed product must
+    have its nodes swept or it keeps serving in Winners. WARN-only on failure —
+    the exclusion is belt-and-braces (label alone routes GMC within hours)."""
+    if not pids: return
+    try:
+        import google_ads_connect as ga
+        gt = ga.get_access_token()
+        rows = _ads_search(ga, gt,
+            "SELECT asset_group_listing_group_filter.id, asset_group_listing_group_filter.type, "
+            "asset_group_listing_group_filter.case_value.product_item_id.value "
+            f"FROM asset_group_listing_group_filter WHERE asset_group.id = {WINNERS_AG_ID}")
+        tgt = []
+        for r in rows:
+            f = r['assetGroupListingGroupFilter']
+            if f['type'] != 'UNIT_INCLUDED': continue
+            val = str(((f.get('caseValue') or {}).get('productItemId') or {}).get('value', ''))
+            if any(f"_{pid}_" in val or val.endswith(f"_{pid}") for pid in pids):
+                tgt.append(str(f['id']))
+        if not tgt: return
+        fp = f"customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters"
+        r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
+                          headers=ga._headers(gt),
+                          json={'operations': [{'remove': f"{fp}/{WINNERS_AG_ID}~{i}"} for i in tgt]},
+                          timeout=90).json()
+        if 'error' in r: print(f"  (winners node sweep warn: {str(r)[:120]})")
+        else: print(f"  winners AG: removed {len(tgt)} item-id node(s) for killed winner(s)")
+    except Exception as ex:
+        print(f"  (winners node sweep warn: {str(ex)[:100]})")
+
+
+def lc_run(run_date, dry):
+    """LAST CHANCE exit + graduation rule (owner 2026-08-13).
+      * GRADUATE: a sale dated AFTER the lc: stamp -> back to Winners (tag + label +
+        ads fast-path). Pre-lc sales NEVER graduate (no ping-pong).
+      * EXIT: lc-campaign spend since stamp > min(price/7, £5) with no post-stamp sale,
+        OR 90 days in lc saleless -> permanent DRAFT.
+    Fail-safe: any error skips this section for the run."""
+    res = dict(pool=0, graduated=[], drafted=[], err=None)
+    try:
+        tok = shopify_token()
+        Q = ('query($c:String){products(first:250,after:$c,query:"tag:%s status:active"){'
+             'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId title tags '
+             'priceRangeV2{minVariantPrice{amount}}}}}}' % LC_TAG)
+        pool = {}; cur = None
+        while True:
+            j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                              headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                              json={'query': Q, 'variables': {'c': cur}}, timeout=60).json()
+            c = j['data']['products']
+            for e in c['edges']:
+                n = e['node']; tl = [str(t) for t in n['tags']]
+                if LC_TAG not in tl: continue          # tag-search tokenises; exact check
+                stamp = next((t[3:13] for t in tl if t.startswith('lc:')), None)
+                pool[str(n['legacyResourceId'])] = dict(
+                    name=n['title'], price=float(n['priceRangeV2']['minVariantPrice']['amount']),
+                    stamp=stamp or run_date.isoformat())
+            if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
+            else: break
+        res['pool'] = len(pool)
+        if not pool: return res
+        sales, n_orders = _winner_last_sales(tok, run_date)
+        if n_orders == 0:
+            res['err'] = 'orders pull returned 0 — glitch; lc rule skipped'; return res
+        spend = _campaign_daily_spend(run_date, set(pool), LC_CAMPAIGN_ID)
+        grads, exits = [], []
+        for pid, m in pool.items():
+            ls = sales.get(pid)
+            if ls and ls['date'] > m['stamp']:
+                grads.append((pid, m)); continue
+            spent = sum(v for d, v in spend.get(pid, ()) if d > m['stamp'])
+            allow = min(m['price'] / 7.0, 5.0) if m['price'] > 0 else 5.0
+            days = (run_date - datetime.date.fromisoformat(m['stamp'])).days
+            if spent > allow:
+                exits.append((pid, m, f'lc spend £{spent:.2f} > £{allow:.2f}, no sale since {m["stamp"]}'))
+            elif days >= 90:
+                exits.append((pid, m, f'{days}d in last chance, no sale'))
+        if len(exits) > LC_KILL_CAP:
+            res['err'] = f'SAFETY STOP: {len(exits)} lc exits > cap {LC_KILL_CAP} — nothing drafted'
+            return res
+        for pid, m in grads:
+            if dry:
+                print(f"  lc would-GRADUATE {pid} -> Winners | {m['name'][:40]}"); continue
+            shopify_add_tag(tok, pid, WINNER_TAG)
+            shopify_set_label_metafield(tok, pid, value=WINNER_TAG)
+            shopify_remove_tag(tok, pid, LC_TAG)
+            print(f"  lc GRADUATE {pid} -> Winners | {m['name'][:40]}")
+            res['graduated'].append({'pid': pid, 'name': m['name']})
+        if res['graduated'] and not dry:
+            try:
+                ads_fast_path([{'pid': g['pid'], 'name': g['name']} for g in res['graduated']], tok)
+            except Exception as ex:
+                print(f"  (lc fast-path warn: {str(ex)[:100]})")
+        for pid, m, why in exits:
+            out = 'DRY' if dry else shopify_lc_draft(tok, pid)
+            print(f"  {'would draft' if dry else 'draft'} lc-exit {pid} -> {out} | {why} | {m['name'][:40]}")
+            res['drafted'].append({'pid': pid, 'name': m['name'], 'why': why})
+        return res
+    except Exception as ex:
+        res['err'] = f'lc rule error (skipped): {str(ex)[:150]}'
+        return res
+
 
 def _write_winner_kills_log(rows, run_date):
     import csv as _csv, os as _os
@@ -478,7 +609,9 @@ def winner_pace_run(run_date, dry):
                 print(f"  winner would-KILL {r['pid']} | spent £{r['spent']:.2f} > "
                       f"allowance £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
         if live:
-            res['killed'] = sum(1 for r in flagged if r.get('outcome') == 'ok')
+            ads_remove_winner_item_nodes([r['pid'] for r in flagged
+                                          if str(r.get('outcome', '')).startswith('ok')])
+            res['killed'] = sum(1 for r in flagged if str(r.get('outcome', '')).startswith('ok'))
             res['pool'] = len(winners) - res['killed']
             _write_winner_kills_log(flagged, run_date)
         return res
@@ -983,10 +1116,15 @@ def main():
         for r in w['closest']:
             print(f"  pace watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
 
+        # LAST CHANCE rule (owner 2026-08-13): graduate/exit the lc pool
+        lc = lc_run(run_date, dry)
+        print(f"last chance: pool {lc['pool']} | graduated {len(lc['graduated'])} | "
+              f"drafted {len(lc['drafted'])}" + (f" | !! {lc['err']}" if lc['err'] else ""))
+
         kills = []
         for p in feed:
-            if WINNER_TAG in p['tags']:
-                continue                      # winners: separate rules later — never killed here
+            if WINNER_TAG in p['tags'] or LC_TAG in p['tags']:
+                continue                      # winners + last-chance: their own rules — never killed here
             dec, tier, why = evaluate(p, run_date, is_monday)
             if dec == 'KILL':
                 kills.append((p, tier, why))
@@ -1028,6 +1166,12 @@ def main():
                 tg += f"\n\n…+{len(to_draft)-DETAIL} more — full reasons &amp; metrics in the attached Excel."
 
         # WINNERS pace section — one status line every run + detail per kill/preview
+        tg += (f"\n\n🩹 <b>Last Chance</b>: pool {lc['pool']} | ⬆ {len(lc['graduated'])} back to Winners | "
+               f"🪦 {len(lc['drafted'])} drafted" + (f" | ⚠ {lc['err']}" if lc['err'] else ""))
+        for g in lc['graduated'][:5]:
+            tg += f"\n  ⬆ <code>{g['pid']}</code> {html.escape(g['name'][:40])}"
+        for g in lc['drafted'][:5]:
+            tg += f"\n  🪦 <code>{g['pid']}</code> {html.escape(g['name'][:40])}"
         tg += (f"\n\n🎯 <b>Winners pace {WINNER_PACE_ROAS}</b>: {w['evaluated']} checked, "
                f"{len(w['flagged'])} over allowance"
                + ("" if w['live'] else (" (DRY)" if dry else f" — dormant, live {WINNER_KILL_START.strftime('%d %b')}")))
