@@ -6,7 +6,7 @@
 #   1. Pull the live feed (Google Ads cost/clicks + Shopify revenue, UK tz).
 #   2. Tag new winners (any Shopify sale) + fast-path them into the Winners campaign.
 #   3. WINNER PACE RULE (v11): kill winners whose Winners-campaign spend since
-#      their last sale exceeds max(sale rev, price) / 2.4 (see block below).
+#      their last sale exceeds max(sale rev, price) / 2.0 (see block below).
 #   4. Apply the SAME v4 rules (evaluate) to the TESTING pool (winners exempt).
 #   5. DRAFT every flagged product in Shopify (no yes/no prompt).
 #   6. NOTIFY:
@@ -276,8 +276,8 @@ def sync_bestseller_collection(tok, dry):
 # ── WINNER PACE RULE (v11 — owner-approved 2026-07-12) ──────────────────────
 # The Winners campaign has ONE kill rule, the "2.8-pace" rule:
 #
-#     KILL when Winners-campaign spend SINCE THE LAST SALE > max(sale revenue, product price) / 2.4
-#     (winner with no sale in the lookback: allowance = product price / 2.4)
+#     KILL when Winners-campaign spend SINCE THE LAST SALE > max(sale revenue, product price) / 2.0
+#     (winner with no sale in the lookback: allowance = product price / 2.0)
 #     max(rev, price) anchor (owner 2026-08-14): a discounted bundle sale must not
 #     shorten a winner's runway below what its normal price would grant.
 #
@@ -310,7 +310,7 @@ def sync_bestseller_collection(tok, dry):
 #     warns — it can never block or distort the testing kills. A glitchy run
 #     that flags more than WINNER_KILL_CAP winners aborts (data glitch guard,
 #     same philosophy as the testing KILL_CAP).
-WINNER_PACE_ROAS  = 2.4                            # 2.8 -> 2.4 owner 2026-08-14: volume lean for the Aug demand trough; LC catches exits
+WINNER_PACE_ROAS  = 2.0                            # 2.4 -> 2.0 owner 2026-08-14: max spend absorption; survival ~2.1 sits under the tROAS-2.2 gate, so the bidder is the real control and this is a deep backstop; LC catches exits
 WINNER_KILL_START = datetime.date(2026, 7, 13)     # LIVE (owner 2026-07-13: "if a winner hits the rules kill it, don't wait for Jul 25")
 WINNER_LOOKBACK_D = 60                             # last-sale + spend lookback window
 WINNER_KILL_CAP   = 10                             # >N winner kills in one run = glitch -> abort + alert
