@@ -6,7 +6,7 @@
 #   1. Pull the live feed (Google Ads cost/clicks + Shopify revenue, UK tz).
 #   2. Tag new winners (any Shopify sale) + fast-path them into the Winners campaign.
 #   3. WINNER PACE RULE (v11): kill winners whose Winners-campaign spend since
-#      their last sale exceeds that sale's revenue / 2.8 (see block below).
+#      their last sale exceeds max(sale rev, price) / 2.4 (see block below).
 #   4. Apply the SAME v4 rules (evaluate) to the TESTING pool (winners exempt).
 #   5. DRAFT every flagged product in Shopify (no yes/no prompt).
 #   6. NOTIFY:
@@ -276,8 +276,10 @@ def sync_bestseller_collection(tok, dry):
 # ── WINNER PACE RULE (v11 — owner-approved 2026-07-12) ──────────────────────
 # The Winners campaign has ONE kill rule, the "2.8-pace" rule:
 #
-#     KILL when Winners-campaign spend SINCE THE LAST SALE > that sale's revenue / 2.8
-#     (winner with no sale in the lookback: allowance = product price / 2.8)
+#     KILL when Winners-campaign spend SINCE THE LAST SALE > max(sale revenue, product price) / 2.4
+#     (winner with no sale in the lookback: allowance = product price / 2.4)
+#     max(rev, price) anchor (owner 2026-08-14): a discounted bundle sale must not
+#     shorten a winner's runway below what its normal price would grant.
 #
 # Why 2.8 (owner 2026-08-10, raised from 2.3 alongside Winners tROAS 2.0 -> 2.2):
 # a kill line at 2.8-pace makes ~2.9 the survival standard, holding the Winners
@@ -308,7 +310,7 @@ def sync_bestseller_collection(tok, dry):
 #     warns — it can never block or distort the testing kills. A glitchy run
 #     that flags more than WINNER_KILL_CAP winners aborts (data glitch guard,
 #     same philosophy as the testing KILL_CAP).
-WINNER_PACE_ROAS  = 2.8                            # the ONE tunable constant (2.3 -> 2.8 owner 2026-08-10)
+WINNER_PACE_ROAS  = 2.4                            # 2.8 -> 2.4 owner 2026-08-14: volume lean for the Aug demand trough; LC catches exits
 WINNER_KILL_START = datetime.date(2026, 7, 13)     # LIVE (owner 2026-07-13: "if a winner hits the rules kill it, don't wait for Jul 25")
 WINNER_LOOKBACK_D = 60                             # last-sale + spend lookback window
 WINNER_KILL_CAP   = 10                             # >N winner kills in one run = glitch -> abort + alert
@@ -580,7 +582,7 @@ def winner_pace_run(run_date, dry):
         for pid, m in winners.items():
             ls = sales.get(pid)
             if ls:
-                allow = ls['rev'] / WINNER_PACE_ROAS
+                allow = max(ls['rev'], m['price']) / WINNER_PACE_ROAS   # max(rev, price) anchor (owner 2026-08-14)
                 spent = sum(v for d, v in spend.get(pid, ()) if d > ls['date'])   # charged from the day AFTER the sale
                 opened = f"sale £{ls['rev']:.2f} on {ls['date']}"
             else:   # no sale in the lookback (stale) — allowance from price, spend from whole window
