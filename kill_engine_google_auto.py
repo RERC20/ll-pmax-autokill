@@ -514,7 +514,10 @@ def lc_run(run_date, dry):
             if ls and ls['date'] > m['stamp']:
                 grads.append((pid, m)); continue
             spent = sum(v for d, v in spend.get(pid, ()) if d > m['stamp'])
-            allow = min(m['price'] / 7.0, 5.0) if m['price'] > 0 else 5.0
+            # owner 2026-08-16: allowance aligned to the LC tROAS 2.1 — a product may
+            # spend what ONE sale at 2.1 ROAS would justify (price/2.1, £20 cap)
+            # before drafting. Was min(price/7, £5) — too strict for LC's purpose.
+            allow = min(m['price'] / 2.1, 20.0) if m['price'] > 0 else 5.0
             days = (run_date - datetime.date.fromisoformat(m['stamp'])).days
             if spent > allow:
                 exits.append((pid, m, f'lc spend £{spent:.2f} > £{allow:.2f}, no sale since {m["stamp"]}'))
