@@ -346,7 +346,7 @@ def _winner_last_sales(tok, run_date):
          'pageInfo{hasNextPage endCursor} edges{node{createdAt subtotalPriceSet{shopMoney{amount}} '
          'lineItems(first:100){edges{node{product{legacyResourceId} '
          'discountedTotalSet{shopMoney{amount}}}}}}}}}' % since)
-    last = {}; cur = None; n_orders = 0
+    last = {}; all_dates = {}; cur = None; n_orders = 0
     while True:
         j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
                           headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
@@ -366,9 +366,10 @@ def _winner_last_sales(tok, run_date):
             for pid, rev in per.items():
                 if pid not in last or ts > last[pid]['ts']:
                     last[pid] = dict(ts=ts, date=d, rev=rev)
+                all_dates.setdefault(pid, []).append(d)
         if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
         else: break
-    return last, n_orders
+    return last, all_dates, n_orders
 
 def _campaign_daily_spend(run_date, pids, campaign_id):
     """pid -> [(date_iso, GBP), ...] spend rows in ONE campaign, lookback window.
@@ -504,16 +505,25 @@ def lc_run(run_date, dry):
             else: break
         res['pool'] = len(pool)
         if not pool: return res
-        sales, n_orders = _winner_last_sales(tok, run_date)
+        sales, sale_dates, n_orders = _winner_last_sales(tok, run_date)
         if n_orders == 0:
             res['err'] = 'orders pull returned 0 — glitch; lc rule skipped'; return res
         spend = _campaign_daily_spend(run_date, set(pool), LC_CAMPAIGN_ID)
         grads, exits = [], []
         for pid, m in pool.items():
-            ls = sales.get(pid)
-            if ls and ls['date'] > m['stamp']:
+            post = [x for x in sale_dates.get(pid, []) if x > m['stamp']]
+            # owner doctrine (2026-08-16): graduation needs TWO post-stamp sales —
+            # one sale is luck, two is proof. A product with exactly ONE post-stamp
+            # sale is showing life: exempt from the spend exit (only the 90d cap
+            # applies) until it either earns its second sale or times out.
+            if len(post) >= 2:
                 grads.append((pid, m)); continue
             spent = sum(v for d, v in spend.get(pid, ()) if d > m['stamp'])
+            if len(post) == 1:
+                days = (run_date - datetime.date.fromisoformat(m['stamp'])).days
+                if days >= 90:
+                    exits.append((pid, m, f'{days}d in last chance, only 1 sale'))
+                continue
             # owner 2026-08-16: allowance aligned to the LC tROAS 2.1 — a product may
             # spend what ONE sale at 2.1 ROAS would justify (price/2.1, £20 cap)
             # before drafting. Was min(price/7, £5) — too strict for LC's purpose.
@@ -576,7 +586,7 @@ def winner_pace_run(run_date, dry):
         winners = {pid: m for pid, m in winners.items() if pid not in champs}
         res['evaluated'] = len(winners); res['pool'] = len(winners)
         if not winners: return res
-        sales, n_orders = _winner_last_sales(tok, run_date)
+        sales, sale_dates, n_orders = _winner_last_sales(tok, run_date)
         if n_orders == 0:   # glitch guard: a live store ALWAYS has orders in 60d
             res['err'] = f'orders pull returned 0 orders in {WINNER_LOOKBACK_D}d — glitch; winner kills skipped'
             return res
