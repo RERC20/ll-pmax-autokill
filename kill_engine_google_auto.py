@@ -81,7 +81,7 @@ def _days_live(p, run_date):
 # for every NEW first sale going forward.
 WINNER_TAG = 'w_campaign'
 LC_TAG = 'lc_campaign'          # LAST CHANCE (owner 2026-08-13): pace-killed winners stay ACTIVE
-LC_CAMPAIGN_ID = '24127184079'  # 'PMax | Last Chance | UK' — £20/day, tROAS 2.4, UK presence-only
+LC_CAMPAIGN_ID = '24127184079'  # 'PMax | Last Chance | UK' — £20/day, tROAS 2.2, UK presence-only
 LC_KILL_CAP = 15                # glitch guard for the lc exit rule
 LOST_TAG   = 'l_camp'      # "lost" — WAS a winner, killed by the pace rule (v11). Set on winner
                            # kills; stripped again if the product is ever resurrected and re-sells.
@@ -626,7 +626,7 @@ def winner_pace_run(run_date, dry):
 # Only repeat-sellers ever absorbed extra spend productively (Jul-16 analysis) — this tier
 # gives them a looser target so Google buys volume, watched by a per-product trailing floor.
 #
-#   ENTRY      4 lifetime orders (order count, not units; cancelled excluded; raised 3->4 2026-07-31)
+#   ENTRY      3 lifetime orders (order count, not units; cancelled excluded; 4->3 owner 2026-08-16, LC-era; was 3->4 2026-07-31)
 #              -> tag c_champion (w_campaign KEPT), feed label -> c_champion,
 #                 item-ids: Champions AG include + Winners AG include-nodes removed.
 #   DEMOTE     Champions-campaign spend since the 3rd-last sale
@@ -652,7 +652,7 @@ CHAMPION_TAG            = 'c_champion'
 CHAMPION_DEMOTED_PREFIX = 'champ_demoted:'          # champ_demoted:YYYY-MM-DD, set on demotion
 CHAMPIONS_CAMPAIGN_ID   = '24047674442'             # PMax | Champions | UK  (created 2026-07-20)
 CHAMPIONS_AG_ID         = '6731971798'              # its asset group (listing tree mirrors Winners)
-CHAMPION_ENTRY_ORDERS   = 4   # raised 3->4 (owner 2026-07-31): cohort audit — of 23 products that
+CHAMPION_ENTRY_ORDERS   = 3   # 4->3 (owner 2026-08-16): LC tier now caps false-positive cost (demote after ~1 order's rev, recovery path), and the continuation curve is flat past 3 (P(4|3)=60% vs P(5|4)=62%). Was: raised 3->4 (owner 2026-07-31): cohort audit — of 23 products that
                               # ever entered at 3 sales, the 10 that never resold burned 24% of all
                               # champion spend for £0 return (ROAS 0.00), while 4-5-sale entrants ran
                               # 3.14 and 6+ ran 4.20. Sale #4 filters the whole dud class at minimal
