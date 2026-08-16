@@ -128,10 +128,21 @@ def shopify_set_label_metafield(tok, pid, value=WINNER_TAG):
     except Exception as ex:
         return f"err: {ex}"
 
+WINNER_ENTRY_ORDERS = 3   # owner 2026-08-16: "3+ lifetime orders, no exceptions"
+
 def tag_new_winners(feed, dry):
-    """Tag every ACTIVE product with a Shopify sale (rev30>0) not yet tagged w_campaign."""
-    new = [p for p in feed if p['rev30'] > 0 and WINNER_TAG not in p['tags']
-           and LC_TAG not in p['tags']]   # lc graduation is lc_run's job (post-stamp sales only)
+    """Tag ACTIVE products that reached WINNER_ENTRY_ORDERS lifetime orders.
+    rev30>0 is only the cheap pre-filter; the real gate is the full lifetime
+    order count (owner 2026-08-16 doctrine — 1-2 sales stay in Testing)."""
+    cand = [p for p in feed if p['rev30'] > 0 and WINNER_TAG not in p['tags']
+            and LC_TAG not in p['tags']]   # lc graduation is lc_run's job (post-stamp sales only)
+    if not cand:
+        return []
+    sales, _ = _lifetime_sales(shopify_token())
+    new = [p for p in cand if len(sales.get(str(p['pid']), [])) >= WINNER_ENTRY_ORDERS]
+    below = len(cand) - len(new)
+    if below:
+        print(f"  entry gate: {below} seller(s) under {WINNER_ENTRY_ORDERS} lifetime orders stay in Testing")
     if not new:
         return []
     tok = None if dry else shopify_token()
