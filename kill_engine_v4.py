@@ -235,7 +235,11 @@ def evaluate(p, run_date, is_monday):
         # Tier 4 age gate 21 -> 40 (owner 2026-08-07): with the 530-product AW batch
         # sharing £30/day, a product can sit ~6p/day for weeks with <5 clicks through no
         # fault of its own. 40d gives every product a real window before "ghost" applies.
-        if is_monday and dl>=40 and clk<5:
+        # Tier 4 SUSPENDED until 2026-10-01 (owner 2026-08-16): the ghost rule is the
+        # only AGE-based kill, and the 992-product AW batch published mid-August would
+        # hit 40d right as its season starts — "keep the spend rule so we don't judge
+        # too early". Tier 2 (spend-based) still applies; resumes automatically Oct 1.
+        if is_monday and dl>=40 and clk<5 and run_date >= datetime.date(2026, 10, 1):
             return ('KILL','Tier 4',f'ghost: {clk} clicks/{dl}d')
     # -- REVERT BLOCK: pre-2026-07-15 no-sale tiers (flat £5 / 40 / 70 clicks). To switch back,
     #    delete the price/7 block above and un-comment this (backup also in
