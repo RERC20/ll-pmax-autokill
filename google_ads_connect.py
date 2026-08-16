@@ -47,7 +47,7 @@ def get_access_token():
         print(f"❌ LOGIN FAILED ({r.status_code}): {r.text}")
         if 'invalid_grant'  in r.text: print("   → refresh_token is wrong/expired, or made with a different client_id/secret.")
         if 'invalid_client' in r.text: print("   → client_id / client_secret don't match.")
-        sys.exit(1)
+        raise RuntimeError('google_ads_connect auth/config failure — see log above')
     print("✅ 1/3  Got access token — OAuth chain works.")
     return r.json()['access_token']
 
@@ -73,7 +73,7 @@ def list_accessible_customers(access_token):
         print(f"❌ ListAccessibleCustomers FAILED ({r.status_code}): {r.text}")
         if 'DEVELOPER_TOKEN_NOT_APPROVED' in r.text:
             print("   → dev token still 'Test' level. Apply for Basic access to reach real accounts.")
-        sys.exit(1)
+        raise RuntimeError('google_ads_connect auth/config failure — see log above')
     names = r.json().get('resourceNames', [])
     print(f"✅ 2/3  Auth valid. Accounts this login can see: {names}")
     return names
@@ -92,7 +92,7 @@ def query_customer(access_token):
             print("   → the authorized human can't see CUSTOMER_ID, or login-customer-id is wrong.")
         if 'NOT_FOUND' in r.text or r.status_code == 404:
             print(f"   → maybe bump API_VERSION (currently {API_VERSION}).")
-        sys.exit(1)
+        raise RuntimeError('google_ads_connect auth/config failure — see log above')
     rows = r.json().get('results', [])
     print(f"✅ 3/3  Read your account OK:\n{json.dumps(rows, indent=2)}")
 

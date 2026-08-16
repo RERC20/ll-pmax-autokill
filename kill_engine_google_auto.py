@@ -130,7 +130,7 @@ def shopify_set_label_metafield(tok, pid, value=WINNER_TAG):
 
 WINNER_ENTRY_ORDERS = 3   # owner 2026-08-16: "3+ lifetime orders, no exceptions"
 
-def tag_new_winners(feed, dry):
+def tag_new_winners(feed, dry, life=None):
     """Tag ACTIVE products that reached WINNER_ENTRY_ORDERS lifetime orders.
     rev30>0 is only the cheap pre-filter; the real gate is the full lifetime
     order count (owner 2026-08-16 doctrine — 1-2 sales stay in Testing)."""
@@ -138,8 +138,9 @@ def tag_new_winners(feed, dry):
             and LC_TAG not in p['tags']]   # lc graduation is lc_run's job (post-stamp sales only)
     if not cand:
         return []
-    sales, _ = _lifetime_sales(shopify_token())
-    new = [p for p in cand if len(sales.get(str(p['pid']), [])) >= WINNER_ENTRY_ORDERS]
+    if life is None:
+        life, _n = _lifetime_sales(shopify_token())
+    new = [p for p in cand if len(life.get(str(p['pid']), [])) >= WINNER_ENTRY_ORDERS]
     below = len(cand) - len(new)
     if below:
         print(f"  entry gate: {below} seller(s) under {WINNER_ENTRY_ORDERS} lifetime orders stay in Testing")
@@ -415,14 +416,26 @@ def shopify_winner_kill(tok, pid, run_date=None):
     feed label -> lc_campaign so it serves ONLY in 'PMax | Last Chance | UK'.
     The lc exit rule (lc_run) drafts it permanently if the last chance fails."""
     gid = f"gid://shopify/Product/{pid}"
-    stamp = 'lc:' + (run_date or datetime.date.today()).isoformat()
+    # audit 2026-08-16: stamp in UK time (runner is UTC, laptop AST — never naive local),
+    # and strip any stale lc:* stamps from a previous LC cycle: lc_run must only ever
+    # see the CURRENT stamp, or pre-stamp sales graduate the product (gate leak class).
+    stamp = 'lc:' + (run_date or datetime.datetime.now(UK).date()).isoformat()
+    old_stamps = []
+    try:
+        tj = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                           headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                           json={'query': '{product(id:"%s"){tags}}' % gid}, timeout=30).json()
+        old_stamps = [str(t) for t in (((tj.get('data') or {}).get('product') or {}).get('tags') or [])
+                      if str(t).startswith('lc:') and str(t) != stamp]
+    except Exception:
+        pass
     tags = [LOST_TAG, LC_TAG, stamp]
     M = ('mutation($id:ID!,$tags:[String!]!,$rm:[String!]!){'
          'tagsAdd(id:$id,tags:$tags){userErrors{message}} '
          'tagsRemove(id:$id,tags:$rm){userErrors{message}} }')
     j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
                       headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                      json={'query': M, 'variables': {'id': gid, 'tags': tags, 'rm': [WINNER_TAG]}},
+                      json={'query': M, 'variables': {'id': gid, 'tags': tags, 'rm': [WINNER_TAG] + old_stamps}},
                       timeout=30).json()
     if j.get('errors'): return str(j['errors'])[:120]
     d = j.get('data') or {}
@@ -486,7 +499,85 @@ def ads_remove_winner_item_nodes(pids):
         print(f"  (winners node sweep warn: {str(ex)[:100]})")
 
 
-def lc_run(run_date, dry):
+def reconcile_serving_state(dry):
+    """Every-run janitor (audit 2026-08-16). The demote-time node sweep is one-shot and
+    warn-only, so a single failure used to strand a product serving in Winners forever;
+    and nothing ever cleaned w_campaign off DRAFT products (a republish would bypass the
+    entry gate). Both are reconciled here, idempotently. Warn-only: never breaks the run."""
+    out = dict(nodes_swept=0, drafts_stripped=0, err=None)
+    try:
+        tok = shopify_token()
+        # -- current legit roster: ACTIVE + w_campaign tag --
+        roster = set()
+        Q = ('query($c:String){products(first:250,after:$c,query:"tag:%s status:active"){'
+             'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId tags}}}}' % WINNER_TAG)
+        cur = None
+        while True:
+            j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                              headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                              json={'query': Q, 'variables': {'c': cur}}, timeout=60).json()
+            c = j['data']['products']
+            for e in c['edges']:
+                if WINNER_TAG in [str(t) for t in e['node']['tags']]:
+                    roster.add(str(e['node']['legacyResourceId']))
+            if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
+            else: break
+        # -- Winners AG: sweep item-id nodes whose pid is not in the roster --
+        import google_ads_connect as ga
+        gt = ga.get_access_token()
+        rows = _ads_search(ga, gt,
+            "SELECT asset_group_listing_group_filter.id, asset_group_listing_group_filter.type, "
+            "asset_group_listing_group_filter.case_value.product_item_id.value "
+            f"FROM asset_group_listing_group_filter WHERE asset_group.id = {WINNERS_AG_ID}")
+        stray = []
+        for r in rows:
+            f = r['assetGroupListingGroupFilter']
+            if f['type'] != 'UNIT_INCLUDED': continue
+            val = str(((f.get('caseValue') or {}).get('productItemId') or {}).get('value', ''))
+            parts = val.split('_')          # shopify_GB_<pid>_<variant>
+            pid = parts[2] if len(parts) >= 3 else ''
+            if pid and pid not in roster:
+                stray.append(str(f['id']))
+        if stray and not dry:
+            fp = f"customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters"
+            rj = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
+                               headers=ga._headers(gt),
+                               json={'operations': [{'remove': f"{fp}/{WINNERS_AG_ID}~{i}"} for i in stray]},
+                               timeout=90).json()
+            if 'error' in rj: out['err'] = f"node sweep: {str(rj)[:100]}"
+            else: out['nodes_swept'] = len(stray)
+        elif stray:
+            out['nodes_swept'] = len(stray)   # dry: report what would go
+        # -- DRAFT products still tagged w_campaign: strip tag + label --
+        QD = ('query($c:String){products(first:250,after:$c,query:"tag:%s status:draft"){'
+              'pageInfo{hasNextPage endCursor} edges{node{id legacyResourceId tags}}}}' % WINNER_TAG)
+        cur = None; drafts = []
+        while True:
+            j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                              headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                              json={'query': QD, 'variables': {'c': cur}}, timeout=60).json()
+            c = j['data']['products']
+            for e in c['edges']:
+                if WINNER_TAG in [str(t) for t in e['node']['tags']]:
+                    drafts.append(str(e['node']['legacyResourceId']))
+            if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
+            else: break
+        for pid in drafts:
+            if dry: continue
+            shopify_remove_tag(tok, pid, WINNER_TAG)
+            requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                json={'query': 'mutation($m:[MetafieldIdentifierInput!]!){ metafieldsDelete(metafields:$m){ userErrors{message} } }',
+                      'variables': {'m': [{"ownerId": f"gid://shopify/Product/{pid}",
+                                           "namespace": "mm-google-shopping", "key": "custom_label_1"}]}},
+                timeout=30)
+        out['drafts_stripped'] = len(drafts)
+    except Exception as ex:
+        out['err'] = str(ex)[:120]
+    return out
+
+
+def lc_run(run_date, dry, life=None):
     """LAST CHANCE exit + graduation rule (owner 2026-08-13).
       * GRADUATE: a sale dated AFTER the lc: stamp -> back to Winners (tag + label +
         ads fast-path). Pre-lc sales NEVER graduate (no ping-pong).
@@ -508,16 +599,25 @@ def lc_run(run_date, dry):
             for e in c['edges']:
                 n = e['node']; tl = [str(t) for t in n['tags']]
                 if LC_TAG not in tl: continue          # tag-search tokenises; exact check
-                stamp = next((t[3:13] for t in tl if t.startswith('lc:')), None)
+                # audit 2026-08-16: NEWEST stamp wins (stale stamps from an earlier LC
+                # cycle made pre-stamp sales count as post-stamp); keep the raw list so
+                # graduation can consume every stamp tag.
+                stamps = sorted(t[3:13] for t in tl if t.startswith('lc:'))
                 pool[str(n['legacyResourceId'])] = dict(
                     name=n['title'], price=float(n['priceRangeV2']['minVariantPrice']['amount']),
-                    stamp=stamp or run_date.isoformat())
+                    stamp=(stamps[-1] if stamps else run_date.isoformat()),
+                    stamp_tags=['lc:' + s for s in stamps])
             if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
             else: break
         res['pool'] = len(pool)
         if not pool: return res
-        sales, sale_dates, n_orders = _winner_last_sales(tok, run_date)
-        if n_orders == 0:
+        # audit 2026-08-16: LC lives up to 90d but the old 60d pull silently dropped
+        # older post-stamp sales (false 'saleless' drafts + lost 1-sale protection).
+        # Lifetime pull covers the whole horizon; main() passes it in to avoid a re-pull.
+        if life is None:
+            life, _n = _lifetime_sales(tok)
+        sale_dates = {p_: [x['date'] for x in lst] for p_, lst in life.items()}
+        if not sale_dates:
             res['err'] = 'orders pull returned 0 — glitch; lc rule skipped'; return res
         spend = _campaign_daily_spend(run_date, set(pool), LC_CAMPAIGN_ID)
         grads, exits = [], []
@@ -553,6 +653,9 @@ def lc_run(run_date, dry):
             shopify_add_tag(tok, pid, WINNER_TAG)
             shopify_set_label_metafield(tok, pid, value=WINNER_TAG)
             shopify_remove_tag(tok, pid, LC_TAG)
+            shopify_remove_tag(tok, pid, LOST_TAG)
+            for _st in m.get('stamp_tags', []):   # consume stamps — stale ones re-graduate on pre-stamp sales
+                shopify_remove_tag(tok, pid, _st)
             print(f"  lc GRADUATE {pid} -> Winners | {m['name'][:40]}")
             res['graduated'].append({'pid': pid, 'name': m['name']})
         if res['graduated'] and not dry:
@@ -627,7 +730,7 @@ def winner_pace_run(run_date, dry):
             return res
         for r in flagged:
             if live:
-                r['outcome'] = shopify_winner_kill(tok, r['pid'])
+                r['outcome'] = shopify_winner_kill(tok, r['pid'], run_date)
                 print(f"  winner KILL {r['pid']} -> {r['outcome']} | spent £{r['spent']:.2f} > "
                       f"allowance £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
             else:
@@ -1108,8 +1211,19 @@ def main():
                         f"PMax auto-kill — {ts} (UK)\nMode: {'DRY-RUN' if dry else 'LIVE'}\n\n{msg}")
             return
 
-        # WINNERS first: tag new 1+ sale actives, then EXEMPT all tagged from the kill rules
-        new_winners = tag_new_winners(feed, dry)
+        # ONE lifetime-sales pull per run (audit 2026-08-16), shared by the entry gate,
+        # the LC rule and the once-sold shield. Fail-open: on error every consumer falls
+        # back to its own behaviour (gate re-pulls; shield approximates with rev30).
+        life_sales = None
+        try:
+            life_sales, _lo = _lifetime_sales(shopify_token())
+        except Exception as _lx:
+            print(f"  (lifetime pull warn: {str(_lx)[:90]})")
+        for p in feed:   # once-sold shield: no-sale tiers must never draft a product with ANY sale
+            p['ever_sold'] = bool(life_sales.get(str(p['pid']))) if life_sales is not None \
+                             else p['rev30'] > 0
+        # WINNERS first: tag new 3+ lifetime-order actives, then EXEMPT all tagged from the kill rules
+        new_winners = tag_new_winners(feed, dry, life_sales)
         exempt = sum(1 for p in feed if WINNER_TAG in p['tags'])
         print(f"winners: +{len(new_winners)} newly tagged | {exempt} total exempt from kill rules")
         fp_err = None
@@ -1133,6 +1247,12 @@ def main():
             ch = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
             print("champions: DISABLED (campaign paused 2026-08-07 — roster folded into Winners)")
 
+        # SERVING-STATE JANITOR (audit 2026-08-16): heal missed node sweeps + draft tags
+        js = reconcile_serving_state(dry)
+        print(f"janitor: {js['nodes_swept']} stray Winners node(s) swept | "
+              f"{js['drafts_stripped']} draft w_campaign strip(s)"
+              + (f" | !! {js['err']}" if js['err'] else ""))
+
         # WINNER PACE RULE (v11): judge the Winners campaign at 2.8-pace
         w = winner_pace_run(run_date, dry)
         print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
@@ -1143,7 +1263,7 @@ def main():
             print(f"  pace watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
 
         # LAST CHANCE rule (owner 2026-08-13): graduate/exit the lc pool
-        lc = lc_run(run_date, dry)
+        lc = lc_run(run_date, dry, life_sales)
         print(f"last chance: pool {lc['pool']} | graduated {len(lc['graduated'])} | "
               f"drafted {len(lc['drafted'])}" + (f" | !! {lc['err']}" if lc['err'] else ""))
 
