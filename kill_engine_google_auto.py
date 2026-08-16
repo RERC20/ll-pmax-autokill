@@ -169,6 +169,7 @@ def tag_new_winners(feed, dry, life=None):
 # product on the next feed sync — so failures WARN, never break the kill run.
 WINNERS_AG_ID = '6684080392'
 TESTING_AG_ID = '6729681029'
+AW_TESTING_AG_ID = '6738045970'   # Testing|AW: aw26 subdivision added 2026-08-16 (node 15260771050)
 
 def _ads_search(ga, gt, query):
     out = []; tok = None
@@ -199,15 +200,23 @@ def ads_fast_path(new_winners, stok):
             "asset_group_listing_group_filter.case_value.product_custom_attribute.index, "
             "asset_group_listing_group_filter.case_value.product_custom_attribute.value, "
             "asset_group_listing_group_filter.case_value.product_item_id.value "
-            "FROM asset_group_listing_group_filter WHERE asset_group.id IN (6684080392,6729681029)")
+            "FROM asset_group_listing_group_filter WHERE asset_group.id IN (6684080392,6729681029,6738045970)")
         info = {}
-        for agid in (WINNERS_AG_ID, TESTING_AG_ID):
+        for agid in (WINNERS_AG_ID, TESTING_AG_ID, AW_TESTING_AG_ID):
             ag = [x for x in rows if str(x['assetGroup']['id']) == agid]
             subdiv = None; have = set()
-            for x in ag:   # the item-id subdivision = the SUBDIVISION whose case is attr1-with-no-value
+            for x in ag:
+                # item-id subdivision: in Winners/Testing it is the SUBDIVISION whose
+                # case is attr1-with-no-value; in Testing-AW it is the SUBDIVISION
+                # whose case is attr2='aw26' (tree converted 2026-08-16).
                 f = x['assetGroupListingGroupFilter']; cv = f.get('caseValue', {})
                 pca = cv.get('productCustomAttribute')
-                if f['type'] == 'SUBDIVISION' and pca is not None and 'value' not in pca:
+                if f['type'] != 'SUBDIVISION' or pca is None:
+                    continue
+                if agid == AW_TESTING_AG_ID:
+                    if pca.get('value') == 'aw26':
+                        subdiv = f['resourceName']
+                elif 'value' not in pca:
                     subdiv = f['resourceName']
             for x in ag:
                 f = x['assetGroupListingGroupFilter']; cv = f.get('caseValue', {})
@@ -216,7 +225,8 @@ def ads_fast_path(new_winners, stok):
             if not subdiv: raise RuntimeError(f"item-id subdivision not found in AG {agid}")
             info[agid] = (subdiv, have)
         made = 0
-        for agid, node_type in ((WINNERS_AG_ID, 'UNIT_INCLUDED'), (TESTING_AG_ID, 'UNIT_EXCLUDED')):
+        for agid, node_type in ((WINNERS_AG_ID, 'UNIT_INCLUDED'), (TESTING_AG_ID, 'UNIT_EXCLUDED'),
+                                (AW_TESTING_AG_ID, 'UNIT_EXCLUDED')):
             subdiv, have = info[agid]
             ops = []
             for p in new_winners:
@@ -231,7 +241,7 @@ def ads_fast_path(new_winners, stok):
                                   headers=ga._headers(gt), json={"operations": ops}, timeout=60).json()
                 if 'error' in r: raise RuntimeError(str(r)[:300])
                 made += len(ops)
-        print(f"  fast-path: {made} item-id nodes written (Winners include / Testing exclude)")
+        print(f"  fast-path: {made} item-id nodes written (Winners include / Testing+AW exclude)")
         return made, None
     except Exception as ex:
         print(f"  !! fast-path FAILED (harmless - label path still moves it on next feed sync): {ex}")
@@ -285,12 +295,14 @@ def sync_bestseller_collection(tok, dry):
     except Exception as ex:
         return 0, f'Best Sellers sync error: {str(ex)[:120]}'
 
-# ── WINNER PACE RULE (v11 — owner-approved 2026-07-12) ──────────────────────
-# The Winners campaign has ONE kill rule, the "2.8-pace" rule:
+# ── WINNER PACE RULE (v12 — owner 2026-08-16: two-sale window at ROAS 2.0) ──
+# The Winners campaign has ONE kill rule:
 #
-#     KILL when Winners-campaign spend SINCE THE LAST SALE > max(sale revenue, product price) / 2.0
-#     (winner with no sale in the lookback: allowance = product price / 2.0)
-#     max(rev, price) anchor (owner 2026-08-14): a discounted bundle sale must not
+#     KILL when Winners-campaign spend SINCE THE 3rd-LAST SALE
+#          > max(revenue of the last TWO sales, product price) / 2.0
+#     (2 lifetime sales: spend since the older one vs their summed revenue;
+#      1 sale: spend since it vs max(its revenue, price); none: price, whole window)
+#     price floor kept (owner 2026-08-14): a discounted bundle sale must not
 #     shorten a winner's runway below what its normal price would grant.
 #
 # Why 2.8 (owner 2026-08-10, raised from 2.3 alongside Winners tROAS 2.0 -> 2.2):
@@ -685,7 +697,7 @@ def _write_winner_kills_log(rows, run_date):
             w.writerow([ts, run_date.isoformat(), r['pid'], r['name'], r['opened'],
                         round(r['allow'], 2), round(r['spent'], 2), r.get('outcome', '')])
 
-def winner_pace_run(run_date, dry):
+def winner_pace_run(run_date, dry, life=None):
     """Evaluate every winner against the pace rule. Kills only when live (>= start
     date and not --dry). Returns dict(live, evaluated, flagged, killed, pool, err, closest)."""
     live = (run_date >= WINNER_KILL_START) and not dry
@@ -700,22 +712,36 @@ def winner_pace_run(run_date, dry):
         winners = {pid: m for pid, m in winners.items() if pid not in champs}
         res['evaluated'] = len(winners); res['pool'] = len(winners)
         if not winners: return res
-        sales, sale_dates, n_orders = _winner_last_sales(tok, run_date)
-        if n_orders == 0:   # glitch guard: a live store ALWAYS has orders in 60d
-            res['err'] = f'orders pull returned 0 orders in {WINNER_LOOKBACK_D}d — glitch; winner kills skipped'
+        # v12: judged on lifetime chronological sales — the two-sale allowance
+        # needs per-sale revenue, which the last-sale-only pull did not keep.
+        if life is None:
+            life, _n = _lifetime_sales(tok)
+        if not life:   # glitch guard: a live store ALWAYS has orders
+            res['err'] = 'orders pull returned 0 orders — glitch; winner kills skipped'
             return res
         spend = _winners_daily_spend(run_date, set(winners))
         rows = []
         for pid, m in winners.items():
-            ls = sales.get(pid)
-            if ls:
-                allow = max(ls['rev'], m['price']) / WINNER_PACE_ROAS   # max(rev, price) anchor (owner 2026-08-14)
-                spent = sum(v for d, v in spend.get(pid, ()) if d > ls['date'])   # charged from the day AFTER the sale
-                opened = f"sale £{ls['rev']:.2f} on {ls['date']}"
-            else:   # no sale in the lookback (stale) — allowance from price, spend from whole window
+            slist = life.get(pid, [])
+            if len(slist) >= 2:
+                # v12: the last two sales pool their revenue; the cycle opens at the
+                # sale BEFORE them (3rd-last), or the older of the two if only two
+                # exist. Spend counts from the day AFTER the anchor. If the anchor
+                # predates the Ads spend window, spend truncates to the window —
+                # undercounting spend only ever DELAYS a kill (safe direction).
+                anchor = slist[-3]['date'] if len(slist) >= 3 else slist[-2]['date']
+                rev2 = slist[-1]['rev'] + slist[-2]['rev']
+                allow = max(rev2, m['price']) / WINNER_PACE_ROAS
+                spent = sum(v for d, v in spend.get(pid, ()) if d > anchor)
+                opened = f"last-2 £{rev2:.2f}, window since {anchor}"
+            elif len(slist) == 1:
+                allow = max(slist[0]['rev'], m['price']) / WINNER_PACE_ROAS
+                spent = sum(v for d, v in spend.get(pid, ()) if d > slist[0]['date'])
+                opened = f"sale £{slist[0]['rev']:.2f} on {slist[0]['date']}"
+            else:   # no lifetime sale on record — allowance from price, spend from whole window
                 allow = m['price'] / WINNER_PACE_ROAS
                 spent = sum(v for _, v in spend.get(pid, ()))
-                opened = f"no sale in {WINNER_LOOKBACK_D}d (price £{m['price']:.2f})"
+                opened = f"no sale on record (price £{m['price']:.2f})"
             rows.append(dict(pid=pid, name=m['name'], allow=allow, spent=spent, opened=opened,
                              pct=(spent / allow * 100) if allow > 0 else 0.0))
         rows.sort(key=lambda x: -x['pct'])
@@ -1254,7 +1280,7 @@ def main():
               + (f" | !! {js['err']}" if js['err'] else ""))
 
         # WINNER PACE RULE (v11): judge the Winners campaign at 2.8-pace
-        w = winner_pace_run(run_date, dry)
+        w = winner_pace_run(run_date, dry, life_sales)
         print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
               f"{len(w['flagged'])} over allowance | killed {w['killed']} | "
               f"{'LIVE' if w['live'] else ('DRY' if dry else 'dormant -> live ' + WINNER_KILL_START.isoformat())}"
