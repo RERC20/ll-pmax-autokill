@@ -211,8 +211,11 @@ def evaluate(p, run_date, is_monday):
     # loitering in the 2.0-2.4 band dilutes the blend and holds budget from fresh tests.
     if has_rev and cost7>=5 and roas7<2.4:
         return ('KILL','Tier 6',f'below 2.4 target: ROAS7={roas7:.2f}, £{cost7:.2f}/7d')
-    if has_rev and recent14 and zero7 and cpa is not None and cost7>=2*cpa:
-        return ('KILL','Tier 5',f'stalled winner: £0 rev 7d, £{cost7:.2f}>=2xCPA(£{cpa:.2f})')
+    # owner 2026-08-18: 2x -> 1x CPA ("if it's losing we don't want it anymore —
+    # we can import a lot of products; not worth risking blended"). A seller that
+    # spends one full CPA with nothing in 7d is already below water.
+    if has_rev and recent14 and zero7 and cpa is not None and cost7>=cpa:
+        return ('KILL','Tier 5',f'stalled seller: £0 rev 7d, £{cost7:.2f}>=1xCPA(£{cpa:.2f})')
     # ---- NO-SALE testing gate: min(price/7, £5) (owner 2026-07-15, "7x to be born") ----
     # Backtested on all 60 winners-ever: every winner's FIRST sale arrived at >=7.2x implied pace
     # (median 22.6x, £1.08 median pre-sale spend; only exception 4.8x = footwear, category being
