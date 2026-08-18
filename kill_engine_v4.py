@@ -229,15 +229,26 @@ def evaluate(p, run_date, is_monday):
     # K=5/6/7 keep 59/60 winners; K>=8 kills real dress winners — don't raise K without
     # re-profiling. Fallback when price unknown/0: £5 flat (v4 Tier-2 behaviour).
     NO_SALE_K = 7.0
-    GATE_CAP  = 5.0                               # hard max allowance per never-sold product
+    # 5.00 -> 4.00 (owner 2026-08-18): measured on 60d/4,024 products — no 3+-sale
+    # winner ever needed more than GBP3.96 before its first sale (p90 2.73).
+    GATE_CAP  = 4.0                               # hard max allowance per never-sold product
+    CLICK_GATE = 20                               # Tier-2b: winners needed <=19 clicks
     price = p.get('price', 0.0) or 0.0
     gate = min(price / NO_SALE_K, GATE_CAP) if price > 0 else GATE_CAP
     if not recent14:                              # a sale in 14d shields (same shield as before)
+        # Tier 2b (owner 2026-08-18): clicks are a paid intent signal the spend gate
+        # misses entirely — a cheap-click product can take 20+ clicks for ~GBP2 and
+        # never trip a spend gate. Winners needed at most 19 clicks before their
+        # first sale, so 20 is one notch past the observed ceiling.
+        if clk >= CLICK_GATE and zero30 and not p.get('ever_sold'):
+            return ('KILL', 'Tier 2b',
+                    f'no-sale past click gate: {clk} clicks >= {CLICK_GATE}, GBP0 rev '
+                    f'(GBP{cost30:.2f} spent)')
         if cost30 > gate and zero30 and not p.get('ever_sold'):
             # ever_sold (audit 2026-08-16): rev30 is a 30-DAY window, not lifetime — post
             # gate-3, 1-2-sale products STAY in Testing and must never die under a
             # "no-sale" rule once any sale exists. Engine sets the flag from lifetime orders.
-            return ('KILL','Tier 2',f'no-sale past gate: £{cost30:.2f} > £{gate:.2f} (min(price/7,£5), price £{price:.2f}), £0 rev')
+            return ('KILL','Tier 2',f'no-sale past gate: £{cost30:.2f} > £{gate:.2f} (min(price/7,£4), price £{price:.2f}), £0 rev')
         # Tier 4 age gate 21 -> 40 (owner 2026-08-07): with the 530-product AW batch
         # sharing £30/day, a product can sit ~6p/day for weeks with <5 clicks through no
         # fault of its own. 40d gives every product a real window before "ghost" applies.
