@@ -128,12 +128,15 @@ def shopify_set_label_metafield(tok, pid, value=WINNER_TAG):
     except Exception as ex:
         return f"err: {ex}"
 
-WINNER_ENTRY_ORDERS = 3   # owner 2026-08-16: "3+ lifetime orders, no exceptions"
+WINNER_ENTRY_ORDERS = 2   # owner 2026-08-20: lowered 3 -> 2 to grow the roster faster.
+                          # Safe because tROAS 2.2 is the real quality filter: a 2-sale
+                          # entrant that cannot clear 2.2 simply never serves. The pace
+                          # rule bounds the downside at max(last-2-rev, price)/2.0.
 
 def tag_new_winners(feed, dry, life=None):
     """Tag ACTIVE products that reached WINNER_ENTRY_ORDERS lifetime orders.
     rev30>0 is only the cheap pre-filter; the real gate is the full lifetime
-    order count (owner 2026-08-16 doctrine — 1-2 sales stay in Testing)."""
+    order count (owner 2026-08-20: gate is 2 — a single sale stays in Testing)."""
     cand = [p for p in feed if p['rev30'] > 0 and WINNER_TAG not in p['tags']
             and LC_TAG not in p['tags']]   # lc graduation is lc_run's job (post-stamp sales only)
     if not cand:
@@ -779,7 +782,7 @@ def winner_pace_run(run_date, dry, life=None):
 # Only repeat-sellers ever absorbed extra spend productively (Jul-16 analysis) — this tier
 # gives them a looser target so Google buys volume, watched by a per-product trailing floor.
 #
-#   ENTRY      3 lifetime orders (order count, not units; cancelled excluded; 4->3 owner 2026-08-16, LC-era; was 3->4 2026-07-31)
+#   ENTRY      2 lifetime orders (order count, not units; cancelled excluded; 3->2 owner 2026-08-20; was 4->3 2026-08-16, 3->4 2026-07-31)
 #              -> tag c_champion (w_campaign KEPT), feed label -> c_champion,
 #                 item-ids: Champions AG include + Winners AG include-nodes removed.
 #   DEMOTE     Champions-campaign spend since the 3rd-last sale
@@ -1248,7 +1251,7 @@ def main():
         for p in feed:   # once-sold shield: no-sale tiers must never draft a product with ANY sale
             p['ever_sold'] = bool(life_sales.get(str(p['pid']))) if life_sales is not None \
                              else p['rev30'] > 0
-        # WINNERS first: tag new 3+ lifetime-order actives, then EXEMPT all tagged from the kill rules
+        # WINNERS first: tag new 2+ lifetime-order actives, then EXEMPT all tagged from the kill rules
         new_winners = tag_new_winners(feed, dry, life_sales)
         exempt = sum(1 for p in feed if WINNER_TAG in p['tags'])
         print(f"winners: +{len(new_winners)} newly tagged | {exempt} total exempt from kill rules")
