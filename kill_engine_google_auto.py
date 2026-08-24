@@ -700,18 +700,12 @@ def lc_run(run_date, dry, life=None):
         grads, exits = [], []
         for pid, m in pool.items():
             post = [x for x in sale_dates.get(pid, []) if x > m['stamp']]
-            # owner doctrine (2026-08-16): graduation needs TWO post-stamp sales —
-            # one sale is luck, two is proof. A product with exactly ONE post-stamp
-            # sale is showing life: exempt from the spend exit (only the 90d cap
-            # applies) until it either earns its second sale or times out.
-            if len(post) >= 2:
+            # owner 2026-08-24: graduation = ONE post-stamp sale (was two, 2026-08-16) —
+            # matches the entry gate lowered to 1 the same day; the Winners pace rule's
+            # 1-sale branch bounds a bad re-entry, so ping-pong risk is now priced in.
+            if len(post) >= 1:
                 grads.append((pid, m)); continue
             spent = sum(v for d, v in spend.get(pid, ()) if d > m['stamp'])
-            if len(post) == 1:
-                days = (run_date - datetime.date.fromisoformat(m['stamp'])).days
-                if days >= 90:
-                    exits.append((pid, m, f'{days}d in last chance, only 1 sale'))
-                continue
             # owner 2026-08-16: allowance aligned to the LC tROAS 2.1 — a product may
             # spend what ONE sale at 2.1 ROAS would justify (price/2.1, £20 cap)
             # before drafting. Was min(price/7, £5) — too strict for LC's purpose.
