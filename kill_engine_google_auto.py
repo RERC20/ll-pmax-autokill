@@ -128,7 +128,7 @@ def shopify_set_label_metafield(tok, pid, value=WINNER_TAG):
     except Exception as ex:
         return f"err: {ex}"
 
-WINNER_ENTRY_ORDERS = 2   # owner 2026-08-20: lowered 3 -> 2 to grow the roster faster.
+WINNER_ENTRY_ORDERS = 1   # owner 2026-08-24: 2 -> 1 — first sale graduates to Winners (tROAS raised to 2.2 as the guard; pace-kill's 1-sale branch is the stop-loss).
                           # Safe because tROAS 2.2 is the real quality filter: a 2-sale
                           # entrant that cannot clear 2.2 simply never serves. The pace
                           # rule bounds the downside at max(last-2-rev, price)/2.0.
@@ -156,8 +156,70 @@ def tag_new_winners(feed, dry, life=None):
         if LOST_TAG in p['tags'] and not dry:
             shopify_remove_tag(tok, p['pid'], LOST_TAG)   # resurrected + sold again: no longer "lost"
         print(f"  {'would tag' if dry else 'tag'} winner {p['pid']} -> {res} (label metafield: {mres}) | {p['name'][:42]}")
+        if not dry and len(life.get(str(p['pid']), [])) >= 2:
+            _add_to_best_sellers(tok, p['pid'])   # owner 2026-08-24: Best Sellers stays gated at 2+ sales (promotion != merchandising)
         p['tags'].append(WINNER_TAG)     # exempt from kill rules in THIS same run too
+    if not dry and new:
+        resort_best_sellers(tok, life)   # keep AW-first-by-sales order after adds
     return new
+
+
+BEST_SELLERS_COLLECTION = 'gid://shopify/Collection/690375426428'   # manual 'best-sellers' (AW best sellers)
+
+
+def _add_to_best_sellers(tok, pid):
+    """Add a freshly-promoted winner to the Best Sellers manual collection.
+    WARN-only: a failure here must never break the promotion run."""
+    try:
+        q = ('mutation($id:ID!,$p:[ID!]!){collectionAddProductsV2(id:$id,productIds:$p)'
+             '{userErrors{field message}}}')
+        r = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                          json={'query': q, 'variables': {'id': BEST_SELLERS_COLLECTION,
+                                'p': [f"gid://shopify/Product/{pid}"]}}, timeout=30).json()
+        errs = (r.get('data') or {}).get('collectionAddProductsV2', {}).get('userErrors')
+        print(f"    best-sellers add: {'WARN ' + str(errs)[:60] if errs else 'ok'}")
+    except Exception as e:                       # noqa: BLE001
+        print(f"    best-sellers add WARN: {type(e).__name__}: {str(e)[:60]}")
+
+
+def resort_best_sellers(tok, life=None):
+    """Owner 2026-08-24: Best Sellers order = AW items by sales first, then summer
+    by sales. MANUAL sort; re-applied nightly after promotions. WARN-only."""
+    try:
+        import datetime as _dt
+        if life is None:
+            life, _ = _lifetime_sales(tok)
+        H = {'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'}
+        def gql(q, v):
+            return requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                                 headers=H, json={'query': q, 'variables': v}, timeout=90).json()
+        cur = None; mem = []
+        Q = ('query($id:ID!,$c:String){collection(id:$id){products(first:250,after:$c)'
+             '{pageInfo{hasNextPage endCursor} edges{node{id legacyResourceId tags '
+             'l2:metafield(namespace:"mm-google-shopping",key:"custom_label_2"){value}}}}}}')
+        while True:
+            d = gql(Q, {'id': BEST_SELLERS_COLLECTION, 'c': cur})['data']['collection']['products']
+            for e in d['edges']:
+                n = e['node']
+                aw = (n['l2'] or {}).get('value') == 'aw26' or 'aw26' in {t.lower() for t in (n['tags'] or [])}
+                mem.append((n['id'], n['legacyResourceId'], aw))
+            if d['pageInfo']['hasNextPage']: cur = d['pageInfo']['endCursor']
+            else: break
+        cut = (_dt.date.today() - _dt.timedelta(days=30)).isoformat()
+        def rank(pid):
+            s = life.get(pid, [])
+            return (sum(1 for x in s if x['date'] >= cut), len(s), sum(x['rev'] for x in s))
+        aw = sorted([m for m in mem if m[2]], key=lambda m: rank(m[1]), reverse=True)
+        sm = sorted([m for m in mem if not m[2]], key=lambda m: rank(m[1]), reverse=True)
+        moves = [{'id': g, 'newPosition': str(i)} for i, (g, _pid, _a) in enumerate(aw + sm)]
+        MV = ('mutation($id:ID!,$moves:[MoveInput!]!){collectionReorderProducts(id:$id,moves:$moves)'
+              '{job{id} userErrors{field message}}}')
+        for i in range(0, len(moves), 200):
+            gql(MV, {'id': BEST_SELLERS_COLLECTION, 'moves': moves[i:i+200]})
+        print(f"  best-sellers resorted: {len(aw)} AW first, {len(sm)} summer after")
+    except Exception as e:                       # noqa: BLE001
+        print(f"  best-sellers resort WARN: {type(e).__name__}: {str(e)[:60]}")
 
 # ── ADS FAST-PATH: move new winners between the two PMax campaigns INSTANTLY ─
 # The Testing/Winners split (2026-07-11) filters on custom_label_1=w_campaign,
