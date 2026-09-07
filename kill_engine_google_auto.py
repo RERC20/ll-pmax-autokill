@@ -202,7 +202,7 @@ def resort_best_sellers(tok, life=None):
             d = gql(Q, {'id': BEST_SELLERS_COLLECTION, 'c': cur})['data']['collection']['products']
             for e in d['edges']:
                 n = e['node']
-                aw = (n['l2'] or {}).get('value') == 'aw26' or 'aw26' in {t.lower() for t in (n['tags'] or [])}
+                aw = (n['l2'] or {}).get('value') in ('aw26', 'aw26b') or 'aw26' in {t.lower() for t in (n['tags'] or [])}   # aw26b = Testing|AW-B (2026-09-08)
                 mem.append((n['id'], n['legacyResourceId'], aw))
             if d['pageInfo']['hasNextPage']: cur = d['pageInfo']['endCursor']
             else: break
