@@ -36,7 +36,7 @@ PMAX_CAMPAIGN_ID = '23620737018'                             # now "PMax | Winne
 # CAMPAIGN SPLIT #2 (2026-08-07): autumn/winter imports test in their own campaign
 # 'PMax | Testing | AW | UK' (24116871559, serves ONLY GMC custom_label_2='aw26').
 # The engine judges spend across BOTH testing campaigns; Winners/Champions stay exempt.
-TESTING_CAMPAIGN_IDS = ('24027270949', '24116871559', '24231514492')   # Testing | UK  +  Testing | AW | UK  +  Testing | AW-B | UK (owner 2026-09-08: no-spend AW products, label aw26b, GBP 100/day)
+TESTING_CAMPAIGN_IDS = ('24027270949', '24116871559', '24231514492', '24224831679')   # Testing | UK  +  Testing | AW | UK  +  Testing | AW-B | UK (owner 2026-09-08: no-spend AW products, label aw26b, GBP 100/day)  +  Testing | Men | UK (owner 2026-09-09: the 809 men parked under custom_label_2=mens_paused, GBP 50/day)
 TESTING_CAMPAIGN_ID = TESTING_CAMPAIGN_IDS[0]                # back-compat alias
 RUN_LOG   = 'kill_engine_google_runs.log'
 KILLS_LOG = 'kills_log_google.csv'
