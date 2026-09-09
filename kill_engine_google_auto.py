@@ -288,11 +288,11 @@ def ads_fast_path(new_winners, stok):
                 if f.get('parentListingGroupFilter') == subdiv and cv.get('productItemId', {}).get('value'):
                     have.add(cv['productItemId']['value'].lower())
             if not subdiv: raise RuntimeError(f"item-id subdivision not found in AG {agid}")
-            info[agid] = (subdiv, have)
+            info[agid] = (subdiv, have, len(ag))          # len(ag) = nodes already in this tree (Google caps at 1,000)
         made = 0
         for agid, node_type in ((WINNERS_AG_ID, 'UNIT_INCLUDED'), (TESTING_AG_ID, 'UNIT_EXCLUDED'),
                                 (AW_TESTING_AG_ID, 'UNIT_EXCLUDED')):
-            subdiv, have = info[agid]
+            subdiv, have, n_nodes = info[agid]
             ops = []
             for p in new_winners:
                 for iid in _variant_item_ids(stok, p['pid']):
@@ -301,6 +301,9 @@ def ads_fast_path(new_winners, stok):
                                                "type": node_type, "listingSource": "SHOPPING",
                                                "parentListingGroupFilter": subdiv,
                                                "caseValue": {"productItemId": {"value": iid}}}})
+            if ops and n_nodes + len(ops) > FAST_PATH_CAP:   # near Google's 1,000-node cap: skip this tree, the label path moves it
+                print(f"  fast-path: AG {agid} has {n_nodes} nodes, +{len(ops)} would pass the {FAST_PATH_CAP} cap - skipped (label path covers it; nightly prune frees space)")
+                continue
             if ops:
                 r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
                                   headers=ga._headers(gt), json={"operations": ops}, timeout=60).json()
@@ -649,6 +652,84 @@ def reconcile_serving_state(dry):
                                            "namespace": "mm-google-shopping", "key": "custom_label_1"}]}},
                 timeout=30)
         out['drafts_stripped'] = len(drafts)
+    except Exception as ex:
+        out['err'] = str(ex)[:120]
+    return out
+
+
+# ── FAST-PATH NODE HYGIENE (owner 2026-09-09) ────────────────────────────────
+# Every fast-path item-id node is a TEMPORARY side door: it moves a product the moment it
+# wins, until custom_label_1=w_campaign reaches Google's feed (1.5-3 h) and the label RULE
+# takes over. Nothing ever closed those doors, so by 8 Sep all three trees sat at Google's
+# 1,000-node cap and every fast-path write failed (RESOURCE_LIMIT) - graduations still moved
+# via the label, just not instantly. Two fixes:
+#   * prune_settled_nodes(): once a day, delete every item-id node whose product's FEED labels
+#     already do what the node does (Winners include -> all its offers carry w_campaign;
+#     Testing exclude -> all offers carry w_campaign/lc_campaign, or its custom_label_2 already
+#     routes it out of that tree; or the product is not in the feed at all). A node is only
+#     removed when the product keeps serving exactly where it does today - proven 9 Sep on all
+#     2,980 nodes: Winners' eligible offers identical before and after.
+#   * FAST_PATH_CAP: the writer skips a tree that is near the cap (label path covers it)
+#     instead of raising and aborting the other trees' writes.
+FAST_PATH_CAP = 990
+PRUNE_HOUR_UK = 4          # run the prune in the 04:xx UK runs (idempotent, ~12 API pages)
+
+def prune_settled_nodes(dry):
+    out = dict(checked=0, removed=0, kept=0, err=None)
+    try:
+        import google_ads_connect as ga
+        gt = ga.get_access_token()
+        ags = {WINNERS_AG_ID: 'winners', TESTING_AG_ID: 'testing_uk', AW_TESTING_AG_ID: 'testing_aw'}
+        rows = _ads_search(ga, gt,
+            "SELECT asset_group.id, asset_group_listing_group_filter.id, asset_group_listing_group_filter.type, "
+            "asset_group_listing_group_filter.case_value.product_item_id.value "
+            f"FROM asset_group_listing_group_filter WHERE asset_group.id IN ({','.join(ags)})")
+        items = []   # (agid, node_id, type, pid)
+        for r in rows:
+            f = r['assetGroupListingGroupFilter']; v = ((f.get('caseValue') or {}).get('productItemId') or {}).get('value')
+            if v and f['type'] in ('UNIT_INCLUDED', 'UNIT_EXCLUDED'):
+                parts = str(v).split('_'); pid = parts[2] if len(parts) >= 3 else None
+                if pid: items.append((str(r['assetGroup']['id']), str(f['id']), f['type'], pid))
+        out['checked'] = len(items)
+        if not items:
+            return out
+        # feed labels per product, ALL offers (a node stays until every variant carries the label)
+        feed = {}
+        for r in _ads_search(ga, gt, "SELECT shopping_product.item_id, shopping_product.custom_attribute1, shopping_product.custom_attribute2 FROM shopping_product"):
+            s = r['shoppingProduct']; parts = str(s['itemId']).split('_'); pid = parts[2] if len(parts) >= 3 else None
+            if not pid: continue
+            f = feed.setdefault(pid, {'l1': set(), 'l2': set()})
+            f['l1'].add((s.get('customAttribute1') or '').lower()); f['l2'].add((s.get('customAttribute2') or '').lower())
+        def redundant(agid, ntype, pid):
+            f = feed.get(pid)
+            if not f: return True                                   # not in the feed: dead node
+            l1, l2 = f['l1'], f['l2']
+            if agid == WINNERS_AG_ID:
+                return ntype == 'UNIT_INCLUDED' and l1 == {'w_campaign'}
+            if ntype != 'UNIT_EXCLUDED': return False
+            if l1 and l1 <= {'w_campaign', 'lc_campaign'}: return True   # the l1 rule already excludes it
+            if agid == AW_TESTING_AG_ID: return len(l2) == 1 and 'aw26' not in l2   # not admitted by the aw26 rule anyway
+            if agid == TESTING_AG_ID:    return l2 == {'aw26'}                       # Testing|UK excludes aw26 anyway
+            return False
+        todo = collections.defaultdict(list)
+        for agid, nid, ntype, pid in items:
+            if redundant(agid, ntype, pid):
+                todo[agid].append(nid)
+        out['kept'] = len(items) - sum(len(v) for v in todo.values())
+        if dry:
+            out['removed'] = sum(len(v) for v in todo.values()); return out
+        fp = f"customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters"
+        for agid, ids in todo.items():
+            for i in range(0, len(ids), 200):
+                chunk = ids[i:i+200]
+                rj = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
+                                   headers=ga._headers(gt), json={'operations': [{'remove': f"{fp}/{agid}~{n}"} for n in chunk]}, timeout=120).json()
+                if 'error' in rj and len(chunk) > 1:   # a subdivision may refuse to lose its last specific child: keep one
+                    rj = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
+                                       headers=ga._headers(gt), json={'operations': [{'remove': f"{fp}/{agid}~{n}"} for n in chunk[:-1]]}, timeout=120).json()
+                    if 'error' not in rj: out['removed'] += len(chunk) - 1; out['kept'] += 1; continue
+                if 'error' in rj: out['err'] = f"{ags[agid]}: {str(rj)[:100]}"; break
+                out['removed'] += len(chunk)
     except Exception as ex:
         out['err'] = str(ex)[:120]
     return out
@@ -1334,6 +1415,10 @@ def main():
 
         # SERVING-STATE JANITOR (audit 2026-08-16): heal missed node sweeps + draft tags
         js = reconcile_serving_state(dry)
+        if datetime.datetime.now(UK).hour == PRUNE_HOUR_UK or '--prune' in sys.argv:
+            pj = prune_settled_nodes(dry)
+            print(f"fast-path hygiene: {pj['checked']} item-id node(s) checked | {pj['removed']} {'would be ' if dry else ''}removed (label has taken over) | "
+                  f"{pj['kept']} kept" + (f" | !! {pj['err']}" if pj['err'] else ""))
         print(f"janitor: {js['nodes_swept']} stray Winners node(s) swept | "
               f"{js['drafts_stripped']} draft w_campaign strip(s)"
               + (f" | !! {js['err']}" if js['err'] else ""))
