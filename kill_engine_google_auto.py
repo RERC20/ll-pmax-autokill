@@ -289,6 +289,8 @@ def ads_fast_path(new_winners, stok):
                     have.add(cv['productItemId']['value'].lower())
             if not subdiv: raise RuntimeError(f"item-id subdivision not found in AG {agid}")
             info[agid] = (subdiv, have, len(ag))          # len(ag) = nodes already in this tree (Google caps at 1,000)
+        global _TREE_NODES_SEEN                            # cheapest possible trigger for the prune: we just read the trees
+        _TREE_NODES_SEEN = max(v[2] for v in info.values())
         made = 0
         for agid, node_type in ((WINNERS_AG_ID, 'UNIT_INCLUDED'), (TESTING_AG_ID, 'UNIT_EXCLUDED'),
                                 (AW_TESTING_AG_ID, 'UNIT_EXCLUDED')):
@@ -672,7 +674,12 @@ def reconcile_serving_state(dry):
 #   * FAST_PATH_CAP: the writer skips a tree that is near the cap (label path covers it)
 #     instead of raising and aborting the other trees' writes.
 FAST_PATH_CAP = 990
-PRUNE_HOUR_UK = 4          # run the prune in the 04:xx UK runs (idempotent, ~12 API pages)
+PRUNE_HOUR_UK = 4          # baseline: prune in the 04:xx UK runs (idempotent, ~12 API pages)
+PRUNE_TRIGGER_NODES = 600  # ...and any run where a tree has grown past this, so a heavy graduation day cannot refill the
+                           # cap before the next 04:00. A graduate writes ~24 variant nodes per tree and 20-30 graduate on a
+                           # good day (~500-700 nodes), so daily-only pruning would sail close to the 1,000 cap. Zero extra
+                           # API cost: ads_fast_path already read the trees and leaves the count in _TREE_NODES_SEEN.
+_TREE_NODES_SEEN = 0
 
 def prune_settled_nodes(dry):
     out = dict(checked=0, removed=0, kept=0, err=None)
@@ -1415,10 +1422,10 @@ def main():
 
         # SERVING-STATE JANITOR (audit 2026-08-16): heal missed node sweeps + draft tags
         js = reconcile_serving_state(dry)
-        if datetime.datetime.now(UK).hour == PRUNE_HOUR_UK or '--prune' in sys.argv:
+        if datetime.datetime.now(UK).hour == PRUNE_HOUR_UK or _TREE_NODES_SEEN > PRUNE_TRIGGER_NODES or '--prune' in sys.argv:
             pj = prune_settled_nodes(dry)
             print(f"fast-path hygiene: {pj['checked']} item-id node(s) checked | {pj['removed']} {'would be ' if dry else ''}removed (label has taken over) | "
-                  f"{pj['kept']} kept" + (f" | !! {pj['err']}" if pj['err'] else ""))
+                  f"{pj['kept']} kept | biggest tree {_TREE_NODES_SEEN} nodes" + (f" | !! {pj['err']}" if pj['err'] else ""))
         print(f"janitor: {js['nodes_swept']} stray Winners node(s) swept | "
               f"{js['drafts_stripped']} draft w_campaign strip(s)"
               + (f" | !! {js['err']}" if js['err'] else ""))
