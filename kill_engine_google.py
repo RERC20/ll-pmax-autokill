@@ -42,9 +42,27 @@ RUN_LOG   = 'kill_engine_google_runs.log'
 KILLS_LOG = 'kills_log_google.csv'
 
 def _gql(tok, q, v=None):
-    return requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-        headers={'X-Shopify-Access-Token':tok,'Content-Type':'application/json'},
-        json={'query':q,'variables':v or {}}, timeout=60).json()
+    # 19 Sep 2026: Shopify answered THROTTLED (another job was using the same app's request budget) and the caller's
+    # ['data'] raised KeyError -> "Auto-Kill FAILED". Retry throttles, 5xx and network errors with backoff; only a
+    # real query error (or 8 failed tries) comes back without 'data'.
+    import time as _t
+    last = None
+    for a in range(8):
+        try:
+            r = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                headers={'X-Shopify-Access-Token':tok,'Content-Type':'application/json'},
+                json={'query':q,'variables':v or {}}, timeout=60)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = f"HTTP {r.status_code}"; _t.sleep(min(30, 2 * 2 ** a)); continue
+            j = r.json()
+            if 'errors' in j and 'THROTTLED' in str(j['errors']).upper():
+                last = 'THROTTLED'; _t.sleep(min(30, 2 * 2 ** a)); continue
+            if 'data' not in j:
+                raise RuntimeError(f"Shopify GraphQL error: {str(j.get('errors', j))[:300]}")
+            return j
+        except requests.RequestException as e:
+            last = str(e)[:120]; _t.sleep(min(30, 2 * 2 ** a))
+    raise RuntimeError(f"Shopify kept failing after 8 tries: {last}")
 
 # ── Google Ads: per-PRODUCT cost/clicks/pixel-value for 7/14/30 day windows ──
 def google_product_perf(run_date):
