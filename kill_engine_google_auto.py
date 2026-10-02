@@ -83,32 +83,70 @@ WINNER_TAG = 'w_campaign'
 LC_TAG = 'lc_campaign'          # LAST CHANCE (owner 2026-08-13): pace-killed winners stay ACTIVE
 LC_CAMPAIGN_ID = '24127184079'  # 'PMax | Last Chance | UK' — £20/day, tROAS 2.2, UK presence-only
 LC_KILL_CAP = 15                # glitch guard for the lc exit rule
+LC_LOOKBACK_D = 200             # ladder v7: LC spend window (no time rule, so a product can stay for months)
 LOST_TAG   = 'l_camp'      # "lost" — WAS a winner, killed by the pace rule (v11). Set on winner
                            # kills; stripped again if the product is ever resurrected and re-sells.
 
+def _shopify_read(tok, query, variables, timeout=60):
+    """One Shopify Admin GraphQL READ with retries (ladder v7.2, 2026-10-02): a network error, HTTP 429/5xx, a non-JSON
+    reply or a reply without 'data' (e.g. THROTTLED) is retried twice (2 s, 4 s) before raising - a single transient
+    reset used to skip a whole judging section for the run. Returns the parsed JSON reply."""
+    import time as _time
+    for attempt in range(3):                  # v7.3: 3 tries, at most 45 s each, 2 s / 4 s pauses
+        if attempt:
+            _time.sleep(2 * attempt)
+        try:
+            resp = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                                 headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                                 json={'query': query, 'variables': variables}, timeout=min(timeout, 45))
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise RuntimeError(f'Shopify HTTP {resp.status_code}')
+            j = resp.json()
+            if j.get('data') is None:
+                raise RuntimeError(f"Shopify reply without data: {str(j.get('errors'))[:120]}")
+            return j
+        except Exception:
+            if attempt == 2:
+                raise
+
+def _shopify_write(tok, query, variables, field):
+    """Run one Shopify Admin GraphQL mutation. Returns 'ok' only when the reply carries `field` and no userErrors.
+    Ladder v7.1 (2026-10-02): a THROTTLED reply has no 'data' and used to read as 'ok' (nothing written, engine moved
+    on). Now THROTTLED / HTTP 429 / 5xx / network errors are retried with backoff; anything else is reported as 'err'."""
+    import time as _time
+    last = 'err: no reply'
+    for attempt in range(3):                  # v7.3: 3 tries, 20 s each, 1 s / 2 s pauses, none after the last try
+        if attempt:
+            _time.sleep(attempt)
+        try:
+            resp = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                                 headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
+                                 json={'query': query, 'variables': variables}, timeout=20)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last = f'err: http {resp.status_code}'
+            else:
+                j = resp.json()
+                errs = j.get('errors') or []
+                node = (j.get('data') or {}).get(field)
+                if node is not None and not errs:
+                    ue = node.get('userErrors') or []
+                    return 'ok' if not ue else f"err: {ue[0].get('message', '?')[:60]}"
+                throttled = isinstance(errs, list) and any(
+                    ((e or {}).get('extensions') or {}).get('code') == 'THROTTLED' for e in errs if isinstance(e, dict))
+                if not throttled:
+                    return f"err: {str(errs)[:80] if errs else 'no data in reply'}"
+                last = 'err: throttled'
+        except Exception as ex:
+            last = f"err: {str(ex)[:80]}"
+    return last
+
 def shopify_add_tag(tok, pid, tag):
     m = 'mutation($id:ID!,$t:[String!]!){tagsAdd(id:$id,tags:$t){userErrors{message}}}'
-    try:
-        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                          json={'query': m, 'variables': {'id': f"gid://shopify/Product/{pid}", 't': [tag]}},
-                          timeout=30).json()
-        errs = (j.get('data', {}).get('tagsAdd') or {}).get('userErrors') or []
-        return 'ok' if not errs else f"err: {errs[0].get('message', '?')[:60]}"
-    except Exception as ex:
-        return f"err: {ex}"
+    return _shopify_write(tok, m, {'id': f"gid://shopify/Product/{pid}", 't': [tag]}, 'tagsAdd')
 
 def shopify_remove_tag(tok, pid, tag):
     m = 'mutation($id:ID!,$t:[String!]!){tagsRemove(id:$id,tags:$t){userErrors{message}}}'
-    try:
-        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                          json={'query': m, 'variables': {'id': f"gid://shopify/Product/{pid}", 't': [tag]}},
-                          timeout=30).json()
-        errs = (j.get('data', {}).get('tagsRemove') or {}).get('userErrors') or []
-        return 'ok' if not errs else f"err: {errs[0].get('message', '?')[:60]}"
-    except Exception as ex:
-        return f"err: {ex}"
+    return _shopify_write(tok, m, {'id': f"gid://shopify/Product/{pid}", 't': [tag]}, 'tagsRemove')
 
 def shopify_set_label_metafield(tok, pid, value=WINNER_TAG):
     """Also write Simprosys's own attribute metafield (mm-google-shopping.custom_label_1).
@@ -119,14 +157,7 @@ def shopify_set_label_metafield(tok, pid, value=WINNER_TAG):
     m = ('mutation($mf:[MetafieldsSetInput!]!){metafieldsSet(metafields:$mf){userErrors{message}}}')
     v = {'mf': [{'ownerId': f"gid://shopify/Product/{pid}", 'namespace': 'mm-google-shopping',
                  'key': 'custom_label_1', 'type': 'single_line_text_field', 'value': value}]}
-    try:
-        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                          json={'query': m, 'variables': v}, timeout=30).json()
-        errs = (j.get('data', {}).get('metafieldsSet') or {}).get('userErrors') or []
-        return 'ok' if not errs else f"err: {errs[0].get('message', '?')[:60]}"
-    except Exception as ex:
-        return f"err: {ex}"
+    return _shopify_write(tok, m, v, 'metafieldsSet')
 
 WINNER_ENTRY_ORDERS = 1   # owner 2026-08-24: 2 -> 1 — first sale graduates to Winners (tROAS raised to 2.2 as the guard; pace-kill's 1-sale branch is the stop-loss).
                           # Safe because tROAS 2.2 is the real quality filter: a 2-sale
@@ -237,12 +268,26 @@ TESTING_AG_ID = '6729681029'
 AW_TESTING_AG_ID = '6738045970'   # Testing|AW: aw26 subdivision added 2026-08-16 (node 15260771050)
 
 def _ads_search(ga, gt, query):
+    """GoogleAdsService.search, every page. Ladder v7.1: a network error, a non-JSON reply or HTTP 429/5xx is retried twice
+    (3 s, 6 s) - a network error / timeout / non-JSON reply only once since v7.3 - instead of skipping a whole section for
+    the run; a Google API error still raises."""
+    import time as _time
     out = []; tok = None
     while True:
         body = {'query': query}
         if tok: body['pageToken'] = tok
-        r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/googleAds:search",
-                          headers=ga._headers(gt), json=body, timeout=60).json()
+        r = None
+        for attempt in range(3):
+            try:
+                resp = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/googleAds:search",
+                                     headers=ga._headers(gt), json=body, timeout=60)
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    _time.sleep(3 * (attempt + 1)); continue
+                r = resp.json()
+                break
+            except Exception:
+                if attempt >= 1: raise              # v7.3: one retry on a network error / timeout (keeps runs short)
+                _time.sleep(3)
         if 'error' in r: raise RuntimeError(str(r)[:300])
         out += r.get('results', []); tok = r.get('nextPageToken')
         if not tok: return out
@@ -418,9 +463,7 @@ def _winner_products(tok):
          'priceRangeV2{minVariantPrice{amount}}}}}}')
     out = {}; cur = None
     while True:
-        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                          json={'query': Q, 'variables': {'c': cur}}, timeout=60).json()
+        j = _shopify_read(tok, Q, {'c': cur}, timeout=60)   # v7.2: retried read
         c = j['data']['products']
         for e in c['edges']:
             n = e['node']
@@ -489,8 +532,51 @@ def _campaign_daily_spend(run_date, pids, campaign_id):
             out[pid].append((row['segments']['date'], int(row['metrics'].get('costMicros', 0)) / 1e6))
     return out
 
+def _campaign_daily_spend_lb(run_date, pids, campaign_id, lookback_d):
+    """_campaign_daily_spend with its own lookback (Last Chance has no time rule, so its window is long)."""
+    import google_ads_connect as ga
+    gt = ga.get_access_token()
+    start = (run_date - datetime.timedelta(days=lookback_d)).isoformat()
+    q = (f"SELECT campaign.id, segments.date, segments.product_item_id, metrics.cost_micros "
+         f"FROM shopping_performance_view "
+         f"WHERE segments.date BETWEEN '{start}' AND '{run_date.isoformat()}' "
+         f"AND campaign.id = {campaign_id} AND metrics.cost_micros > 0")
+    out = collections.defaultdict(list)
+    for row in _ads_search(ga, gt, q):
+        item = row.get('segments', {}).get('productItemId')
+        if not item:
+            continue
+        parts = str(item).lower().split('_')
+        pid = parts[2] if len(parts) >= 3 and parts[0] == 'shopify' else None
+        if pid and pid in pids:
+            out[pid].append((row['segments']['date'], int(row['metrics'].get('costMicros', 0)) / 1e6))
+    return out
+
 def _winners_daily_spend(run_date, pids):
     return _campaign_daily_spend(run_date, pids, WINNERS_CAMPAIGN_ID)
+
+def _tier_daily_spend(run_date, pids, lookback_d=None):
+    """pid -> [(date_iso, GBP), ...] spend in EVERY campaign a sold product can serve in: Rising (Winners),
+    Proven (Champions) and Last Chance. Ladder v7 (owner 2026-10-02): a product that moves between tiers is judged
+    on all of its spend, so a move never hands it fresh room for the same dry spell. Testing spend before the
+    first sale stays out: it belongs to Testing's own judgement (and the window always starts after a sale)."""
+    import google_ads_connect as ga
+    gt = ga.get_access_token()
+    start = (run_date - datetime.timedelta(days=lookback_d or WINNER_LOOKBACK_D)).isoformat()
+    q = (f"SELECT campaign.id, segments.date, segments.product_item_id, metrics.cost_micros "
+         f"FROM shopping_performance_view "
+         f"WHERE segments.date BETWEEN '{start}' AND '{run_date.isoformat()}' "
+         f"AND campaign.id IN ({WINNERS_CAMPAIGN_ID}, {CHAMPIONS_CAMPAIGN_ID}, {LC_CAMPAIGN_ID}) AND metrics.cost_micros > 0")
+    out = collections.defaultdict(list)
+    for row in _ads_search(ga, gt, q):
+        item = row.get('segments', {}).get('productItemId')
+        if not item:
+            continue
+        parts = str(item).lower().split('_')
+        pid = parts[2] if len(parts) >= 3 and parts[0] == 'shopify' else None
+        if pid and pid in pids:
+            out[pid].append((row['segments']['date'], int(row['metrics'].get('costMicros', 0)) / 1e6))
+    return out
 
 def shopify_winner_kill(tok, pid, run_date=None):
     """LAST CHANCE routing (owner 2026-08-13, replaces permanent DRAFT): the product
@@ -502,6 +588,9 @@ def shopify_winner_kill(tok, pid, run_date=None):
     # and strip any stale lc:* stamps from a previous LC cycle: lc_run must only ever
     # see the CURRENT stamp, or pre-stamp sales graduate the product (gate leak class).
     stamp = 'lc:' + (run_date or datetime.datetime.now(UK).date()).isoformat()
+    lab = shopify_set_label_metafield(tok, pid, value=LC_TAG)     # v7.3: label first - routing follows the label
+    if lab != 'ok':
+        return f'err: label {lab}'                                 # nothing else changed; the next run retries the move
     old_stamps = []
     try:
         tj = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
@@ -515,14 +604,14 @@ def shopify_winner_kill(tok, pid, run_date=None):
     M = ('mutation($id:ID!,$tags:[String!]!,$rm:[String!]!){'
          'tagsAdd(id:$id,tags:$tags){userErrors{message}} '
          'tagsRemove(id:$id,tags:$rm){userErrors{message}} }')
-    j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                      headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                      json={'query': M, 'variables': {'id': gid, 'tags': tags, 'rm': [WINNER_TAG] + old_stamps}},
-                      timeout=30).json()
+    try:
+        j = _shopify_read(tok, M, {'id': gid, 'tags': tags, 'rm': [WINNER_TAG] + old_stamps}, timeout=30)   # retried
+    except Exception as ex:
+        shopify_set_label_metafield(tok, pid, value=WINNER_TAG)    # v7.3: roll the label back - tags never changed
+        return f'err: tags {str(ex)[:100]}'
     if j.get('errors'): return str(j['errors'])[:120]
     d = j.get('data') or {}
     errs = sum([((d.get(k) or {}).get('userErrors') or []) for k in ('tagsAdd', 'tagsRemove')], [])
-    shopify_set_label_metafield(tok, pid, value=LC_TAG)
     return 'ok -> last chance' if not errs else str(errs)[:120]
 
 
@@ -576,7 +665,7 @@ def ads_remove_winner_item_nodes(pids):
                           json={'operations': [{'remove': f"{fp}/{WINNERS_AG_ID}~{i}"} for i in tgt]},
                           timeout=90).json()
         if 'error' in r: print(f"  (winners node sweep warn: {str(r)[:120]})")
-        else: print(f"  winners AG: removed {len(tgt)} item-id node(s) for killed winner(s)")
+        else: print(f"  winners AG: removed {len(tgt)} item-id node(s) of product(s) that left Rising")
     except Exception as ex:
         print(f"  (winners node sweep warn: {str(ex)[:100]})")
 
@@ -600,8 +689,9 @@ def reconcile_serving_state(dry):
                               json={'query': Q, 'variables': {'c': cur}}, timeout=60).json()
             c = j['data']['products']
             for e in c['edges']:
-                if WINNER_TAG in [str(t) for t in e['node']['tags']]:
-                    roster.add(str(e['node']['legacyResourceId']))
+                tg_ = [str(t) for t in e['node']['tags']]
+                if WINNER_TAG in tg_ and CHAMPION_TAG not in tg_:   # ladder v7.1: Proven products serve in Champions by
+                    roster.add(str(e['node']['legacyResourceId']))   # label, so a Winners item-id node of theirs is stray
             if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
             else: break
         # -- Winners AG: sweep item-id nodes whose pid is not in the roster --
@@ -633,20 +723,23 @@ def reconcile_serving_state(dry):
         # -- DRAFT products still tagged w_campaign: strip tag + label --
         QD = ('query($c:String){products(first:250,after:$c,query:"tag:%s status:draft"){'
               'pageInfo{hasNextPage endCursor} edges{node{id legacyResourceId tags}}}}' % WINNER_TAG)
-        cur = None; drafts = []
+        cur = None; drafts = []; champ_drafts = set()
         while True:
             j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
                               headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
                               json={'query': QD, 'variables': {'c': cur}}, timeout=60).json()
             c = j['data']['products']
             for e in c['edges']:
-                if WINNER_TAG in [str(t) for t in e['node']['tags']]:
+                tg_ = [str(t) for t in e['node']['tags']]
+                if WINNER_TAG in tg_:
                     drafts.append(str(e['node']['legacyResourceId']))
+                    if CHAMPION_TAG in tg_: champ_drafts.add(str(e['node']['legacyResourceId']))
             if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
             else: break
         for pid in drafts:
             if dry: continue
             shopify_remove_tag(tok, pid, WINNER_TAG)
+            if pid in champ_drafts: shopify_remove_tag(tok, pid, CHAMPION_TAG)   # ladder v7.1
             requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
                 headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
                 json={'query': 'mutation($m:[MetafieldIdentifierInput!]!){ metafieldsDelete(metafields:$m){ userErrors{message} } }',
@@ -712,9 +805,10 @@ def prune_settled_nodes(dry):
             if not f: return True                                   # not in the feed: dead node
             l1, l2 = f['l1'], f['l2']
             if agid == WINNERS_AG_ID:
-                return ntype == 'UNIT_INCLUDED' and l1 == {'w_campaign'}
+                # ladder v7: a Proven product (label c_champion) must not be held in Rising by an item-id node either
+                return ntype == 'UNIT_INCLUDED' and (l1 == {'w_campaign'} or l1 == {'c_champion'})
             if ntype != 'UNIT_EXCLUDED': return False
-            if l1 and l1 <= {'w_campaign', 'lc_campaign'}: return True   # the l1 rule already excludes it
+            if l1 and l1 <= {'w_campaign', 'lc_campaign', 'c_champion'}: return True   # the l1 rule already excludes it (c_champion: ladder v7 tree rule)
             if agid == AW_TESTING_AG_ID: return len(l2) == 1 and 'aw26' not in l2   # not admitted by the aw26 rule anyway
             if agid == TESTING_AG_ID:    return l2 == {'aw26'}                       # Testing|UK excludes aw26 anyway
             return False
@@ -746,8 +840,8 @@ def lc_run(run_date, dry, life=None):
     """LAST CHANCE exit + graduation rule (owner 2026-08-13).
       * GRADUATE: a sale dated AFTER the lc: stamp -> back to Winners (tag + label +
         ads fast-path). Pre-lc sales NEVER graduate (no ping-pong).
-      * EXIT: lc-campaign spend since stamp > min(price/7, £5) with no post-stamp sale,
-        OR 90 days in lc saleless -> permanent DRAFT.
+      * EXIT: lc-campaign spend since stamp > min(price/2, £20) with no post-stamp sale -> permanent DRAFT
+        (owner 2026-10-02, ladder v7; the old 90-days-saleless time rule is REMOVED - no time rules).
     Fail-safe: any error skips this section for the run."""
     res = dict(pool=0, graduated=[], drafted=[], err=None)
     try:
@@ -757,9 +851,7 @@ def lc_run(run_date, dry, life=None):
              'priceRangeV2{minVariantPrice{amount}}}}}}' % LC_TAG)
         pool = {}; cur = None
         while True:
-            j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                              headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                              json={'query': Q, 'variables': {'c': cur}}, timeout=60).json()
+            j = _shopify_read(tok, Q, {'c': cur}, timeout=60)   # v7.2: retried read
             c = j['data']['products']
             for e in c['edges']:
                 n = e['node']; tl = [str(t) for t in n['tags']]
@@ -784,7 +876,7 @@ def lc_run(run_date, dry, life=None):
         sale_dates = {p_: [x['date'] for x in lst] for p_, lst in life.items()}
         if not sale_dates:
             res['err'] = 'orders pull returned 0 — glitch; lc rule skipped'; return res
-        spend = _campaign_daily_spend(run_date, set(pool), LC_CAMPAIGN_ID)
+        spend = _campaign_daily_spend_lb(run_date, set(pool), LC_CAMPAIGN_ID, LC_LOOKBACK_D)   # ladder v7: no time rule, so a long spend window
         grads, exits = [], []
         for pid, m in pool.items():
             post = [x for x in sale_dates.get(pid, []) if x > m['stamp']]
@@ -797,12 +889,10 @@ def lc_run(run_date, dry, life=None):
             # owner 2026-08-16: allowance aligned to the LC tROAS 2.1 — a product may
             # spend what ONE sale at 2.1 ROAS would justify (price/2.1, £20 cap)
             # before drafting. Was min(price/7, £5) — too strict for LC's purpose.
-            allow = min(m['price'] / 2.1, 20.0) if m['price'] > 0 else 5.0
-            days = (run_date - datetime.date.fromisoformat(m['stamp'])).days
+            # owner 2026-10-02 (ladder v7): price / 2 (max £20) - "ROAS 2 of the price" with no new sale. No time rule.
+            allow = min(m['price'] / 2.0, 20.0) if m['price'] > 0 else 5.0
             if spent > allow:
                 exits.append((pid, m, f'lc spend £{spent:.2f} > £{allow:.2f}, no sale since {m["stamp"]}'))
-            elif days >= 90:
-                exits.append((pid, m, f'{days}d in last chance, no sale'))
         if len(exits) > LC_KILL_CAP:
             res['err'] = f'SAFETY STOP: {len(exits)} lc exits > cap {LC_KILL_CAP} — nothing drafted'
             return res
@@ -844,7 +934,7 @@ def _write_winner_kills_log(rows, run_date):
             w.writerow([ts, run_date.isoformat(), r['pid'], r['name'], r['opened'],
                         round(r['allow'], 2), round(r['spent'], 2), r.get('outcome', '')])
 
-def winner_pace_run(run_date, dry, life=None):
+def winner_pace_run(run_date, dry, life=None, shared=None, skip=None, exclude=None):
     """Evaluate every winner against the pace rule. Kills only when live (>= start
     date and not --dry). Returns dict(live, evaluated, flagged, killed, pool, err, closest)."""
     live = (run_date >= WINNER_KILL_START) and not dry
@@ -855,8 +945,9 @@ def winner_pace_run(run_date, dry, life=None):
         # CHAMPIONS EXEMPT (2026-07-20): champions keep w_campaign but serve in the Champions
         # campaign — their winners-campaign spend is residual, and their last sale can be stale,
         # so judging them here would false-kill. They have their OWN trailing-2.0 demotion rule.
-        champs = _champion_pids(tok)
-        winners = {pid: m for pid, m in winners.items() if pid not in champs}
+        champs = exclude if exclude is not None else _champion_pids(tok)   # v7.3: exact Proven set from champion_run
+        # ladder v7.1: `skip` = products promoted to Proven THIS run (Shopify's tag search can lag behind the write)
+        winners = {pid: m for pid, m in winners.items() if pid not in champs and pid not in (skip or set())}
         res['evaluated'] = len(winners); res['pool'] = len(winners)
         if not winners: return res
         # v12: judged on lifetime chronological sales — the two-sale allowance
@@ -866,7 +957,13 @@ def winner_pace_run(run_date, dry, life=None):
         if not life:   # glitch guard: a live store ALWAYS has orders
             res['err'] = 'orders pull returned 0 orders — glitch; winner kills skipped'
             return res
-        spend = _winners_daily_spend(run_date, set(winners))
+        # ladder v7 (owner 2026-10-02): Rising + Proven + Last Chance spend - no fresh room after a move. v7.1: reuse the
+        # Proven section's pull when it covered every product judged here, cut to this rule's own 60-day window.
+        if shared and shared[1] is not None and set(winners) <= shared[0]:
+            cut = (run_date - datetime.timedelta(days=WINNER_LOOKBACK_D)).isoformat()
+            spend = {pid: [(d, v) for d, v in rows if d >= cut] for pid, rows in shared[1].items() if pid in winners}
+        else:
+            spend = _tier_daily_spend(run_date, set(winners))
         rows = []
         for pid, m in winners.items():
             slist = life.get(pid, [])
@@ -947,17 +1044,24 @@ def winner_pace_run(run_date, dry, life=None):
 # tROAS bidder. Campaign paused, roster folded back into Winners (c_champion tag
 # removed, feed label restored to w_campaign). Flip to True only when the roster
 # can be rebuilt at 25-30+ products.
-CHAMPIONS_ENABLED       = False
+# ── LADDER v7 (owner 2026-10-01/02): PROVEN = PMax | Champions | UK, MCV tROAS 2.8, £300/day ─────────────
+# Entry 4th sale + last-4 ROAS >= max(2.5, own break-even); exit when the last 4 sales fall under that line;
+# re-entry 2 sales after the demotion + ROAS >= 2.5 since; routing by LABEL only (Testing trees exclude
+# c_champion); every spend window counts Rising + Proven + Last Chance spend. Evidence: plan v7 on the Desktop.
+CHAMPIONS_ENABLED       = True
 CHAMPION_TAG            = 'c_champion'
 CHAMPION_DEMOTED_PREFIX = 'champ_demoted:'          # champ_demoted:YYYY-MM-DD, set on demotion
 CHAMPIONS_CAMPAIGN_ID   = '24047674442'             # PMax | Champions | UK  (created 2026-07-20)
 CHAMPIONS_AG_ID         = '6731971798'              # its asset group (listing tree mirrors Winners)
-CHAMPION_ENTRY_ORDERS   = 3   # 4->3 (owner 2026-08-16): LC tier now caps false-positive cost (demote after ~1 order's rev, recovery path), and the continuation curve is flat past 3 (P(4|3)=60% vs P(5|4)=62%). Was: raised 3->4 (owner 2026-07-31): cohort audit — of 23 products that
+CHAMPION_ENTRY_ORDERS   = 4   # ladder v7 (owner 2026-10-01): 4th sale, checked vs the 5th-7th. Older history: 4->3 (owner 2026-08-16): LC tier now caps false-positive cost (demote after ~1 order's rev, recovery path), and the continuation curve is flat past 3 (P(4|3)=60% vs P(5|4)=62%). Was: raised 3->4 (owner 2026-07-31): cohort audit — of 23 products that
                               # ever entered at 3 sales, the 10 that never resold burned 24% of all
                               # champion spend for £0 return (ROAS 0.00), while 4-5-sale entrants ran
                               # 3.14 and 6+ ran 4.20. Sale #4 filters the whole dud class at minimal
                               # star-delay; 5+ would only delay the profitable 4-5 cohort.
-CHAMPION_PACE_ROAS      = 2.0
+CHAMPION_LINE           = 2.5     # ladder v7: entry + exit ROAS line on the last 4 sales (own break-even if higher)
+CHAMPION_REENTRY_ROAS   = 2.5     # ladder v7: re-entry needs ROAS >= 2.5 on all spend since the demotion
+PROVEN_LOOKBACK_D       = 200     # ladder v7: LONGEST spend window for the last-4 check (each run sizes it to the oldest anchor, min 60)
+BE_SNAPSHOT             = 'breakeven_snapshot.json'   # LOCAL runs only (gitignored); Actions reads the PROVEN_BE_JSON secret
 CHAMPION_REPROMOTE_SALES = 2
 CHAMPION_PROMOTE_CAP    = 25                        # >N promotions in one run = glitch -> abort section
 CHAMPION_DEMOTE_CAP     = 10                        # >N demotions in one run = glitch -> abort section
@@ -970,9 +1074,7 @@ def _champion_pids(tok):
          'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId}}}}')
     out = set(); cur = None
     while True:
-        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                          json={'query': Q, 'variables': {'c': cur}}, timeout=60).json()
+        j = _shopify_read(tok, Q, {'c': cur}, timeout=60)   # v7.2: retried read
         c = j['data']['products']
         for e in c['edges']: out.add(str(e['node']['legacyResourceId']))
         if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
@@ -989,9 +1091,7 @@ def _lifetime_sales(tok):
          'discountedTotalSet{shopMoney{amount}}}}}}}}}' % LIFETIME_SINCE)
     sales = collections.defaultdict(list); cur = None; n_orders = 0
     while True:
-        j = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
-                          headers={'X-Shopify-Access-Token': tok, 'Content-Type': 'application/json'},
-                          json={'query': Q, 'variables': {'c': cur}}, timeout=90).json()
+        j = _shopify_read(tok, Q, {'c': cur}, timeout=90)   # v7.2: retried read
         c = j['data']['orders']
         for e in c['edges']:
             node = e['node']; n_orders += 1; ts = node['createdAt']
@@ -1012,8 +1112,18 @@ def _lifetime_sales(tok):
     return sales, n_orders
 
 def _demoted_date(tags):
-    """Latest champ_demoted:YYYY-MM-DD stamp, or None."""
-    ds = [t[len(CHAMPION_DEMOTED_PREFIX):] for t in tags if str(t).startswith(CHAMPION_DEMOTED_PREFIX)]
+    """Latest valid champ_demoted:YYYY-MM-DD stamp, or None. v7.3: a malformed stamp (typed by hand) is ignored - it used
+    to make the date parsing raise and skip the whole Proven section every run."""
+    ds = []
+    for t in tags:
+        t = str(t)
+        if t.startswith(CHAMPION_DEMOTED_PREFIX):
+            v = t[len(CHAMPION_DEMOTED_PREFIX):]
+            try:
+                datetime.date.fromisoformat(v)
+                ds.append(v)
+            except ValueError:
+                pass
     return max(ds) if ds else None
 
 def _ag_listing_state(ga, gt, ag_ids):
@@ -1132,103 +1242,194 @@ def _write_champion_log(rows):
                             'lifetime_orders', 'allowance', 'spent', 'outcome'])
         for r in rows: w.writerow(r)
 
-def champion_run(feed, run_date, dry):
-    """Promotions (4 lifetime orders / 2 fresh post-demotion) + demotions (trailing 2.0).
-    Returns dict(roster, promoted, demoted, flagged, watch, err). Fail-safe: any error
-    skips the section and warns — testing/winner kills are never affected."""
-    res = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
+def _load_breakeven():
+    """pid -> own break-even ROAS. Source: the PROVEN_BE_JSON environment variable (an encrypted repo secret - this repo is
+    PUBLIC, so product costs never go into a committed file), else a local BE_SNAPSHOT file for runs on the laptop. Only
+    products whose break-even is above 2.5 need to be listed (the line is max(2.5, own BE)). Missing -> {} (line 2.5)."""
+    import json as _json
+    try:
+        raw = os.environ.get('PROVEN_BE_JSON')
+        if raw:
+            data = _json.loads(raw)
+        else:
+            with open(BE_SNAPSHOT, encoding='utf-8') as f:
+                data = _json.load(f)
+        if isinstance(data, dict) and isinstance(data.get('be'), dict):
+            data = data['be']
+        if not isinstance(data, dict):
+            raise ValueError('not a JSON object')
+    except FileNotFoundError:
+        return {}
+    except Exception as ex:
+        print(f"  !! WARNING: break-even list unreadable ({type(ex).__name__}) - Proven line = {CHAMPION_LINE} for every product")
+        return {}
+    out, bad = {}, 0
+    for k, v in data.items():               # one bad value skips that product only, never the whole list
+        try:
+            f = float(v)
+            if not (0 < f < float('inf')): raise ValueError
+            out[str(k)] = f
+        except Exception:
+            bad += 1
+    if bad:
+        print(f"  !! WARNING: {bad} unreadable break-even value(s) skipped - those products use the {CHAMPION_LINE} line")
+    return out
+
+def champion_run(feed, run_date, dry, life=None):
+    """PROVEN tier, ladder v7 (owner 2026-10-01/02) - PMax | Champions | UK, tROAS 2.8, £300/day.
+      PROMOTE   4+ lifetime orders AND last-4 ROAS >= max(2.5, own break-even): revenue of the last 4 sales over the
+                spend (Rising + Proven + Last Chance) since the sale before them (no 5th-last sale: since the first sale).
+                After a demotion: 2+ sales dated after the champ_demoted: stamp AND ROAS >= 2.5 on the spend since it,
+                AND the last-4 test above (so a re-entry is not demoted again on the very next run).
+      DEMOTE    that same last-4 spend > last-4 revenue / max(2.5, own break-even) -> back to Rising (label w_campaign),
+                stamped champ_demoted:DATE. Judged for every Proven product, whatever its order count.
+      ROUTING   label only (custom_label_1 = c_champion; Champions tree includes it, Testing trees exclude it). Writes go
+                LABEL FIRST, then the tag, then the stamp - a half-failed write is retried by the next run instead of
+                leaving a tagged product serving under its old label. A promotion also removes any Winners item-id node.
+      GUARDS    promotion cap (skips promotions only) and demotion cap (skips demotions only); an empty orders pull skips
+                the section; any error warns and skips it - the Testing kills, pace rule and Last Chance still run.
+      PRIVACY   the repo and its Actions logs are public: nothing printed to stdout lets anyone work out a product's own
+                break-even (figures go to the private Telegram chat only).
+    Returns res with: roster, promoted, demoted, flagged, watch, err, warn, spend (pid -> rows, shared with the pace
+    rule), skip_pace (promoted this run) and pace_exclude (the exact Proven set after this run's moves - the pace rule uses
+    it instead of a tag search; None when the section did not finish, so the pace rule falls back to its own search)."""
+    res = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None, warn=None, spend=None, skip_pace=set(),
+               pace_exclude=None)
     try:
         tok = shopify_token()
-        active = {p['pid']: p for p in feed}
+        active = {str(p['pid']): p for p in feed}
         champs = {pid: p for pid, p in active.items() if CHAMPION_TAG in p['tags']}
+        winners = {pid: p for pid, p in active.items() if WINNER_TAG in p['tags'] and CHAMPION_TAG not in p['tags']}
         res['roster'] = len(champs)
-        sales, n_orders = _lifetime_sales(tok)
+        if life:                                    # main() already pulled lifetime sales this run - reuse it
+            sales, n_orders = life, len(life)
+        else:
+            sales, n_orders = _lifetime_sales(tok)
         if n_orders == 0:
             res['err'] = 'lifetime orders pull returned 0 — glitch; champion moves skipped'
             return res
+        be = _load_breakeven()
+        if not be:
+            res['warn'] = 'break-even list missing (PROVEN_BE_JSON) — every Proven line is 2.5 this run'
+        line = lambda pid: max(CHAMPION_LINE, be.get(pid, 0.0))   # noqa: E731
 
-        # ---- PROMOTIONS: winners with 4+ lifetime orders (or 2 fresh ones post-demotion) ----
+        # spend window: back to the oldest date any judged product needs (5th-last sale, first sale, or stamp), 60..200 days
+        need = []
+        for pid in list(champs) + [q for q in winners if len(sales.get(q, [])) >= CHAMPION_ENTRY_ORDERS]:
+            sl = sales.get(pid, [])
+            if sl:
+                need.append(sl[-5]['date'] if len(sl) >= 5 else sl[0]['date'])
+            dem0 = _demoted_date(active[pid]['tags'])
+            if dem0:
+                need.append(dem0)
+        days = 60
+        if need:
+            days = (run_date - datetime.date.fromisoformat(min(need))).days + 1
+        days = max(WINNER_LOOKBACK_D, min(PROVEN_LOOKBACK_D, days))
+        spend = _tier_daily_spend(run_date, set(winners) | set(champs), days)
+        res['spend'] = spend
+        res['spend_pids'] = set(winners) | set(champs)
+
+        def last4(pid, slist):
+            rows = spend.get(pid, ())
+            if len(slist) >= 5:
+                anchor = slist[-5]['date']
+                spent = sum(v for d, v in rows if d > anchor)                  # the day AFTER the 5th-last sale
+            elif slist:
+                anchor = None                                                  # v7.3: 1-4 sales -> since the first sale
+                spent = sum(v for d, v in rows if d >= slist[0]['date'])       # (never older spend from the shared window)
+            else:
+                anchor = None
+                spent = sum(v for d, v in rows)                                # no sale on record: the whole window
+            return spent, sum(x['rev'] for x in slist[-4:]), anchor
+
+        def passes_last4(pid, slist):
+            spent, rev, _a = last4(pid, slist)
+            return spent <= 0 or rev / spent >= line(pid)
+
+        # ---- PROMOTIONS ----
         cands = []
-        for pid, p in active.items():
-            if CHAMPION_TAG in p['tags'] or WINNER_TAG not in p['tags']: continue
+        for pid, p in winners.items():
             slist = sales.get(pid, [])
             if len(slist) < CHAMPION_ENTRY_ORDERS: continue
             dem = _demoted_date(p['tags'])
-            if dem and len([s for s in slist if s['date'] > dem]) < CHAMPION_REPROMOTE_SALES:
-                continue                       # demoted: must RE-EARN with fresh sales
+            if dem:
+                post = [x for x in slist if x['date'] > dem]
+                if len(post) < CHAMPION_REPROMOTE_SALES: continue
+                spent = sum(v for d, v in spend.get(pid, ()) if d > dem)
+                if spent > 0 and sum(x['rev'] for x in post) / spent < CHAMPION_REENTRY_ROAS: continue
+            if not passes_last4(pid, slist): continue
             cands.append((pid, p, len(slist), dem))
+        log_rows = []; ts = datetime.datetime.now(UK).strftime('%Y-%m-%d %H:%M:%S')
         if len(cands) > CHAMPION_PROMOTE_CAP:
             res['err'] = (f'SAFETY STOP: {len(cands)} promotions > cap {CHAMPION_PROMOTE_CAP} — '
-                          f'looks like a data glitch; NO champion moves this run')
-            return res
-        log_rows = []; ts = datetime.datetime.now(UK).strftime('%Y-%m-%d %H:%M:%S')
-        for pid, p, n_life, dem in cands:
+                          f'looks like a data glitch; NO promotions this run (demotions still checked)')
+            cands = []
+        for pid, p, n_life, dem in sorted(cands, key=lambda c: -c[2]):
             if dry:
                 out = 'DRY'
             else:
-                r1 = shopify_add_tag(tok, pid, CHAMPION_TAG)
-                r2 = shopify_set_label_metafield(tok, pid, CHAMPION_TAG)
-                for t in [t for t in p['tags'] if str(t).startswith(CHAMPION_DEMOTED_PREFIX)]:
-                    shopify_remove_tag(tok, pid, t)          # clean re-entry
-                out = 'ok' if (r1 == 'ok' and r2 == 'ok') else f'{r1}/{r2}'
-                p['tags'].append(CHAMPION_TAG)
-            res['promoted'].append(dict(pid=pid, name=p['name'], orders=n_life,
-                                        re=bool(dem), outcome=out))
-            log_rows.append([ts, run_date.isoformat(), 'RE-PROMOTE' if dem else 'PROMOTE',
-                             pid, p['name'], n_life, '', '', out])
-            print(f"  {'would promote' if dry else 'promote'} {'(re) ' if dem else ''}champion "
-                  f"{pid} ({n_life} lifetime orders) -> {out} | {p['name'][:40]}")
-
-        # ---- DEMOTIONS: trailing floor — champion spend since 3rd-last sale vs last-2-rev/2.0 ----
-        flagged = []
-        judged = {pid: p for pid, p in champs.items()}        # only pre-existing champions
-        if judged:
-            spend = _campaign_daily_spend(run_date, set(judged), CHAMPIONS_CAMPAIGN_ID)
-            for pid, p in judged.items():
-                slist = sales.get(pid, [])
-                if len(slist) < CHAMPION_ENTRY_ORDERS: continue      # can't compute window
-                anchor = slist[-3]
-                allow = (slist[-1]['rev'] + slist[-2]['rev']) / CHAMPION_PACE_ROAS
-                spent = sum(v for d, v in spend.get(pid, ()) if d > anchor['date'])   # day AFTER anchor
-                pct = (spent / allow * 100) if allow > 0 else 0.0
-                row = dict(pid=pid, name=p['name'], allow=allow, spent=spent, pct=pct,
-                           opened=f"last-2 rev £{slist[-1]['rev'] + slist[-2]['rev']:.2f}, 3rd-last {anchor['date']}")
-                if spent > allow: flagged.append(row)
-                elif pct >= 60: res['watch'].append(row)
-            res['watch'].sort(key=lambda x: -x['pct']); res['watch'] = res['watch'][:5]
-            if len(flagged) > CHAMPION_DEMOTE_CAP:
-                res['err'] = (f'SAFETY STOP: {len(flagged)} demotions > cap {CHAMPION_DEMOTE_CAP} — '
-                              f'looks like a data glitch; NO demotions this run')
-                flagged = []
-            res['flagged'] = flagged
-            for r in flagged:
-                pid = r['pid']; p = judged[pid]
-                if dry:
-                    r['outcome'] = 'DRY'
-                else:
-                    r1 = shopify_remove_tag(tok, pid, CHAMPION_TAG)
-                    r2 = shopify_add_tag(tok, pid, f"{CHAMPION_DEMOTED_PREFIX}{run_date.isoformat()}")
-                    r3 = shopify_set_label_metafield(tok, pid, WINNER_TAG)
-                    r['outcome'] = 'ok' if (r1 == r2 == r3 == 'ok') else f'{r1}/{r2}/{r3}'
-                    if CHAMPION_TAG in p['tags']: p['tags'].remove(CHAMPION_TAG)
-                res['demoted'].append(r)
-                log_rows.append([ts, run_date.isoformat(), 'DEMOTE', pid, p['name'], len(sales.get(pid, [])),
-                                 round(r['allow'], 2), round(r['spent'], 2), r['outcome']])
-                print(f"  {'would demote' if dry else 'demote'} champion {pid} | spent £{r['spent']:.2f} > "
-                      f"allowance £{r['allow']:.2f} ({r['opened']}) | {p['name'][:40]}")
-
-        # ---- Ads listing reconciliation: the WHOLE roster, every run (self-healing) ----
+                r1 = shopify_set_label_metafield(tok, pid, CHAMPION_TAG)          # label first: routing follows it
+                r2 = shopify_add_tag(tok, pid, CHAMPION_TAG) if r1 == 'ok' else 'skipped'
+                if r1 == 'ok' and r2 != 'ok':          # v7.3: roll the label back - routing and tags must never disagree
+                    r2 = f"{r2} (label rolled back: {shopify_set_label_metafield(tok, pid, WINNER_TAG)})"
+                if r1 == 'ok' and r2 == 'ok':
+                    for t in [t for t in p['tags'] if str(t).startswith(CHAMPION_DEMOTED_PREFIX)]:
+                        shopify_remove_tag(tok, pid, t)      # clean re-entry (only once the move itself is written)
+                    p['tags'].append(CHAMPION_TAG)
+                out = 'ok' if (r1 == 'ok' and r2 == 'ok') else f'label {r1} / tag {r2}'
+            res['promoted'].append(dict(pid=pid, name=p['name'], orders=n_life, re=bool(dem), outcome=out))
+            if out in ('ok', 'DRY'):
+                res['skip_pace'].add(pid)
+            log_rows.append([ts, run_date.isoformat(), 'RE-PROMOTE' if dem else 'PROMOTE', pid, p['name'], n_life, '', '', out])
+            print(f"  {'would promote' if dry else 'promote'} {'(re) ' if dem else ''}to Proven {pid} ({n_life} orders) -> {out} | {p['name'][:40]}")
         if not dry:
-            roster_now = ({pid for pid in champs} - {x['pid'] for x in res['demoted'] if x.get('outcome') == 'ok'}
-                          ) | {x['pid'] for x in res['promoted'] if x['outcome'] == 'ok'}
-            _, fp_err = champion_ads_move(sorted(roster_now),
-                                          [x['pid'] for x in res['demoted'] if x.get('outcome') == 'ok'], tok,
-                                          winner_pids={str(p['pid']) for p in feed if WINNER_TAG in p['tags']})
-            if fp_err: res['err'] = f'fast-path: {fp_err}'
+            ok = [x['pid'] for x in res['promoted'] if x['outcome'] == 'ok']
+            if ok: ads_remove_winner_item_nodes(ok)   # label routes it; an item-id node would keep it in Rising too
+
+        # ---- DEMOTIONS: last 4 sales under max(2.5, own BE) on all-tier spend ----
+        flagged = []
+        for pid, p in champs.items():
+            slist = sales.get(pid, [])
+            spent, rev, anchor = last4(pid, slist)
+            allow = rev / line(pid)
+            pct = (spent / allow * 100) if allow > 0 else (100.0 if spent > 0 else 0.0)
+            row = dict(pid=pid, name=p['name'], allow=allow, spent=spent, pct=pct,
+                       opened=f"last-4 £{rev:.2f}, spend since {anchor or 'the first sale'}")   # Telegram only (private)
+            if spent > allow: flagged.append(row)
+            elif pct >= 60: res['watch'].append(row)
+        res['watch'].sort(key=lambda x: -x['pct']); res['watch'] = res['watch'][:5]
+        if len(flagged) > CHAMPION_DEMOTE_CAP:
+            msg = (f'SAFETY STOP: {len(flagged)} demotions > cap {CHAMPION_DEMOTE_CAP} — '
+                   f'looks like a data glitch; NO demotions this run')
+            res['err'] = (res['err'] + ' | ' + msg) if res['err'] else msg
+            flagged = []
+        res['flagged'] = flagged
+        for r in flagged:
+            pid = r['pid']; p = champs[pid]
+            if dry:
+                r['outcome'] = 'DRY'
+            else:
+                r1 = shopify_set_label_metafield(tok, pid, WINNER_TAG)            # label first: routing follows it
+                r2 = shopify_remove_tag(tok, pid, CHAMPION_TAG) if r1 == 'ok' else 'skipped'
+                if r1 == 'ok' and r2 != 'ok':          # v7.3: roll the label back - routing and tags must never disagree
+                    r2 = f"{r2} (label rolled back: {shopify_set_label_metafield(tok, pid, CHAMPION_TAG)})"
+                r3 = shopify_add_tag(tok, pid, f"{CHAMPION_DEMOTED_PREFIX}{run_date.isoformat()}") if r2 == 'ok' else 'skipped'
+                r['outcome'] = 'ok' if (r1 == r2 == r3 == 'ok') else f'label {r1} / tag {r2} / stamp {r3}'
+                r['moved'] = (r1 == 'ok' and r2 == 'ok')   # out of Proven even if only the stamp failed
+                if r2 == 'ok' and CHAMPION_TAG in p['tags']: p['tags'].remove(CHAMPION_TAG)
+            res['demoted'].append(r)
+            log_rows.append([ts, run_date.isoformat(), 'DEMOTE', pid, p['name'], len(sales.get(pid, [])),
+                             round(r['allow'], 2), round(r['spent'], 2), r['outcome']])
+            print(f"  {'would demote' if dry else 'demote'} Proven {pid} (last 4 sales under its line) -> {r['outcome']} | {p['name'][:40]}")
         if not dry and log_rows: _write_champion_log(log_rows)
+        # v7.3: the EXACT Proven set for the pace rule - feed tags + this run's moves (Shopify's tag search can lag)
+        moved_in = {x['pid'] for x in res['promoted'] if x['outcome'] in ('ok', 'DRY')}
+        moved_out = {x['pid'] for x in res['demoted'] if x.get('outcome') == 'DRY' or x.get('moved')}
+        res['pace_exclude'] = (set(champs) | moved_in) - moved_out
         return res
     except Exception as ex:
-        res['err'] = f'champion rule error (section skipped; other kills unaffected): {str(ex)[:150]}'
+        res['err'] = f'champion rule error (section skipped; other kills unaffected): {type(ex).__name__}: {str(ex)[:120]}'
         return res
 
 def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry):
@@ -1410,19 +1611,20 @@ def main():
         # campaign; demote champions whose trailing 2-gap window fell below 2.0. Runs BEFORE
         # the winner pace rule so fresh promotions are already champion-exempt this same run.
         if CHAMPIONS_ENABLED:
-            ch = champion_run(feed, run_date, dry)
+            ch = champion_run(feed, run_date, dry, life_sales)
             print(f"champions: roster {ch['roster']} | promoted {len(ch['promoted'])} | "
                   f"demoted {len(ch['demoted'])}" + (f" | !! {ch['err']}" if ch['err'] else ""))
-            for r in ch['watch']:
-                print(f"  champion watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of "
-                      f"£{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+            if ch.get('warn'): print(f"  !! {ch['warn']}")
+            for r in ch['watch']:   # ladder v7.1: figures only in the private Telegram chat (public log must not reveal a break-even)
+                print(f"  champion watch {r['pct']:.0f}%: {r['pid']} | {r['name'][:40]}")
         else:
             ch = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
             print("champions: DISABLED (campaign paused 2026-08-07 — roster folded into Winners)")
 
         # SERVING-STATE JANITOR (audit 2026-08-16): heal missed node sweeps + draft tags
         js = reconcile_serving_state(dry)
-        if datetime.datetime.now(UK).hour == PRUNE_HOUR_UK or _TREE_NODES_SEEN > PRUNE_TRIGGER_NODES or '--prune' in sys.argv:
+        _now_uk = datetime.datetime.now(UK)   # v7.3: once a day (first run of 04:00-04:09 UK) at the 8-min cadence
+        if (_now_uk.hour == PRUNE_HOUR_UK and _now_uk.minute < 10) or _TREE_NODES_SEEN > PRUNE_TRIGGER_NODES or '--prune' in sys.argv:
             pj = prune_settled_nodes(dry)
             print(f"fast-path hygiene: {pj['checked']} item-id node(s) checked | {pj['removed']} {'would be ' if dry else ''}removed (label has taken over) | "
                   f"{pj['kept']} kept | biggest tree {_TREE_NODES_SEEN} nodes" + (f" | !! {pj['err']}" if pj['err'] else ""))
@@ -1431,7 +1633,8 @@ def main():
               + (f" | !! {js['err']}" if js['err'] else ""))
 
         # WINNER PACE RULE (v11): judge the Winners campaign at 2.8-pace
-        w = winner_pace_run(run_date, dry, life_sales)
+        w = winner_pace_run(run_date, dry, life_sales, shared=(ch.get('spend_pids') or set(), ch.get('spend')),
+                            skip=ch.get('skip_pace'), exclude=ch.get('pace_exclude'))
         print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
               f"{len(w['flagged'])} over allowance | killed {w['killed']} | "
               f"{'LIVE' if w['live'] else ('DRY' if dry else 'dormant -> live ' + WINNER_KILL_START.isoformat())}"
@@ -1513,7 +1716,7 @@ def main():
         else:
             ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
                       - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY')))
-            tg += (f"\n\n👑 <b>Champions (tROAS 2.0, trailing pace {CHAMPION_PACE_ROAS})</b>: "
+            tg += (f"\n\n👑 <b>Proven (Champions, tROAS 2.8; out when the last 4 sales fall under {CHAMPION_LINE} or own BE)</b>: "
                    f"roster {ch_now} | promoted {len(ch['promoted'])} | demoted {len(ch['demoted'])}")
         for x in ch['promoted'][:10]:
             tg += (f"\n⬆️ <b>{html.escape(x['name'][:42])}</b> <code>{x['pid']}</code> — "
@@ -1522,12 +1725,14 @@ def main():
         for r in ch['demoted'][:10]:
             tg += (f"\n⬇️ <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
                    f"   spent £{r['spent']:.2f} &gt; allowance £{r['allow']:.2f} "
-                   f"({html.escape(r['opened'])}) → back to Winners")
+                   f"({html.escape(r['opened'])}) → back to Rising")
         for r in ch['watch'][:3]:
             tg += (f"\n👀 champion watch {r['pct']:.0f}%: <code>{r['pid']}</code> "
                    f"£{r['spent']:.2f} of £{r['allow']:.2f}")
         if ch['err']:
             tg += f"\n⚠️ {html.escape(ch['err'])}"
+        if ch.get('warn'):
+            tg += f"\n⚠️ {html.escape(ch['warn'])}"
         if bs_added:
             tg += f"\n🛍️ Best Sellers collection: +{bs_added} winner(s) added"
         if bs_err:

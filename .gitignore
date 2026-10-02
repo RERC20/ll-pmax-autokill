@@ -22,3 +22,8 @@ _*.json
 _*.csv
 _apiout*.json
 scratchpad/
+
+# ladder v7 (2026-10-02): product costs / break-evens never go into this PUBLIC repo (Actions reads the PROVEN_BE_JSON secret)
+breakeven_snapshot.json
+champion_moves_log.csv
+winner_kills_log.csv
