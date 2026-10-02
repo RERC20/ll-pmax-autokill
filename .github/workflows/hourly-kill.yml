@@ -6,7 +6,7 @@ name: PMax Auto-Kill (8-min cadence)
 # CADENCE (owner 2026-10-02, ladder v7): EVERY 8-min tick of the external cron (cron-job.org) runs the
 # engine. History: 2026-07-29 a 15-min gate halved Google Ads API ops while item-id node writes were
 # exhausting the Basic Access 15k/day quota; v7 routes by label, and a full dry run measured 12 Google
-# searches per run (~2,200/day at 8 min). The gate below only stops a doubled / early tick (< 5 min).
+# searches per run (~2,200/day at 8 min). The gate below only stops a doubled tick (< 200 s).
 # To change cadence, edit GATE_S.
 #
 # PRIVACY: this repo is PUBLIC only so Actions minutes are free & unlimited. The CODE is public;
@@ -27,8 +27,9 @@ permissions:
 
 concurrency:
   group: auto-kill               # one run at a time; a new 8-min trigger SUPERSEDES a stuck/queued
-  cancel-in-progress: true       # run instead of piling up. Safe: the engine re-evaluates every run
-                                 # (idempotent), so cancelling a stale run loses nothing.
+  cancel-in-progress: false      # v7.4 (2026-10-02): the */8 cron's :00 tick comes 4 min after :56 - it must not cancel a
+                                 # slow :56 run part-way (lost sections + Telegram). GitHub keeps one run going and only the
+                                 # newest one waiting, so nothing piles up; the 7-min job timeout still stops a hung run.
 
 jobs:
   run:
@@ -76,14 +77,14 @@ jobs:
             -d "{\"ref\":\"${{ github.ref_name }}\"}"
           echo "fired $(date -u)" > _structure_edits_fired.txt
 
-      # 8-MINUTE CADENCE GATE (owner 2026-10-02): every 8-min grid tick proceeds unless the last engine run
-      # was < 300s ago (an early / doubled tick; runner start times jitter by up to ~1 min, so a
-      # tighter gate would skip real 8-min ticks). The epoch is stamped BEFORE the engine runs, so even a
+      # 8-MINUTE CADENCE GATE (owner 2026-10-02): every tick of the external cron proceeds unless the last engine run
+      # was < 200s ago (a doubled tick). The cron is */8, i.e. minutes :00 :08 ... :56, so :56 -> :00 is only 4 min;
+      # a 200 s gate keeps that :00 run too, so the engine runs at least every 8 minutes. The epoch is stamped BEFORE the engine runs, so even a
       # failed run counts as a tick (prevents retry-hammering Google during quota exhaustion).
       - name: Cadence gate (8 min)
         id: gate
         run: |
-          GATE_S=300
+          GATE_S=200
           now=$(date +%s)
           last=$(cat _last_run_epoch.txt 2>/dev/null || echo 0)
           age=$((now - last))

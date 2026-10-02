@@ -109,6 +109,18 @@ def _shopify_read(tok, query, variables, timeout=60):
             if attempt == 2:
                 raise
 
+def _product_tags(tok, pid):
+    """A product's current tags, read straight from Shopify (v7.4): decides whether a write that 'failed' (timeouts / 5xx
+    on every try) actually landed, BEFORE anything is rolled back. None when the read itself fails - then nothing is rolled
+    back and the next run repairs the move (every write here can be repeated safely)."""
+    import time as _time
+    _time.sleep(3)                     # a write that timed out may still be landing - give Shopify a moment first
+    try:
+        j = _shopify_read(tok, '{product(id:"gid://shopify/Product/%s"){tags}}' % pid, {}, timeout=20)
+        return {str(t) for t in (((j.get('data') or {}).get('product') or {}).get('tags') or [])}
+    except Exception:
+        return None
+
 def _shopify_write(tok, query, variables, field):
     """Run one Shopify Admin GraphQL mutation. Returns 'ok' only when the reply carries `field` and no userErrors.
     Ladder v7.1 (2026-10-02): a THROTTLED reply has no 'data' and used to read as 'ok' (nothing written, engine moved
@@ -283,6 +295,10 @@ def _ads_search(ga, gt, query):
                                      headers=ga._headers(gt), json=body, timeout=60)
                 if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
                     _time.sleep(3 * (attempt + 1)); continue
+                if resp.status_code == 400 and attempt == 0 and not any(k in (resp.text or '') for k in (
+                        'queryError', 'fieldError', 'requestError', 'authenticationError', 'authorizationError')):
+                    print(f"  (Google HTTP 400 - retrying once: {(resp.text or '')[:200]})")   # v7.4: the documented flake
+                    _time.sleep(4); continue
                 r = resp.json()
                 break
             except Exception:
@@ -607,8 +623,13 @@ def shopify_winner_kill(tok, pid, run_date=None):
     try:
         j = _shopify_read(tok, M, {'id': gid, 'tags': tags, 'rm': [WINNER_TAG] + old_stamps}, timeout=30)   # retried
     except Exception as ex:
-        shopify_set_label_metafield(tok, pid, value=WINNER_TAG)    # v7.3: roll the label back - tags never changed
-        return f'err: tags {str(ex)[:100]}'
+        now = _product_tags(tok, pid)                                  # v7.4: did the tag change land after all?
+        if now is not None and LC_TAG in now and WINNER_TAG not in now:
+            return 'ok -> last chance (confirmed by read-back)'
+        if now is not None:                                            # definitely not moved: roll the label back
+            shopify_set_label_metafield(tok, pid, value=WINNER_TAG)
+            return f'err: tags {str(ex)[:100]} (label rolled back)'
+        return f'err: tags {str(ex)[:100]} (tags unreadable - label kept, next run repairs)'
     if j.get('errors'): return str(j['errors'])[:120]
     d = j.get('data') or {}
     errs = sum([((d.get(k) or {}).get('userErrors') or []) for k in ('tagsAdd', 'tagsRemove')], [])
@@ -670,7 +691,7 @@ def ads_remove_winner_item_nodes(pids):
         print(f"  (winners node sweep warn: {str(ex)[:100]})")
 
 
-def reconcile_serving_state(dry):
+def reconcile_serving_state(dry, extra_roster=None):
     """Every-run janitor (audit 2026-08-16). The demote-time node sweep is one-shot and
     warn-only, so a single failure used to strand a product serving in Winners forever;
     and nothing ever cleaned w_campaign off DRAFT products (a republish would bypass the
@@ -694,6 +715,7 @@ def reconcile_serving_state(dry):
                     roster.add(str(e['node']['legacyResourceId']))   # label, so a Winners item-id node of theirs is stray
             if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
             else: break
+        roster |= {str(x) for x in (extra_roster or ())}   # v7.4: this run's new winners (their fresh fast-path nodes)
         # -- Winners AG: sweep item-id nodes whose pid is not in the roster --
         import google_ads_connect as ga
         gt = ga.get_access_token()
@@ -1120,6 +1142,8 @@ def _demoted_date(tags):
         if t.startswith(CHAMPION_DEMOTED_PREFIX):
             v = t[len(CHAMPION_DEMOTED_PREFIX):]
             try:
+                if len(v) != 10 or v[4] != '-' or v[7] != '-':
+                    raise ValueError(v)
                 datetime.date.fromisoformat(v)
                 ds.append(v)
             except ValueError:
@@ -1282,7 +1306,8 @@ def champion_run(feed, run_date, dry, life=None):
                 After a demotion: 2+ sales dated after the champ_demoted: stamp AND ROAS >= 2.5 on the spend since it,
                 AND the last-4 test above (so a re-entry is not demoted again on the very next run).
       DEMOTE    that same last-4 spend > last-4 revenue / max(2.5, own break-even) -> back to Rising (label w_campaign),
-                stamped champ_demoted:DATE. Judged for every Proven product, whatever its order count.
+                stamped champ_demoted:DATE. Judged for every Proven product, whatever its order count. A product moved
+                down is judged by the Rising pace rule IN THE SAME RUN (no fresh room), so it can reach Last Chance at once.
       ROUTING   label only (custom_label_1 = c_champion; Champions tree includes it, Testing trees exclude it). Writes go
                 LABEL FIRST, then the tag, then the stamp - a half-failed write is retried by the next run instead of
                 leaving a tagged product serving under its old label. A promotion also removes any Winners item-id node.
@@ -1371,16 +1396,22 @@ def champion_run(feed, run_date, dry, life=None):
             else:
                 r1 = shopify_set_label_metafield(tok, pid, CHAMPION_TAG)          # label first: routing follows it
                 r2 = shopify_add_tag(tok, pid, CHAMPION_TAG) if r1 == 'ok' else 'skipped'
-                if r1 == 'ok' and r2 != 'ok':          # v7.3: roll the label back - routing and tags must never disagree
-                    r2 = f"{r2} (label rolled back: {shopify_set_label_metafield(tok, pid, WINNER_TAG)})"
+                if r1 == 'ok' and r2 != 'ok':          # v7.4: read the tags before any rollback - the write may have landed
+                    now = _product_tags(tok, pid)
+                    if now is not None and CHAMPION_TAG in now:
+                        r2 = 'ok'                                              # it landed after all: the move is complete
+                    elif now is not None:                                      # definitely not tagged: roll the label back
+                        r2 = f"{r2} (label rolled back: {shopify_set_label_metafield(tok, pid, WINNER_TAG)})"
+                    else:
+                        r2 = f"{r2} (tags unreadable - label kept, next run repairs)"
                 if r1 == 'ok' and r2 == 'ok':
                     for t in [t for t in p['tags'] if str(t).startswith(CHAMPION_DEMOTED_PREFIX)]:
                         shopify_remove_tag(tok, pid, t)      # clean re-entry (only once the move itself is written)
                     p['tags'].append(CHAMPION_TAG)
                 out = 'ok' if (r1 == 'ok' and r2 == 'ok') else f'label {r1} / tag {r2}'
             res['promoted'].append(dict(pid=pid, name=p['name'], orders=n_life, re=bool(dem), outcome=out))
-            if out in ('ok', 'DRY'):
-                res['skip_pace'].add(pid)
+            if out in ('ok', 'DRY') or 'tags unreadable' in out:    # unreadable: it may already be Proven - keep it out
+                res['skip_pace'].add(pid)                         # of the pace rule this run (the next run settles it)
             log_rows.append([ts, run_date.isoformat(), 'RE-PROMOTE' if dem else 'PROMOTE', pid, p['name'], n_life, '', '', out])
             print(f"  {'would promote' if dry else 'promote'} {'(re) ' if dem else ''}to Proven {pid} ({n_life} orders) -> {out} | {p['name'][:40]}")
         if not dry:
@@ -1412,8 +1443,14 @@ def champion_run(feed, run_date, dry, life=None):
             else:
                 r1 = shopify_set_label_metafield(tok, pid, WINNER_TAG)            # label first: routing follows it
                 r2 = shopify_remove_tag(tok, pid, CHAMPION_TAG) if r1 == 'ok' else 'skipped'
-                if r1 == 'ok' and r2 != 'ok':          # v7.3: roll the label back - routing and tags must never disagree
-                    r2 = f"{r2} (label rolled back: {shopify_set_label_metafield(tok, pid, CHAMPION_TAG)})"
+                if r1 == 'ok' and r2 != 'ok':          # v7.4: read the tags before any rollback - the write may have landed
+                    now = _product_tags(tok, pid)
+                    if now is not None and CHAMPION_TAG not in now:
+                        r2 = 'ok'                                              # it landed after all: the move is complete
+                    elif now is not None:                                      # definitely still tagged: roll the label back
+                        r2 = f"{r2} (label rolled back: {shopify_set_label_metafield(tok, pid, CHAMPION_TAG)})"
+                    else:
+                        r2 = f"{r2} (tags unreadable - label kept, next run repairs)"
                 r3 = shopify_add_tag(tok, pid, f"{CHAMPION_DEMOTED_PREFIX}{run_date.isoformat()}") if r2 == 'ok' else 'skipped'
                 r['outcome'] = 'ok' if (r1 == r2 == r3 == 'ok') else f'label {r1} / tag {r2} / stamp {r3}'
                 r['moved'] = (r1 == 'ok' and r2 == 'ok')   # out of Proven even if only the stamp failed
@@ -1424,7 +1461,7 @@ def champion_run(feed, run_date, dry, life=None):
             print(f"  {'would demote' if dry else 'demote'} Proven {pid} (last 4 sales under its line) -> {r['outcome']} | {p['name'][:40]}")
         if not dry and log_rows: _write_champion_log(log_rows)
         # v7.3: the EXACT Proven set for the pace rule - feed tags + this run's moves (Shopify's tag search can lag)
-        moved_in = {x['pid'] for x in res['promoted'] if x['outcome'] in ('ok', 'DRY')}
+        moved_in = {x['pid'] for x in res['promoted'] if x['outcome'] in ('ok', 'DRY') or 'tags unreadable' in str(x['outcome'])}
         moved_out = {x['pid'] for x in res['demoted'] if x.get('outcome') == 'DRY' or x.get('moved')}
         res['pace_exclude'] = (set(champs) | moved_in) - moved_out
         return res
@@ -1622,7 +1659,7 @@ def main():
             print("champions: DISABLED (campaign paused 2026-08-07 — roster folded into Winners)")
 
         # SERVING-STATE JANITOR (audit 2026-08-16): heal missed node sweeps + draft tags
-        js = reconcile_serving_state(dry)
+        js = reconcile_serving_state(dry, extra_roster={str(p['pid']) for p in (new_winners or [])})
         _now_uk = datetime.datetime.now(UK)   # v7.3: once a day (first run of 04:00-04:09 UK) at the 8-min cadence
         if (_now_uk.hour == PRUNE_HOUR_UK and _now_uk.minute < 10) or _TREE_NODES_SEEN > PRUNE_TRIGGER_NODES or '--prune' in sys.argv:
             pj = prune_settled_nodes(dry)
@@ -1715,7 +1752,7 @@ def main():
             tg += "\n\n👑 Champions: disabled (paused 2026-08-07, folded into Winners)"
         else:
             ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
-                      - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY')))
+                      - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY') or x.get('moved')))
             tg += (f"\n\n👑 <b>Proven (Champions, tROAS 2.8; out when the last 4 sales fall under {CHAMPION_LINE} or own BE)</b>: "
                    f"roster {ch_now} | promoted {len(ch['promoted'])} | demoted {len(ch['demoted'])}")
         for x in ch['promoted'][:10]:
@@ -1725,7 +1762,9 @@ def main():
         for r in ch['demoted'][:10]:
             tg += (f"\n⬇️ <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
                    f"   spent £{r['spent']:.2f} &gt; allowance £{r['allow']:.2f} "
-                   f"({html.escape(r['opened'])}) → back to Rising")
+                   f"({html.escape(r['opened'])}) → "
+                   + ("back to Rising" if (r.get('outcome') in ('ok', 'DRY') or r.get('moved'))
+                      else f"NOT moved: {html.escape(str(r.get('outcome'))[:120])}"))   # cut BEFORE escaping (never split an entity)
         for r in ch['watch'][:3]:
             tg += (f"\n👀 champion watch {r['pct']:.0f}%: <code>{r['pid']}</code> "
                    f"£{r['spent']:.2f} of £{r['allow']:.2f}")
