@@ -859,6 +859,123 @@ def prune_settled_nodes(dry):
     return out
 
 
+
+# ── FEED LABEL SYNC GUARD (owner 2026-10-03, ladder v7.6) ─────────────────────────────────────────────────────────────
+# A product's campaign is decided by custom_label_1 as GOOGLE holds it: the engine writes the label in Shopify and the feed
+# app copies it to Google, normally within 1-1.5 h. On 3 Oct two products had never been copied (26 h and 78 h) - one served in
+# Rising while the engine judged it as Proven. Once an hour this compares every ACTIVE product's tier (from its tags, the
+# engine's own record) with the label on EVERY offer Google holds. Still wrong LABEL_STUCK_H after the label was written ->
+# a neutral tag is added and removed: the product update makes the feed app send the product again. Never writes a label or
+# a routing tag; a Shopify label that disagrees with the tags is reported, not guessed at.
+LABEL_SYNC_MINUTE_MAX = 8      # the first run of every hour at the 8-minute cadence
+LABEL_STUCK_H         = 2.0    # label written longer ago than this and Google still disagrees = stuck
+LABEL_RESEND_GAP_H    = 2.0    # at most one re-send per product every 2 h (judged on the product's own updatedAt)
+LABEL_ALERT_H         = 6.0    # still stuck after this long = shout in Telegram (the re-send is not working for it)
+LABEL_RESEND_CAP      = 25     # more stuck products than this = a feed outage, not a product problem: alert, touch nothing
+LABEL_RESEND_TAG      = 'feed_resync'
+
+
+def _tier_of_tags(tags):
+    tg = {str(t) for t in tags}
+    return 'proven' if CHAMPION_TAG in tg else 'lc' if LC_TAG in tg else 'rising' if WINNER_TAG in tg else 'testing'
+
+
+def _tier_of_label(v):
+    return {CHAMPION_TAG: 'proven', LC_TAG: 'lc', WINNER_TAG: 'rising'}.get((v or '').strip().lower(), 'testing')
+
+
+def _google_offer_tiers():
+    """pid -> Counter(tier of every offer Google holds for it), from shopping_product (custom_attribute1 = custom_label_1)."""
+    import google_ads_connect as ga
+    gt = ga.get_access_token()
+    out = collections.defaultdict(collections.Counter)
+    for r in _ads_search(ga, gt, "SELECT shopping_product.item_id, shopping_product.custom_attribute1 FROM shopping_product"):
+        sp = r['shoppingProduct']; parts = str(sp.get('itemId', '')).split('_'); pid = parts[2] if len(parts) >= 3 else None
+        if pid:
+            out[pid][_tier_of_label(sp.get('customAttribute1'))] += 1
+    return out
+
+
+def _label_state(tok, pids):
+    """pid -> (Shopify custom_label_1, when that label was written, when the product was last updated) for a few products."""
+    out, pids = {}, list(pids)
+    for i in range(0, len(pids), 50):
+        ids = [f"gid://shopify/Product/{p}" for p in pids[i:i + 50]]
+        j = _shopify_read(tok, 'query($ids:[ID!]!){nodes(ids:$ids){... on Product{legacyResourceId updatedAt '
+                               'l1:metafield(namespace:"mm-google-shopping",key:"custom_label_1"){value updatedAt}}}}', {'ids': ids}, timeout=60)
+        for n in ((j.get('data') or {}).get('nodes') or []):
+            if n:
+                m = n.get('l1') or {}
+                out[str(n['legacyResourceId'])] = (m.get('value'), m.get('updatedAt'), n.get('updatedAt'))
+    return out
+
+
+def label_sync_check(feed, dry, now=None, force=False):
+    """Hourly feed label guard (see the block above). None when it is not this run's turn, else
+    dict(checked, syncing, waiting, resent, stuck_long, label_wrong, cleaned, err). Never raises."""
+    now = now or datetime.datetime.now(UK)
+    if not (force or now.minute < LABEL_SYNC_MINUTE_MAX):
+        return None
+    res = dict(checked=0, syncing=[], waiting=[], resent=[], stuck_long=[], label_wrong=[], cleaned=0, err=None)
+    try:
+        tok = shopify_token()
+        active = {str(p['pid']): p for p in feed}
+        if not dry:                     # a re-send whose second write failed leaves the neutral tag behind: take it off
+            for pid, p in active.items():
+                if LABEL_RESEND_TAG in [str(t) for t in p['tags']] and shopify_remove_tag(tok, pid, LABEL_RESEND_TAG) == 'ok':
+                    res['cleaned'] += 1
+        offers = _google_offer_tiers()
+        if not offers:
+            res['err'] = 'Google returned no offers - glitch; label check skipped'
+            return res
+        cand = {}
+        for pid, p in active.items():
+            c = offers.get(pid)
+            if not c:
+                continue
+            res['checked'] += 1
+            want = _tier_of_tags(p['tags'])
+            wrong = sum(v for t, v in c.items() if t != want)
+            if wrong:
+                cand[pid] = (p, want, wrong, sum(c.values()))
+        if not cand:
+            return res
+        state = _label_state(tok, cand)
+        utc_now = now.astimezone(datetime.timezone.utc)
+
+        def hours(ts):
+            return (utc_now - datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))).total_seconds() / 3600 if ts else None
+        stuck = []
+        for pid, (p, want, wrong, tot) in cand.items():
+            lab, lab_ts, prod_ts = state.get(pid, (None, None, None))
+            row = dict(pid=pid, name=p['name'], want=want, wrong=wrong, offers=tot, label_age=hours(lab_ts), product_age=hours(prod_ts))
+            if _tier_of_label(lab) != want:
+                res['label_wrong'].append(row)          # Shopify's own label disagrees with the tags: report, never guess
+                continue
+            if row['label_age'] is None or row['label_age'] < LABEL_STUCK_H:
+                res['syncing'].append(row)
+                continue
+            if row['label_age'] >= LABEL_ALERT_H:
+                res['stuck_long'].append(row)
+            if row['product_age'] is not None and row['product_age'] < LABEL_RESEND_GAP_H:
+                res['waiting'].append(row)             # re-sent (or edited) recently: give the feed app its time
+                continue
+            stuck.append(row)
+        if len(stuck) > LABEL_RESEND_CAP:
+            res['err'] = f'SAFETY STOP: {len(stuck)} stuck labels > cap {LABEL_RESEND_CAP} - looks like a feed outage; nothing re-sent'
+            return res
+        for row in stuck:
+            if dry:
+                row['outcome'] = 'DRY'
+            else:
+                r1 = shopify_add_tag(tok, row['pid'], LABEL_RESEND_TAG)
+                r2 = shopify_remove_tag(tok, row['pid'], LABEL_RESEND_TAG) if r1 == 'ok' else 'skipped'
+                row['outcome'] = 'ok' if (r1 == 'ok' and r2 == 'ok') else f'add {r1} / remove {r2}'
+            res['resent'].append(row)
+    except Exception as ex:
+        res['err'] = f'label check error (skipped; nothing else affected): {type(ex).__name__}: {str(ex)[:120]}'
+    return res
+
 def lc_run(run_date, dry, life=None):
     """LAST CHANCE exit + graduation rule (owner 2026-08-13).
       * GRADUATE: a sale dated AFTER the lc: stamp -> back to Winners (tag + label +
@@ -1724,6 +1841,20 @@ def main():
         print(f"last chance: pool {lc['pool']} | graduated {len(lc['graduated'])} | "
               f"drafted {len(lc['drafted'])}" + (f" | !! {lc['err']}" if lc['err'] else ""))
 
+        # FEED LABEL SYNC GUARD (v7.6): once an hour, re-send any product whose label Google has not taken after 2 h
+        try:
+            ls = label_sync_check(feed, dry, force=('--labels' in sys.argv))
+        except Exception as _lx:
+            ls = dict(checked=0, syncing=[], waiting=[], resent=[], stuck_long=[], label_wrong=[], cleaned=0, err=str(_lx)[:120])
+        if ls is not None:
+            print(f"feed labels: {ls['checked']} checked | {len(ls['syncing'])} syncing (< {LABEL_STUCK_H:g} h) | {len(ls['resent'])} "
+                  f"{'would be ' if dry else ''}re-sent | {len(ls['waiting'])} re-sent earlier, waiting | {len(ls['label_wrong'])} Shopify label != tags"
+                  + (f" | cleaned {ls['cleaned']}" if ls['cleaned'] else "") + (f" | !! {ls['err']}" if ls['err'] else ""))
+            for r in ls['resent'] + ls['waiting'] + ls['label_wrong']:
+                kind = 're-send' if r in ls['resent'] else ('waiting' if r in ls['waiting'] else 'LABEL != TAGS')
+                print(f"  label {kind} {r['pid']} should be {r['want']} | {r['wrong']}/{r['offers']} offers wrong at Google | "
+                      f"label written {(r['label_age'] or 0):.1f} h ago | {r['name'][:40]}")
+
         kills = []
         for p in feed:
             if WINNER_TAG in p['tags'] or LC_TAG in p['tags']:
@@ -1812,6 +1943,17 @@ def main():
             tg += f"\n⚠️ {html.escape(ch['err'])}"
         if ch.get('warn'):
             tg += f"\n⚠️ {html.escape(ch['warn'])}"
+        if ls is not None and (ls['resent'] or ls['stuck_long'] or ls['label_wrong'] or ls['err']):
+            tg += (f"\n\n🏷 <b>Feed labels</b>: {len(ls['resent'])} re-sent to Google | {len(ls['waiting'])} waiting | "
+                   f"{len(ls['syncing'])} still syncing (&lt; {LABEL_STUCK_H:g} h)")
+            for r in ls['resent'][:8]:
+                tg += f"\n  ↻ <code>{r['pid']}</code> {html.escape(r['name'][:40])} - Google still not {r['want']} after {r['label_age']:.0f} h"
+            for r in ls['stuck_long'][:5]:
+                tg += f"\n  ⚠️ stuck {r['label_age']:.0f} h: <code>{r['pid']}</code> {html.escape(r['name'][:40])}"
+            for r in ls['label_wrong'][:5]:
+                tg += f"\n  ⚠️ Shopify label disagrees with its tags: <code>{r['pid']}</code> {html.escape(r['name'][:40])}"
+            if ls['err']:
+                tg += f"\n⚠️ {html.escape(ls['err'])}"
         if bs_added:
             tg += f"\n🛍️ Best Sellers collection: +{bs_added} winner(s) added"
         if bs_err:
