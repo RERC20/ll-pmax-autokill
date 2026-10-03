@@ -475,7 +475,7 @@ WINNER_KILLS_LOG  = 'winner_kills_log.csv'
 def _winner_products(tok):
     """Live winners (ACTIVE + w_campaign) -> {pid: {name, price}} (min variant price)."""
     Q = ('query($c:String){products(first:250,after:$c,query:"tag:w_campaign status:active"){'
-         'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId title '
+         'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId title tags '
          'priceRangeV2{minVariantPrice{amount}}}}}}')
     out = {}; cur = None
     while True:
@@ -485,7 +485,8 @@ def _winner_products(tok):
             n = e['node']
             out[str(n['legacyResourceId'])] = dict(
                 name=n.get('title', ''),
-                price=float((n.get('priceRangeV2') or {}).get('minVariantPrice', {}).get('amount') or 0))
+                price=float((n.get('priceRangeV2') or {}).get('minVariantPrice', {}).get('amount') or 0),
+                tags=[str(t) for t in (n.get('tags') or [])])                  # v7.5: for the Last Chance restart stamp
         if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
         else: break
     return out
@@ -861,7 +862,8 @@ def prune_settled_nodes(dry):
 def lc_run(run_date, dry, life=None):
     """LAST CHANCE exit + graduation rule (owner 2026-08-13).
       * GRADUATE: a sale dated AFTER the lc: stamp -> back to Winners (tag + label +
-        ads fast-path). Pre-lc sales NEVER graduate (no ping-pong).
+        ads fast-path). Pre-lc sales NEVER graduate (no ping-pong). v7.5: stamped lc_grad:<rescue sale date> FIRST
+        (no stamp, no graduation this run); from then on only sales on/after that date count - a new graduate again.
       * EXIT: lc-campaign spend since stamp > min(price/2, £20) with no post-stamp sale -> permanent DRAFT
         (owner 2026-10-02, ladder v7; the old 90-days-saleless time rule is REMOVED - no time rules).
     Fail-safe: any error skips this section for the run."""
@@ -885,7 +887,8 @@ def lc_run(run_date, dry, life=None):
                 pool[str(n['legacyResourceId'])] = dict(
                     name=n['title'], price=float(n['priceRangeV2']['minVariantPrice']['amount']),
                     stamp=(stamps[-1] if stamps else run_date.isoformat()),
-                    stamp_tags=['lc:' + s for s in stamps])
+                    stamp_tags=['lc:' + s for s in stamps],
+                    grad_tags=[t for t in tl if t.startswith(LC_GRAD_PREFIX)])   # v7.5: restart stamps of earlier cycles
             if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
             else: break
         res['pool'] = len(pool)
@@ -919,15 +922,27 @@ def lc_run(run_date, dry, life=None):
             res['err'] = f'SAFETY STOP: {len(exits)} lc exits > cap {LC_KILL_CAP} — nothing drafted'
             return res
         for pid, m in grads:
+            # v7.5 (owner 2026-10-03): the rescue sale = its new sale #1; everything before it stops counting
+            rescue = min(x for x in sale_dates.get(pid, []) if x > m['stamp'])
+            gstamp = f"{LC_GRAD_PREFIX}{rescue}"
             if dry:
-                print(f"  lc would-GRADUATE {pid} -> Winners | {m['name'][:40]}"); continue
+                print(f"  lc would-GRADUATE {pid} -> Winners (history restarts {rescue}) | {m['name'][:40]}"); continue
+            r0 = shopify_add_tag(tok, pid, gstamp)                             # the restart stamp FIRST
+            if r0 != 'ok':
+                now = _product_tags(tok, pid)                                  # the write may have landed anyway
+                if not (now is not None and gstamp in now):
+                    print(f"  lc GRADUATE {pid} postponed: restart stamp not written ({r0}) - next run retries | {m['name'][:40]}")
+                    continue
             shopify_add_tag(tok, pid, WINNER_TAG)
             shopify_set_label_metafield(tok, pid, value=WINNER_TAG)
             shopify_remove_tag(tok, pid, LC_TAG)
             shopify_remove_tag(tok, pid, LOST_TAG)
             for _st in m.get('stamp_tags', []):   # consume stamps — stale ones re-graduate on pre-stamp sales
                 shopify_remove_tag(tok, pid, _st)
-            print(f"  lc GRADUATE {pid} -> Winners | {m['name'][:40]}")
+            for _st in m.get('grad_tags', []):    # v7.5: an earlier cycle's restart stamp is replaced by this one
+                if _st != gstamp:
+                    shopify_remove_tag(tok, pid, _st)
+            print(f"  lc GRADUATE {pid} -> Winners (history restarts {rescue}) | {m['name'][:40]}")
             res['graduated'].append({'pid': pid, 'name': m['name']})
         if res['graduated'] and not dry:
             try:
@@ -988,7 +1003,7 @@ def winner_pace_run(run_date, dry, life=None, shared=None, skip=None, exclude=No
             spend = _tier_daily_spend(run_date, set(winners))
         rows = []
         for pid, m in winners.items():
-            slist = life.get(pid, [])
+            slist = _since_reset(life.get(pid, []), _lc_reset_date(m.get('tags') or ()))   # v7.5: new sales only after Last Chance
             if len(slist) >= 2:
                 # v12: the last two sales pool their revenue; the cycle opens at the
                 # sale BEFORE them (3rd-last), or the older of the two if only two
@@ -1073,6 +1088,10 @@ def winner_pace_run(run_date, dry, life=None, shared=None, skip=None, exclude=No
 CHAMPIONS_ENABLED       = True
 CHAMPION_TAG            = 'c_champion'
 CHAMPION_DEMOTED_PREFIX = 'champ_demoted:'          # champ_demoted:YYYY-MM-DD, set on demotion
+LC_GRAD_PREFIX          = 'lc_grad:'                # v7.5 (owner 2026-10-03): lc_grad:YYYY-MM-DD = the date of the sale that took the product
+                                                    # OUT of Last Chance. From then on it is a new Testing graduate again: only sales on/after the
+                                                    # stamp count in every Rising / Proven rule - Proven needs 4 NEW sales and the last-4 ROAS on the
+                                                    # spend since the first of them. No credit for the sales made before Last Chance.
 CHAMPIONS_CAMPAIGN_ID   = '24047674442'             # PMax | Champions | UK  (created 2026-07-20)
 CHAMPIONS_AG_ID         = '6731971798'              # its asset group (listing tree mirrors Winners)
 CHAMPION_ENTRY_ORDERS   = 4   # ladder v7 (owner 2026-10-01): 4th sale, checked vs the 5th-7th. Older history: 4->3 (owner 2026-08-16): LC tier now caps false-positive cost (demote after ~1 order's rev, recovery path), and the continuation curve is flat past 3 (P(4|3)=60% vs P(5|4)=62%). Was: raised 3->4 (owner 2026-07-31): cohort audit — of 23 products that
@@ -1133,14 +1152,14 @@ def _lifetime_sales(tok):
     for pid in sales: sales[pid].sort(key=lambda s: s['ts'])
     return sales, n_orders
 
-def _demoted_date(tags):
-    """Latest valid champ_demoted:YYYY-MM-DD stamp, or None. v7.3: a malformed stamp (typed by hand) is ignored - it used
+def _stamp_date(tags, prefix):
+    """Latest valid <prefix>YYYY-MM-DD stamp, or None. v7.3: a malformed stamp (typed by hand) is ignored - it used
     to make the date parsing raise and skip the whole Proven section every run."""
     ds = []
     for t in tags:
         t = str(t)
-        if t.startswith(CHAMPION_DEMOTED_PREFIX):
-            v = t[len(CHAMPION_DEMOTED_PREFIX):]
+        if t.startswith(prefix):
+            v = t[len(prefix):]
             try:
                 if len(v) != 10 or v[4] != '-' or v[7] != '-':
                     raise ValueError(v)
@@ -1149,6 +1168,22 @@ def _demoted_date(tags):
             except ValueError:
                 pass
     return max(ds) if ds else None
+
+
+def _demoted_date(tags):
+    """Latest valid champ_demoted:YYYY-MM-DD stamp, or None."""
+    return _stamp_date(tags, CHAMPION_DEMOTED_PREFIX)
+
+
+def _lc_reset_date(tags):
+    """v7.5: latest valid lc_grad:YYYY-MM-DD stamp (the sale that took the product out of Last Chance), or None."""
+    return _stamp_date(tags, LC_GRAD_PREFIX)
+
+
+def _since_reset(slist, reset):
+    """v7.5: a product that sold its way out of Last Chance starts again like a new Testing graduate - only the sales from
+    that sale on count. Never mutates the shared lifetime-sales list."""
+    return [x for x in slist if x['date'] >= reset] if reset else slist
 
 def _ag_listing_state(ga, gt, ag_ids):
     """agid -> (item_subdiv_resource_name, {item_id_lower: node_resource_name}).
@@ -1301,6 +1336,8 @@ def _load_breakeven():
 
 def champion_run(feed, run_date, dry, life=None):
     """PROVEN tier, ladder v7 (owner 2026-10-01/02) - PMax | Champions | UK, tROAS 2.8, £300/day.
+      RESTART   v7.5: a product that sold its way out of Last Chance (lc_grad: stamp) is judged on the sales from that sale on
+                only, in every rule below - like a new Testing graduate.
       PROMOTE   4+ lifetime orders AND last-4 ROAS >= max(2.5, own break-even): revenue of the last 4 sales over the
                 spend (Rising + Proven + Last Chance) since the sale before them (no 5th-last sale: since the first sale).
                 After a demotion: 2+ sales dated after the champ_demoted: stamp AND ROAS >= 2.5 on the spend since it,
@@ -1340,8 +1377,10 @@ def champion_run(feed, run_date, dry, life=None):
 
         # spend window: back to the oldest date any judged product needs (5th-last sale, first sale, or stamp), 60..200 days
         need = []
-        for pid in list(champs) + [q for q in winners if len(sales.get(q, [])) >= CHAMPION_ENTRY_ORDERS]:
-            sl = sales.get(pid, [])
+        # v7.5: the sales history each rule judges - since the restart stamp for products that sold their way out of Last Chance
+        hist = {pid: _since_reset(sales.get(pid, []), _lc_reset_date(active[pid]['tags'])) for pid in list(champs) + list(winners)}
+        for pid in list(champs) + [q for q in winners if len(hist[q]) >= CHAMPION_ENTRY_ORDERS]:
+            sl = hist[pid]
             if sl:
                 need.append(sl[-5]['date'] if len(sl) >= 5 else sl[0]['date'])
             dem0 = _demoted_date(active[pid]['tags'])
@@ -1375,7 +1414,7 @@ def champion_run(feed, run_date, dry, life=None):
         # ---- PROMOTIONS ----
         cands = []
         for pid, p in winners.items():
-            slist = sales.get(pid, [])
+            slist = hist[pid]                                                  # v7.5: new sales only after Last Chance
             if len(slist) < CHAMPION_ENTRY_ORDERS: continue
             dem = _demoted_date(p['tags'])
             if dem:
@@ -1413,7 +1452,8 @@ def champion_run(feed, run_date, dry, life=None):
             if out in ('ok', 'DRY') or 'tags unreadable' in out:    # unreadable: it may already be Proven - keep it out
                 res['skip_pace'].add(pid)                         # of the pace rule this run (the next run settles it)
             log_rows.append([ts, run_date.isoformat(), 'RE-PROMOTE' if dem else 'PROMOTE', pid, p['name'], n_life, '', '', out])
-            print(f"  {'would promote' if dry else 'promote'} {'(re) ' if dem else ''}to Proven {pid} ({n_life} orders) -> {out} | {p['name'][:40]}")
+            print(f"  {'would promote' if dry else 'promote'} {'(re) ' if dem else ''}to Proven {pid} ({n_life} orders"
+                  f"{' since Last Chance' if _lc_reset_date(p['tags']) else ''}) -> {out} | {p['name'][:40]}")
         if not dry:
             ok = [x['pid'] for x in res['promoted'] if x['outcome'] == 'ok']
             if ok: ads_remove_winner_item_nodes(ok)   # label routes it; an item-id node would keep it in Rising too
@@ -1421,7 +1461,7 @@ def champion_run(feed, run_date, dry, life=None):
         # ---- DEMOTIONS: last 4 sales under max(2.5, own BE) on all-tier spend ----
         flagged = []
         for pid, p in champs.items():
-            slist = sales.get(pid, [])
+            slist = hist[pid]                                                  # v7.5: same history as at entry
             spent, rev, anchor = last4(pid, slist)
             allow = rev / line(pid)
             pct = (spent / allow * 100) if allow > 0 else (100.0 if spent > 0 else 0.0)
@@ -1456,7 +1496,7 @@ def champion_run(feed, run_date, dry, life=None):
                 r['moved'] = (r1 == 'ok' and r2 == 'ok')   # out of Proven even if only the stamp failed
                 if r2 == 'ok' and CHAMPION_TAG in p['tags']: p['tags'].remove(CHAMPION_TAG)
             res['demoted'].append(r)
-            log_rows.append([ts, run_date.isoformat(), 'DEMOTE', pid, p['name'], len(sales.get(pid, [])),
+            log_rows.append([ts, run_date.isoformat(), 'DEMOTE', pid, p['name'], len(hist[pid]),
                              round(r['allow'], 2), round(r['spent'], 2), r['outcome']])
             print(f"  {'would demote' if dry else 'demote'} Proven {pid} (last 4 sales under its line) -> {r['outcome']} | {p['name'][:40]}")
         if not dry and log_rows: _write_champion_log(log_rows)
