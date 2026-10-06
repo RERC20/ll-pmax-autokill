@@ -1216,7 +1216,10 @@ CHAMPION_ENTRY_ORDERS   = 4   # ladder v7 (owner 2026-10-01): 4th sale, checked 
                               # champion spend for £0 return (ROAS 0.00), while 4-5-sale entrants ran
                               # 3.14 and 6+ ran 4.20. Sale #4 filters the whole dud class at minimal
                               # star-delay; 5+ would only delay the profitable 4-5 cohort.
-CHAMPION_LINE           = 2.5     # ladder v7: entry + exit ROAS line on the last 4 sales (own break-even if higher)
+CHAMPION_LINE           = 2.5     # ladder v7: ENTRY ROAS line on the last 4 sales (own break-even if higher)
+CHAMPION_EXIT_LINE      = 2.0     # v7.7 (owner 2026-10-06): EXIT line on the same last 4 sales (own break-even if higher). Proven's
+                                  # tROAS went 2.8 -> 2.6, so a 2.5 exit sat on the campaign's own average and churned steady sellers;
+                                  # replay 15 Jul - 1 Oct: exit 2.0 = 7 demotions vs 18 (1 vs 6 still selling), +GBP152 at BE 1.6.
 CHAMPION_REENTRY_ROAS   = 2.5     # ladder v7: re-entry needs ROAS >= 2.5 on all spend since the demotion
 PROVEN_LOOKBACK_D       = 200     # ladder v7: LONGEST spend window for the last-4 check (each run sizes it to the oldest anchor, min 60)
 BE_SNAPSHOT             = 'breakeven_snapshot.json'   # LOCAL runs only (gitignored); Actions reads the PROVEN_BE_JSON secret
@@ -1459,7 +1462,8 @@ def champion_run(feed, run_date, dry, life=None):
                 spend (Rising + Proven + Last Chance) since the sale before them (no 5th-last sale: since the first sale).
                 After a demotion: 2+ sales dated after the champ_demoted: stamp AND ROAS >= 2.5 on the spend since it,
                 AND the last-4 test above (so a re-entry is not demoted again on the very next run).
-      DEMOTE    that same last-4 spend > last-4 revenue / max(2.5, own break-even) -> back to Rising (label w_campaign),
+      DEMOTE    that same last-4 spend > last-4 revenue / max(2.0, own break-even) -> back to Rising (label w_campaign),
+                (v7.7: exit line 2.0, entry stays 2.5 - a steady 2.0-2.5 seller stays in Proven)
                 stamped champ_demoted:DATE. Judged for every Proven product, whatever its order count. A product moved
                 down is judged by the Rising pace rule IN THE SAME RUN (no fresh room), so it can reach Last Chance at once.
       ROUTING   label only (custom_label_1 = c_champion; Champions tree includes it, Testing trees exclude it). Writes go
@@ -1490,7 +1494,8 @@ def champion_run(feed, run_date, dry, life=None):
         be = _load_breakeven()
         if not be:
             res['warn'] = 'break-even list missing (PROVEN_BE_JSON) — every Proven line is 2.5 this run'
-        line = lambda pid: max(CHAMPION_LINE, be.get(pid, 0.0))   # noqa: E731
+        line = lambda pid: max(CHAMPION_LINE, be.get(pid, 0.0))   # noqa: E731  entry
+        exit_line = lambda pid: max(CHAMPION_EXIT_LINE, be.get(pid, 0.0))   # noqa: E731  v7.7: exit
 
         # spend window: back to the oldest date any judged product needs (5th-last sale, first sale, or stamp), 60..200 days
         need = []
@@ -1580,7 +1585,7 @@ def champion_run(feed, run_date, dry, life=None):
         for pid, p in champs.items():
             slist = hist[pid]                                                  # v7.5: same history as at entry
             spent, rev, anchor = last4(pid, slist)
-            allow = rev / line(pid)
+            allow = rev / exit_line(pid)                                 # v7.7: exit line 2.0 (entry 2.5)
             pct = (spent / allow * 100) if allow > 0 else (100.0 if spent > 0 else 0.0)
             row = dict(pid=pid, name=p['name'], allow=allow, spent=spent, pct=pct,
                        opened=f"last-4 £{rev:.2f}, spend since {anchor or 'the first sale'}")   # Telegram only (private)
@@ -1924,7 +1929,7 @@ def main():
         else:
             ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
                       - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY') or x.get('moved')))
-            tg += (f"\n\n👑 <b>Proven (Champions, tROAS 2.8; out when the last 4 sales fall under {CHAMPION_LINE} or own BE)</b>: "
+            tg += (f"\n\n👑 <b>Proven (Champions; in at last-4 ROAS {CHAMPION_LINE}+, out under {CHAMPION_EXIT_LINE} or own BE)</b>: "
                    f"roster {ch_now} | promoted {len(ch['promoted'])} | demoted {len(ch['demoted'])}")
         for x in ch['promoted'][:10]:
             tg += (f"\n⬆️ <b>{html.escape(x['name'][:42])}</b> <code>{x['pid']}</code> — "
