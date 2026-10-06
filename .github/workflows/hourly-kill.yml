@@ -119,6 +119,8 @@ jobs:
           SHOPIFY_CLIENT_ID:      ${{ secrets.SHOPIFY_CLIENT_ID }}
           SHOPIFY_CLIENT_SECRET:  ${{ secrets.SHOPIFY_CLIENT_SECRET }}
           RESEND_API_KEY:         ${{ secrets.RESEND_API_KEY }}
+          EMAIL_TO:               ${{ secrets.EMAIL_TO }}         # v7.7.1 (2026-10-06): the 12h digest + email alerts need it - the secret
+                                                                 # existed since 12 Jul but was never passed, so no engine email was sent
           TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}
           PROVEN_BE_JSON:         ${{ secrets.PROVEN_BE_JSON }}   # ladder v7: own break-even per product (secret - public repo)
