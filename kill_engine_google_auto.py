@@ -585,7 +585,13 @@ def _tier_daily_spend(run_date, pids, lookback_d=None):
          f"WHERE segments.date BETWEEN '{start}' AND '{run_date.isoformat()}' "
          f"AND campaign.id IN ({WINNERS_CAMPAIGN_ID}, {CHAMPIONS_CAMPAIGN_ID}, {LC_CAMPAIGN_ID}) AND metrics.cost_micros > 0")
     out = collections.defaultdict(list)
-    for row in _ads_search(ga, gt, q):
+    rows = _ads_search(ga, gt, q)
+    if not rows:
+        # v7.7.1: Rising + Proven + Last Chance spend hundreds of pounds a day, so NO spend row at all over 60+ days is a
+        # Google glitch, not reality. Read as "no spend", every 4-sale Rising product would pass the Proven entry line and
+        # be promoted on bad data - raise instead: the section that asked skips this run (and says so in Telegram).
+        raise RuntimeError(f'Google returned no Rising/Proven/Last Chance spend rows since {start} - glitch, nothing judged on it')
+    for row in rows:
         item = row.get('segments', {}).get('productItemId')
         if not item:
             continue
@@ -1245,9 +1251,13 @@ def _champion_pids(tok):
 def _lifetime_sales(tok):
     """pid -> chronological [{ts, date(UK), rev}, ...] — ONE entry per ORDER containing the
     product, all orders lifetime. Cancelled excluded; per-order product revenue with the same
-    order-level discount scaling as the feed (GROSS, refunds ignored). ~10 pages / run."""
+    order-level discount scaling as the feed (GROSS, refunds ignored). ~10 pages / run.
+    v7.7.1 (2026-10-06): a sale is MONEY. Test orders, GBP0 orders (support-desk exchanges / replacements, 100% codes)
+    and a GBP0 product line inside a paid order are NOT sales: on 5 Oct a free exchange (#553395) graduated a Last Chance
+    product, and a GBP0 "sale" also moves the Rising pace window and fills a slot of the Proven last 4 with GBP0.
+    The order count still counts every order the pull returned (it is the empty-pull glitch signal)."""
     Q = ('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s -status:cancelled"){'
-         'pageInfo{hasNextPage endCursor} edges{node{createdAt subtotalPriceSet{shopMoney{amount}} '
+         'pageInfo{hasNextPage endCursor} edges{node{createdAt test subtotalPriceSet{shopMoney{amount}} '
          'lineItems(first:100){edges{node{product{legacyResourceId} '
          'discountedTotalSet{shopMoney{amount}}}}}}}}}' % LIFETIME_SINCE)
     sales = collections.defaultdict(list); cur = None; n_orders = 0
@@ -1256,6 +1266,8 @@ def _lifetime_sales(tok):
         c = j['data']['orders']
         for e in c['edges']:
             node = e['node']; n_orders += 1; ts = node['createdAt']
+            if node.get('test'):
+                continue                                    # v7.7.1: a test order is not a sale
             d = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone(UK).date().isoformat()
             lines = [(str(li['node']['product']['legacyResourceId']),
                       float(li['node']['discountedTotalSet']['shopMoney']['amount']))
@@ -1266,6 +1278,9 @@ def _lifetime_sales(tok):
             per = collections.defaultdict(float)
             for pid, amt in lines: per[pid] += amt * factor
             for pid, rev in per.items():
+                if rev < 0.01:
+                    continue                                # v7.7.1: under 1p is not a sale - a GBP0 order (exchange / replacement /
+                                                            # 100% code: a GBP0 subtotal makes every line GBP0) or a free line
                 sales[pid].append(dict(ts=ts, date=d, rev=rev))
         if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
         else: break
@@ -1682,6 +1697,29 @@ def send_report(subject, body, xlsx_path=None):
         print(f"!! EMAIL FAILED: {ex}   (report saved: {xlsx_path})")
         return False
 
+TELEGRAM_MAX = 4000      # v7.7.1: Telegram REFUSES a message over 4,096 characters - the whole report was lost, not cut
+
+
+def _tg_parts(text, limit=TELEGRAM_MAX):
+    """v7.7.1: a report longer than Telegram's limit is split at line breaks (every line of the report opens and closes its
+    own HTML tags, so each part stays valid HTML). A single line longer than the limit (never built by this engine) is cut."""
+    if len(text) <= limit:
+        return [text]
+    parts, cur = [], ''
+    for line in text.split('\n'):
+        while len(line) > limit:
+            if cur:
+                parts.append(cur); cur = ''
+            parts.append(line[:limit]); line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            parts.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
 def send_telegram(text, xlsx_path=None):
     """Every-run push: a text summary + the .xlsx as a document. No daily cap on Telegram."""
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
@@ -1689,10 +1727,14 @@ def send_telegram(text, xlsx_path=None):
         return False
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"; ok = False
     try:
-        r = requests.post(f"{base}/sendMessage",
-                          data={'chat_id': TELEGRAM_CHAT, 'text': text, 'parse_mode': 'HTML'}, timeout=30)
-        ok = (r.status_code == 200)
-        if not ok: print(f"!! Telegram message failed ({r.status_code}): {r.text[:200]}")
+        parts = _tg_parts(text)
+        ok = True
+        for i, part in enumerate(parts):
+            r = requests.post(f"{base}/sendMessage",
+                              data={'chat_id': TELEGRAM_CHAT, 'text': part, 'parse_mode': 'HTML'}, timeout=30)
+            if r.status_code != 200:
+                ok = False
+                print(f"!! Telegram message failed (part {i + 1}/{len(parts)}, {r.status_code}): {r.text[:200]}")
         if xlsx_path and os.path.exists(xlsx_path):
             with open(xlsx_path, 'rb') as f:
                 rd = requests.post(f"{base}/sendDocument",
@@ -1906,7 +1948,7 @@ def main():
 
         # WINNERS pace section — one status line every run + detail per kill/preview
         tg += (f"\n\n🩹 <b>Last Chance</b>: pool {lc['pool']} | ⬆ {len(lc['graduated'])} back to Winners | "
-               f"🪦 {len(lc['drafted'])} drafted" + (f" | ⚠ {lc['err']}" if lc['err'] else ""))
+               f"🪦 {len(lc['drafted'])} drafted" + (f" | ⚠ {html.escape(lc['err'])}" if lc['err'] else ""))   # v7.7.1: escaped
         for g in lc['graduated'][:5]:
             tg += f"\n  ⬆ <code>{g['pid']}</code> {html.escape(g['name'][:40])}"
         for g in lc['drafted'][:5]:
@@ -2010,7 +2052,7 @@ def main():
         else:
             print("!! AUTO-KILL RUN FAILED — nothing further drafted:\n" + err)
             try:
-                send_telegram(f"❌ <b>Auto-Kill FAILED</b>\n{ts} UK\n<pre>{err[-500:]}</pre>")
+                send_telegram(f"❌ <b>Auto-Kill FAILED</b>\n{ts} UK\n<pre>{html.escape(err[-500:])}</pre>")   # v7.7.1: escaped
                 send_report(f"AUTO-KILL FAILED — {run_date}",
                             f"auto-kill run FAILED at {ts} (UK).\n\nError:\n{err}")
             except Exception:
