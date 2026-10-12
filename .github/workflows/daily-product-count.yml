@@ -29,11 +29,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'start | end | rollover | settle | auto | test (fake numbers, layout check)'
+        description: 'start | end | rollover | settle | auto'
         required: false
         default: 'auto'
         type: choice
-        options: [auto, rollover, settle, start, end, test]
+        options: [auto, rollover, settle, start, end]
   # BACKUP only: GitHub's own schedule (best-effort, set for BST). Cannot overlap the kill engine
   # (that workflow has no schedule). Safe to leave on; the dedicated cron above is the punctual one.
   # The 02:11 UTC line (03:11 BST) drives the SETTLED PNL re-send: Google restates overnight ad

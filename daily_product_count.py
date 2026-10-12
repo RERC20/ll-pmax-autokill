@@ -409,26 +409,6 @@ def do_settle(stores, day, dry, force):
     json.dump(snap, open(PNL_FILE, 'w', encoding='utf-8'))
     send_telegram(msg)
 
-def do_test():
-    """Owner 12 Oct 2026: 'do a test on Telegram now, fake numbers' - the END OF DAY layout with made-up figures, clearly
-    labelled TEST. Reads and writes NOTHING (no store, no state, no history)."""
-    rate = 1.323
-    fake = [('LolaLooks', (6435, 6421, 49, 63), dict(rev_gbp=2668.40, orders=70, items=74, fees_gbp=153.72, cost_gbp=1299.80)),
-            ('Loreya', (242, 1236, 994, 0), dict(rev_gbp=212.85, orders=6, items=7, fees_gbp=12.40, cost_gbp=74.10)),
-            ('SoleVair', (227, 1215, 992, 4), dict(rev_gbp=158.60, orders=5, items=5, fees_gbp=9.35, cost_gbp=71.45))]
-    ms, blocks, s = [], [], [0, 0, 0, 0]
-    for label, (a, b_, p, k), m in fake:
-        m = dict(m, cost_usd=m['cost_gbp'] * rate); ms.append(m)
-        for i, v in enumerate((a, b_, p, k)): s[i] += v
-        blocks.append(f"\U0001F3EC <b>{label}</b>\n" + product_lines(a, b_, p, k) + "\n" + money_block(m, rate))
-    msg = ("\U0001F9EA <b>TEST — FAKE NUMBERS</b> (layout check only)\n"
-           "\U0001F4CA <b>PRODUCTS — END OF DAY</b>\n"
-           f"\U0001F5D3 {fmt_date(datetime.datetime.now(UK).date())}\n"
-           "━━━━━━━━━━━\n\U0001F310 <b>BLENDED — ALL STORES</b>\n" + product_lines(*s) + "\n" + money_block(blend(ms), rate)
-           + "\n━━━━━━━━━━━\n" + "\n━━━━━━━━━━━\n".join(blocks))
-    print(msg)
-    send_telegram(msg)
-
 def resolve_mode(now, event, explicit):
     """Decide rollover / settle / start / end / skip.
       - explicit start|end|rollover|settle always wins (manual / gh runs).
@@ -446,13 +426,11 @@ def resolve_mode(now, event, explicit):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', choices=['start', 'end', 'rollover', 'settle', 'auto', 'test'], default='auto')
+    ap.add_argument('--mode', choices=['start', 'end', 'rollover', 'settle', 'auto'], default='auto')
     ap.add_argument('--dry', action='store_true')
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--day', help='END / SETTLE for this UK day (YYYY-MM-DD) instead of today / yesterday (testing)')
     a = ap.parse_args()
-    if a.mode == 'test':                            # fake-number layout check (no store read, no state)
-        do_test(); return
     now = datetime.datetime.now(UK); today = now.date()
     explicit = a.mode if a.mode in ('start', 'end', 'rollover', 'settle') else None
     mode = resolve_mode(now, os.environ.get('GITHUB_EVENT_NAME', ''), explicit)
