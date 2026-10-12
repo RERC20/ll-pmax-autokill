@@ -1,4 +1,4 @@
-name: Daily Product Count (start + end of day)
+name: Daily Product Count (start + end of day, all stores)
 
 # Records how many ACTIVE products the store STARTS and ENDS each day, and pushes each as its
 # own dated Telegram message. Also diffs start->end to show how many were PUBLISHED vs KILLED.
@@ -75,6 +75,10 @@ jobs:
             _product_count_state.json
             _product_count_history.csv
             _eod_pnl.json
+            _product_count_state_loreya.json
+            _product_count_history_loreya.csv
+            _product_count_state_solevair.json
+            _product_count_history_solevair.csv
           key: product-count-${{ github.run_id }}
           restore-keys: |
             product-count-
@@ -93,6 +97,23 @@ jobs:
           GOOGLE_CLIENT_SECRET:   ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN:   ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           GOOGLE_CUSTOMER_ID:     ${{ secrets.GOOGLE_CUSTOMER_ID }}
+          # 12 Oct 2026: Loreya + SoleVair in the same message (blended first, then each store)
+          LOR_SHOPIFY_STORE: ${{ secrets.LOR_SHOPIFY_STORE }}
+          LOR_SHOPIFY_CLIENT_ID: ${{ secrets.LOR_SHOPIFY_CLIENT_ID }}
+          LOR_SHOPIFY_CLIENT_SECRET: ${{ secrets.LOR_SHOPIFY_CLIENT_SECRET }}
+          LOR_GOOGLE_CLIENT_ID: ${{ secrets.LOR_GOOGLE_CLIENT_ID }}
+          LOR_GOOGLE_CLIENT_SECRET: ${{ secrets.LOR_GOOGLE_CLIENT_SECRET }}
+          LOR_GOOGLE_REFRESH_TOKEN: ${{ secrets.LOR_GOOGLE_REFRESH_TOKEN }}
+          LOR_GOOGLE_CUSTOMER_ID: ${{ secrets.LOR_GOOGLE_CUSTOMER_ID }}
+          LOR_GOOGLE_LOGIN_CUSTOMER_ID: ${{ secrets.LOR_GOOGLE_LOGIN_CUSTOMER_ID }}
+          SOL_SHOPIFY_STORE: ${{ secrets.SOL_SHOPIFY_STORE }}
+          SOL_SHOPIFY_CLIENT_ID: ${{ secrets.SOL_SHOPIFY_CLIENT_ID }}
+          SOL_SHOPIFY_CLIENT_SECRET: ${{ secrets.SOL_SHOPIFY_CLIENT_SECRET }}
+          SOL_GOOGLE_CLIENT_ID: ${{ secrets.SOL_GOOGLE_CLIENT_ID }}
+          SOL_GOOGLE_CLIENT_SECRET: ${{ secrets.SOL_GOOGLE_CLIENT_SECRET }}
+          SOL_GOOGLE_REFRESH_TOKEN: ${{ secrets.SOL_GOOGLE_REFRESH_TOKEN }}
+          SOL_GOOGLE_CUSTOMER_ID: ${{ secrets.SOL_GOOGLE_CUSTOMER_ID }}
+          SOL_GOOGLE_LOGIN_CUSTOMER_ID: ${{ secrets.SOL_GOOGLE_LOGIN_CUSTOMER_ID }}
         run: python daily_product_count.py --mode ${{ github.event.inputs.mode || 'auto' }}
 
       - name: Save count state
@@ -103,4 +124,8 @@ jobs:
             _product_count_state.json
             _product_count_history.csv
             _eod_pnl.json
+            _product_count_state_loreya.json
+            _product_count_history_loreya.csv
+            _product_count_state_solevair.json
+            _product_count_history_solevair.csv
           key: product-count-${{ github.run_id }}
