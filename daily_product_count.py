@@ -96,7 +96,7 @@ class Store:
         h = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
         if cred(f'{p}_GOOGLE_LOGIN_CUSTOMER_ID'):
             h['login-customer-id'] = cred(f'{p}_GOOGLE_LOGIN_CUSTOMER_ID').replace('-', '')
-        url = f"https://googleads.googleapis.com/v22/customers/{cred(f'{p}_GOOGLE_CUSTOMER_ID').replace('-', '')}/googleAds:search"
+        url = f"https://googleads.googleapis.com/v25/customers/{cred(f'{p}_GOOGLE_CUSTOMER_ID').replace('-', '')}/googleAds:search"
 
         def search(q):
             rows, page = [], None
