@@ -1232,6 +1232,10 @@ BE_SNAPSHOT             = 'breakeven_snapshot.json'   # LOCAL runs only (gitigno
 CHAMPION_REPROMOTE_SALES = 2
 CHAMPION_PROMOTE_CAP    = 25                        # >N promotions in one run = glitch -> abort section
 CHAMPION_DEMOTE_CAP     = 10                        # >N demotions in one run = glitch -> abort section
+CHAMPION_FAST_DAYS      = 14      # owner 2026-10-21: FAST GUARD next to the last-4 rule - a Proven product that has spent
+CHAMPION_FAST_SPEND     = 25.0    # >= GBP25 (Rising + Proven + Last Chance spend) in the last 14 UK days at a 14-day
+CHAMPION_FAST_ROAS      = 2.0     # true ROAS under 2.0 goes back to Rising now, instead of waiting weeks for its last-4
+                                  # window to catch up ("we dont want products at 1.5 - it would fuck up the blended").
 CHAMPION_LOG            = 'champion_moves_log.csv'
 LIFETIME_SINCE          = '2026-01-01'              # predates the store — lifetime = complete
 
@@ -1595,7 +1599,8 @@ def champion_run(feed, run_date, dry, life=None):
             ok = [x['pid'] for x in res['promoted'] if x['outcome'] == 'ok']
             if ok: ads_remove_winner_item_nodes(ok)   # label routes it; an item-id node would keep it in Rising too
 
-        # ---- DEMOTIONS: last 4 sales under max(2.5, own BE) on all-tier spend ----
+        # ---- DEMOTIONS: last 4 sales under max(2.0, own BE) on all-tier spend, OR (owner 2026-10-21) the 14-day fast
+        #      guard: >= GBP25 spent in the last 14 days at a 14-day true ROAS under 2.0 ----
         flagged = []
         for pid, p in champs.items():
             slist = hist[pid]                                                  # v7.5: same history as at entry
@@ -1604,8 +1609,18 @@ def champion_run(feed, run_date, dry, life=None):
             pct = (spent / allow * 100) if allow > 0 else (100.0 if spent > 0 else 0.0)
             row = dict(pid=pid, name=p['name'], allow=allow, spent=spent, pct=pct,
                        opened=f"last-4 £{rev:.2f}, spend since {anchor or 'the first sale'}")   # Telegram only (private)
-            if spent > allow: flagged.append(row)
-            elif pct >= 60: res['watch'].append(row)
+            if spent > allow: flagged.append(row); continue
+            # owner 2026-10-21 FAST GUARD: the last 14 days on their own (the last-4 window can reach back weeks)
+            f0 = (run_date - datetime.timedelta(days=CHAMPION_FAST_DAYS - 1)).isoformat()
+            rst = _lc_reset_date(p['tags'])          # a Last Chance graduate's history restarts: spend AND sales from that day
+            if rst and rst > f0: f0 = rst
+            sp14 = sum(v for d, v in spend.get(pid, ()) if d >= f0)
+            rv14 = sum(x['rev'] for x in slist if x['date'] >= f0)
+            if sp14 >= CHAMPION_FAST_SPEND and rv14 / sp14 < CHAMPION_FAST_ROAS:
+                row.update(fast=True, allow=rv14 / CHAMPION_FAST_ROAS, spent=sp14,
+                           opened=f"14-day GBP{sp14:.2f} spend, GBP{rv14:.2f} sales, ROAS {rv14 / sp14:.2f} under {CHAMPION_FAST_ROAS}")
+                flagged.append(row); continue
+            if pct >= 60: res['watch'].append(row)
         res['watch'].sort(key=lambda x: -x['pct']); res['watch'] = res['watch'][:5]
         if len(flagged) > CHAMPION_DEMOTE_CAP:
             msg = (f'SAFETY STOP: {len(flagged)} demotions > cap {CHAMPION_DEMOTE_CAP} — '
@@ -1635,7 +1650,8 @@ def champion_run(feed, run_date, dry, life=None):
             res['demoted'].append(r)
             log_rows.append([ts, run_date.isoformat(), 'DEMOTE', pid, p['name'], len(hist[pid]),
                              round(r['allow'], 2), round(r['spent'], 2), r['outcome']])
-            print(f"  {'would demote' if dry else 'demote'} Proven {pid} (last 4 sales under its line) -> {r['outcome']} | {p['name'][:40]}")
+            why = '14-day fast guard' if r.get('fast') else 'last 4 sales under its line'
+            print(f"  {'would demote' if dry else 'demote'} Proven {pid} ({why}) -> {r['outcome']} | {p['name'][:40]}")
         if not dry and log_rows: _write_champion_log(log_rows)
         # v7.3: the EXACT Proven set for the pace rule - feed tags + this run's moves (Shopify's tag search can lag)
         moved_in = {x['pid'] for x in res['promoted'] if x['outcome'] in ('ok', 'DRY') or 'tags unreadable' in str(x['outcome'])}
