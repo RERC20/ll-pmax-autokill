@@ -1231,11 +1231,14 @@ PROVEN_LOOKBACK_D       = 200     # ladder v7: LONGEST spend window for the last
 BE_SNAPSHOT             = 'breakeven_snapshot.json'   # LOCAL runs only (gitignored); Actions reads the PROVEN_BE_JSON secret
 CHAMPION_REPROMOTE_SALES = 2
 CHAMPION_PROMOTE_CAP    = 25                        # >N promotions in one run = glitch -> abort section
-CHAMPION_DEMOTE_CAP     = 10                        # >N demotions in one run = glitch -> abort section
+# CHAMPION_DEMOTE_CAP removed 2026-10-22 (owner: "remove the safety cap") - every flagged Proven product is demoted.
 CHAMPION_FAST_DAYS      = 14      # owner 2026-10-21: FAST GUARD next to the last-4 rule - a Proven product that has spent
 CHAMPION_FAST_SPEND     = 25.0    # >= GBP25 (Rising + Proven + Last Chance spend) in the last 14 UK days at a 14-day
 CHAMPION_FAST_ROAS      = 2.0     # true ROAS under 2.0 goes back to Rising now, instead of waiting weeks for its last-4
                                   # window to catch up ("we dont want products at 1.5 - it would fuck up the blended").
+CHAMPION_FAST_ROAS_MCV  = 2.1     # owner 2026-10-22: while PMax | Champions | UK bids Maximize Conversion Value with NO
+                                  # target ROAS (the scale test), the 14-day line is 2.1 instead of 2.0. Read from Google
+                                  # every run - put a target back and the line returns to 2.0 by itself.
 CHAMPION_LOG            = 'champion_moves_log.csv'
 LIFETIME_SINCE          = '2026-01-01'              # predates the store — lifetime = complete
 
@@ -1473,6 +1476,23 @@ def _load_breakeven():
         print(f"  !! WARNING: {bad} unreadable break-even value(s) skipped - those products use the {CHAMPION_LINE} line")
     return out
 
+def _champions_no_target():
+    """owner 2026-10-22: True when PMax | Champions | UK bids Maximize Conversion Value with NO target ROAS, False when a
+    target ROAS is set (or another strategy), None when Google could not be read (the default 2.0 line is used)."""
+    try:
+        import google_ads_connect as ga
+        gt = ga.get_access_token()
+        rows = _ads_search(ga, gt, "SELECT campaign.bidding_strategy_type, campaign.maximize_conversion_value.target_roas "
+                                   f"FROM campaign WHERE campaign.id = {CHAMPIONS_CAMPAIGN_ID}")
+        if not rows: return None
+        c = rows[0].get('campaign', {})
+        tr = float((c.get('maximizeConversionValue') or {}).get('targetRoas') or 0)
+        return c.get('biddingStrategyType') == 'MAXIMIZE_CONVERSION_VALUE' and tr <= 0
+    except Exception as ex:
+        print(f"  (champions bidding unreadable: {str(ex)[:120]})")
+        return None
+
+
 def champion_run(feed, run_date, dry, life=None):
     """PROVEN tier, ladder v7 (owner 2026-10-01/02) - PMax | Champions | UK, tROAS 2.8, £300/day.
       RESTART   v7.5: a product that sold its way out of Last Chance (lc_grad: stamp) is judged on the sales from that sale on
@@ -1602,6 +1622,10 @@ def champion_run(feed, run_date, dry, life=None):
         # ---- DEMOTIONS: last 4 sales under max(2.0, own BE) on all-tier spend, OR (owner 2026-10-21) the 14-day fast
         #      guard: >= GBP25 spent in the last 14 days at a 14-day true ROAS under 2.0 ----
         flagged = []
+        mcv = _champions_no_target()                  # owner 2026-10-22: 2.1 while Champions has no target ROAS
+        fast_line = CHAMPION_FAST_ROAS_MCV if mcv else CHAMPION_FAST_ROAS
+        print(f"  champions bidding: {'Max Conversion Value, NO target' if mcv else ('target ROAS set' if mcv is False else 'unreadable - default line')}"
+              f" -> 14-day line {fast_line}")
         for pid, p in champs.items():
             slist = hist[pid]                                                  # v7.5: same history as at entry
             spent, rev, anchor = last4(pid, slist)
@@ -1616,17 +1640,12 @@ def champion_run(feed, run_date, dry, life=None):
             if rst and rst > f0: f0 = rst
             sp14 = sum(v for d, v in spend.get(pid, ()) if d >= f0)
             rv14 = sum(x['rev'] for x in slist if x['date'] >= f0)
-            if sp14 >= CHAMPION_FAST_SPEND and rv14 / sp14 < CHAMPION_FAST_ROAS:
-                row.update(fast=True, allow=rv14 / CHAMPION_FAST_ROAS, spent=sp14,
-                           opened=f"14-day GBP{sp14:.2f} spend, GBP{rv14:.2f} sales, ROAS {rv14 / sp14:.2f} under {CHAMPION_FAST_ROAS}")
+            if sp14 >= CHAMPION_FAST_SPEND and rv14 / sp14 < fast_line:
+                row.update(fast=True, allow=rv14 / fast_line, spent=sp14,
+                           opened=f"14-day GBP{sp14:.2f} spend, GBP{rv14:.2f} sales, ROAS {rv14 / sp14:.2f} under {fast_line}")
                 flagged.append(row); continue
             if pct >= 60: res['watch'].append(row)
         res['watch'].sort(key=lambda x: -x['pct']); res['watch'] = res['watch'][:5]
-        if len(flagged) > CHAMPION_DEMOTE_CAP:
-            msg = (f'SAFETY STOP: {len(flagged)} demotions > cap {CHAMPION_DEMOTE_CAP} — '
-                   f'looks like a data glitch; NO demotions this run')
-            res['err'] = (res['err'] + ' | ' + msg) if res['err'] else msg
-            flagged = []
         res['flagged'] = flagged
         for r in flagged:
             pid = r['pid']; p = champs[pid]
