@@ -576,13 +576,13 @@ def _tier_campaign_ids():
     """Every campaign a SOLD product can serve in: Rising (Winners), Proven (Champions), Last Chance and (owner 2026-10-23)
     Hero. A product moving between them is judged on all of its spend."""
     ids = [WINNERS_CAMPAIGN_ID, CHAMPIONS_CAMPAIGN_ID, LC_CAMPAIGN_ID]
-    if HERO_ENABLED and HERO_CAMPAIGN_ID:
-        ids.append(HERO_CAMPAIGN_ID)
+    if HERO_CAMPAIGN_ID:
+        ids.append(HERO_CAMPAIGN_ID)                    # always: Hero spend is real spend, even with HERO_ENABLED off
     return [str(i) for i in ids]
 
 def _tier_daily_spend(run_date, pids, lookback_d=None):
     """pid -> [(date_iso, GBP), ...] spend in EVERY campaign a sold product can serve in: Rising (Winners),
-    Proven (Champions) and Last Chance. Ladder v7 (owner 2026-10-02): a product that moves between tiers is judged
+    Proven (Champions), Last Chance and Hero (_tier_campaign_ids). Ladder v7 (owner 2026-10-02): a product that moves between tiers is judged
     on all of its spend, so a move never hands it fresh room for the same dry spell. Testing spend before the
     first sale stays out: it belongs to Testing's own judgement (and the window always starts after a sale)."""
     import google_ads_connect as ga
@@ -598,7 +598,7 @@ def _tier_daily_spend(run_date, pids, lookback_d=None):
         # v7.7.1: Rising + Proven + Last Chance spend hundreds of pounds a day, so NO spend row at all over 60+ days is a
         # Google glitch, not reality. Read as "no spend", every 4-sale Rising product would pass the Proven entry line and
         # be promoted on bad data - raise instead: the section that asked skips this run (and says so in Telegram).
-        raise RuntimeError(f'Google returned no Rising/Proven/Last Chance spend rows since {start} - glitch, nothing judged on it')
+        raise RuntimeError(f'Google returned no Rising/Proven/Last Chance/Hero spend rows since {start} - glitch, nothing judged on it')
     for row in rows:
         item = row.get('segments', {}).get('productItemId')
         if not item:
@@ -1270,6 +1270,7 @@ HERO_CAMPAIGN_ID = '24388812638'             # PMax | Hero | UK  (created 2026-1
 HERO_AG_ID       = '6763933930'              # its asset group: root item-id subdivision, roster variants included
 HERO_PACE_ROAS   = 2.0                       # exit line: spend since the last sale > price / 2.0
 HERO_LOG         = 'hero_moves_log.csv'
+HERO_CHANGE_CAP  = 5                         # more Heroes leaving / exiting in ONE run than this = data glitch: none moved
 
 def _champion_pids(tok):
     """ACTIVE products tagged c_champion -> set of pids."""
@@ -1717,7 +1718,7 @@ def _hero_ok(outcome):
 
 
 def _hero_tagged(tok):
-    """Every product tagged h_hero, ANY status -> {pid: {name, status, price (min variant), tags}}."""
+    """Every product tagged h_hero, ANY status -> {pid: {name, status, price (min variant), tags}} (tags read fresh)."""
     Q = ('query($c:String){products(first:250,after:$c,query:"tag:%s"){pageInfo{hasNextPage endCursor} '
          'edges{node{legacyResourceId title status tags priceRangeV2{minVariantPrice{amount}}}}}}' % HERO_TAG)
     out = {}; cur = None
@@ -1734,6 +1735,29 @@ def _hero_tagged(tok):
         if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
         else: break
     return out
+
+
+def _hero_products_by_id(tok, pids):
+    """pid -> {status, tags} read BY ID (no search index lag). Used before pausing Hero on an empty roster."""
+    out = {}
+    pids = sorted({str(p) for p in pids})
+    for i in range(0, len(pids), 50):
+        ids = ','.join(f'"gid://shopify/Product/{p}"' for p in pids[i:i + 50])
+        j = _shopify_read(tok, '{nodes(ids:[%s]){... on Product{legacyResourceId status tags}}}' % ids, {}, timeout=60)
+        for n in (j.get('data') or {}).get('nodes') or []:
+            if n and n.get('legacyResourceId'):
+                out[str(n['legacyResourceId'])] = dict(status=str(n.get('status', '')), tags=[str(t) for t in (n.get('tags') or [])])
+    return out
+
+
+def _hero_variant_iids(tok, pid):
+    """Variant item-ids of a product, Simprosys format 'shopify_zz_{pid}_{vid}' (lowercase), via the RETRIED Shopify read."""
+    j = _shopify_read(tok, 'query($id:ID!){product(id:$id){variants(first:100){edges{node{legacyResourceId}}}}}',
+                      {'id': f"gid://shopify/Product/{pid}"}, timeout=30)
+    prod = (j.get('data') or {}).get('product')
+    if not prod:
+        return []
+    return [f"shopify_zz_{pid}_{e['node']['legacyResourceId']}".lower() for e in prod['variants']['edges']]
 
 
 def _hero_untag(tok, pid, run_date):
@@ -1758,22 +1782,30 @@ def _write_hero_log(rows):
         for r in rows: w.writerow(r)
 
 
-def hero_ads_reconcile(roster, dry, stok):
-    """Listing trees for the Hero tier, every run (idempotent, self-healing):
-       - Hero tree: UNIT_INCLUDED item-id nodes == every variant of the roster (root item-id subdivision);
-       - Champions tree: UNIT_EXCLUDED item-id nodes under the c_champion branch == the same item-ids (a plain
-         c_champion unit is turned into an item-id subdivision in the same atomic request);
-       - empty roster: Hero nodes are left alone and the Hero campaign is PAUSED instead (a tree cannot be empty).
-    All changes go in ONE atomic googleAds:mutate (all or nothing). Any error is returned, never raised."""
-    out = dict(hero_add=0, hero_rm=0, ch_add=0, ch_rm=0, converted=False, paused=False, status=None, err=None)
+def hero_ads_reconcile(roster, dry, stok, disabled=False):
+    """Listing trees for the Hero tier, every run (idempotent, self-healing). Campaign status is read FIRST:
+       - Hero tree: UNIT_INCLUDED item-id nodes == every variant of the roster (kept in sync even while paused, so the
+         campaign is ready when re-enabled; left alone when the roster is empty - a tree cannot be emptied);
+       - Champions c_champion branch: UNIT_EXCLUDED nodes == the roster's item-ids ONLY while Hero is ENABLED. Hero
+         paused / removed / disabled -> no exclusions, so Hero products serve in Champions (never dark);
+       - empty roster while ENABLED -> Hero is PAUSED, but only after the products still in the Hero tree are re-read BY
+         ID and none is still an ACTIVE h_hero + c_champion product (a bad tag-search read must not pause it). The pause
+         goes before the tree write, so a failed write can never leave Hero serving.
+    Tree changes go in ONE atomic googleAds:mutate. Any error is returned, never raised."""
+    out = dict(hero_add=0, hero_rm=0, ch_add=0, ch_rm=0, converted=False, paused=False, would_pause=False,
+               status=None, nodes_hero=0, nodes_champ=0, warn=None, err=None)
     try:
         import google_ads_connect as ga
         gt = ga.get_access_token()
+        C = f"customers/{ga.CUSTOMER_ID}"
+        st = _ads_search(ga, gt, f"SELECT campaign.status FROM campaign WHERE campaign.id = {HERO_CAMPAIGN_ID}")
+        out['status'] = st[0]['campaign']['status'] if st else 'NOT_FOUND'
         want = set()
         for pid in sorted(roster):
-            want |= {i.lower() for i in _variant_item_ids(stok, pid)}
-        if roster and not want:
-            raise RuntimeError('roster variants unreadable - trees left as they are')
+            iids = _hero_variant_iids(stok, pid)
+            if not iids:
+                raise RuntimeError(f'variants unreadable for Hero {pid} - trees left as they are this run')
+            want |= set(iids)
         rows = _ads_search(ga, gt,
             "SELECT asset_group.id, asset_group_listing_group_filter.resource_name, asset_group_listing_group_filter.type, "
             "asset_group_listing_group_filter.parent_listing_group_filter, "
@@ -1783,13 +1815,12 @@ def hero_ads_reconcile(roster, dry, stok):
             f"FROM asset_group_listing_group_filter WHERE asset_group.id IN ({HERO_AG_ID},{CHAMPIONS_AG_ID})")
         hero = [x['assetGroupListingGroupFilter'] for x in rows if str(x['assetGroup']['id']) == str(HERO_AG_ID)]
         champ = [x['assetGroupListingGroupFilter'] for x in rows if str(x['assetGroup']['id']) == str(CHAMPIONS_AG_ID)]
+        out['nodes_hero'], out['nodes_champ'] = len(hero), len(champ)
         iid_of = lambda f: (((f.get('caseValue') or {}).get('productItemId') or {}).get('value') or '').lower()   # noqa: E731
         h_root = next((f['resourceName'] for f in hero
                        if f['type'] == 'SUBDIVISION' and not f.get('parentListingGroupFilter')), None)
-        if not h_root:
-            raise RuntimeError('Hero tree root (item-id subdivision) not found')
         h_have = {iid_of(f): f['resourceName'] for f in hero
-                  if f.get('parentListingGroupFilter') == h_root and f['type'] == 'UNIT_INCLUDED' and iid_of(f)}
+                  if h_root and f.get('parentListingGroupFilter') == h_root and f['type'] == 'UNIT_INCLUDED' and iid_of(f)}
         cc = [f for f in champ
               if (((f.get('caseValue') or {}).get('productCustomAttribute') or {}).get('value') or '').lower() == CHAMPION_TAG
               and ((f.get('caseValue') or {}).get('productCustomAttribute') or {}).get('index') == 'INDEX1']
@@ -1803,7 +1834,28 @@ def hero_ads_reconcile(roster, dry, stok):
             if not any(f.get('parentListingGroupFilter') == cc['resourceName'] and f['type'] == 'UNIT_INCLUDED'
                        and not iid_of(f) for f in champ):
                 raise RuntimeError('Champions c_champion subdivision has no "everything else" include node')
-        C = f"customers/{ga.CUSTOMER_ID}"
+        # -- empty roster while ENABLED: verify by ID, then pause (before any tree write) --
+        hero_live = (out['status'] == 'ENABLED') and not disabled
+        if not roster and out['status'] == 'ENABLED':
+            if not disabled:
+                still = _hero_products_by_id(stok, {_iid_pid(i) for i in h_have if _iid_pid(i)})
+                alive = [p for p, m in still.items()
+                         if m['status'] == 'ACTIVE' and HERO_TAG in m['tags'] and CHAMPION_TAG in m['tags']]
+                if alive:
+                    raise RuntimeError(f'roster read empty but {len(alive)} product(s) in the Hero tree are still Heroes - '
+                                       f'not pausing, trees untouched (likely a Shopify read glitch)')
+            if dry:
+                out['would_pause'] = True
+            else:
+                r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/campaigns:mutate", headers=ga._headers(gt),
+                                  json={'operations': [{'update': {'resourceName': f"{C}/campaigns/{HERO_CAMPAIGN_ID}",
+                                                                   'status': 'PAUSED'}, 'updateMask': 'status'}]}, timeout=60).json()
+                if 'error' in r:
+                    raise RuntimeError('pause failed: ' + str(r)[:200])
+                out['paused'] = True; out['status'] = 'PAUSED'
+            hero_live = False
+        if not hero_live and roster and not disabled:
+            out['warn'] = f"Hero campaign is {out['status']} - its {len(roster)} product(s) serve in Champions until it is enabled"
         def node(ag, parent, typ, iid):
             return {'assetGroupListingGroupFilterOperation': {'create': {
                 'assetGroup': f"{C}/assetGroups/{ag}", 'type': typ, 'listingSource': 'SHOPPING',
@@ -1811,13 +1863,16 @@ def hero_ads_reconcile(roster, dry, stok):
         def rm(rn):
             return {'assetGroupListingGroupFilterOperation': {'remove': rn}}
         ops = []
-        # -- Champions: exclusions under c_champion == want --
-        ch_rm = [rn for iid, rn in ch_have.items() if iid not in want]
-        ch_add = sorted(want - set(ch_have))
+        # -- Champions: exclusions == want while Hero serves, else none --
+        ch_want = want if hero_live else set()
+        ch_rm = [rn for iid, rn in ch_have.items() if iid not in ch_want]
+        ch_add = sorted(ch_want - set(ch_have))
         if cc['type'] == 'SUBDIVISION':
             ops += [rm(rn) for rn in ch_rm]
             ops += [node(CHAMPIONS_AG_ID, cc['resourceName'], 'UNIT_EXCLUDED', iid) for iid in ch_add]
-        elif want:
+        elif ch_want:
+            if cc['type'] != 'UNIT_INCLUDED':
+                raise RuntimeError(f"Champions c_champion node is {cc['type']} - not converting it")
             tmp = f"{C}/assetGroupListingGroupFilters/{CHAMPIONS_AG_ID}~-1"
             ops.append(rm(cc['resourceName']))
             ops.append({'assetGroupListingGroupFilterOperation': {'create': {
@@ -1829,98 +1884,115 @@ def hero_ads_reconcile(roster, dry, stok):
             out['converted'] = True
         else:
             ch_add = []
-        # -- Hero: includes == want (empty roster: left alone, the campaign is paused instead) --
-        h_rm = [rn for iid, rn in h_have.items() if iid not in want] if want else []
-        h_add = sorted(want - set(h_have))
-        ops += [rm(rn) for rn in h_rm]
-        ops += [node(HERO_AG_ID, h_root, 'UNIT_INCLUDED', iid) for iid in h_add]
+        # -- Hero: includes == want (roster empty or disabled: left alone) --
+        h_add, h_rm = [], []
+        if want and not disabled:
+            if not h_root:
+                raise RuntimeError('Hero tree root (item-id subdivision) not found')
+            h_rm = [rn for iid, rn in h_have.items() if iid not in want]
+            h_add = sorted(want - set(h_have))
+            ops += [rm(rn) for rn in h_rm]
+            ops += [node(HERO_AG_ID, h_root, 'UNIT_INCLUDED', iid) for iid in h_add]
         out.update(hero_add=len(h_add), hero_rm=len(h_rm), ch_add=len(ch_add), ch_rm=len(ch_rm))
-        st = _ads_search(ga, gt, f"SELECT campaign.status FROM campaign WHERE campaign.id = {HERO_CAMPAIGN_ID}")
-        out['status'] = st[0]['campaign']['status'] if st else None
-        if dry:
+        if len(hero) + len(h_add) - len(h_rm) > 950 or len(champ) + len(ch_add) - len(ch_rm) > 950:
+            out['warn'] = (out['warn'] + ' | ' if out['warn'] else '') + 'a Hero/Champions tree is near the 1,000-node cap'
+        if dry or not ops:
             return out
-        if ops:
-            r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/googleAds:mutate", headers=ga._headers(gt),
-                              json={'mutateOperations': ops}, timeout=120).json()
-            if 'error' in r:
-                raise RuntimeError(str(r)[:300])
-        if not roster and out['status'] == 'ENABLED':
-            r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/campaigns:mutate", headers=ga._headers(gt),
-                              json={'operations': [{'update': {'resourceName': f"{C}/campaigns/{HERO_CAMPAIGN_ID}",
-                                                               'status': 'PAUSED'}, 'updateMask': 'status'}]}, timeout=60).json()
-            if 'error' in r:
-                raise RuntimeError('pause failed: ' + str(r)[:200])
-            out['paused'] = True; out['status'] = 'PAUSED'
+        r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/googleAds:mutate", headers=ga._headers(gt),
+                          json={'mutateOperations': ops}, timeout=120).json()
+        if 'error' in r:
+            raise RuntimeError(str(r)[:300])
         return out
     except Exception as ex:
-        out['err'] = f"hero trees: {type(ex).__name__}: {str(ex)[:150]}"
+        out['err'] = f"hero trees: {type(ex).__name__}: {str(ex)[:180]}"
         return out
 
 
-def hero_run(feed, run_date, dry, life=None, proven=None, shared=None):
-    """HERO tier (owner 2026-10-23) - see the HERO TIER block above. `proven` = the exact Proven set after this run's
-    Proven moves (champion_run's pace_exclude), `shared` = (pids, spend rows) from the Proven section's all-tier pull."""
-    res = dict(roster=0, exits=[], cleaned=[], watch=[], trees=None, err=None)
+def hero_run(feed, run_date, dry, life=None, demoted=None, shared=None):
+    """HERO tier (owner 2026-10-23) - see the HERO TIER block. Roster = ACTIVE products tagged h_hero whose FRESH tags
+    still carry c_champion (and not demoted out of Proven this run - `demoted`, which also covers dry-run demotions).
+    `shared` = (pids, spend rows) from the Proven section's all-tier pull. Exit judging is isolated: whatever happens
+    there, the trees are reconciled for the roster minus the confirmed moves."""
+    res = dict(roster=0, exits=[], cleaned=[], watch=[], trees=None, err=None, warn=None)
+    tok = None; roster = {}
     try:
         tok = shopify_token()
         tagged = _hero_tagged(tok)
-        if proven is None:
-            proven = _champion_pids(tok)
-        proven = {str(p) for p in proven}
-        active = {str(p['pid']) for p in feed}
-        roster = {pid: m for pid, m in tagged.items() if m['status'] == 'ACTIVE' and pid in active and pid in proven}
+        demoted = {str(p) for p in (demoted or ())}
         log_rows = []; ts = datetime.datetime.now(UK).strftime('%Y-%m-%d %H:%M:%S')
-        # FOLLOW: tagged but no longer an active Proven product -> out of Hero
+        leave = {}
         for pid, m in tagged.items():
-            if pid in roster:
-                continue
-            why = 'left Proven' if m['status'] == 'ACTIVE' else f"product {m['status'].lower()}"
+            if m['status'] != 'ACTIVE':
+                leave[pid] = f"product {m['status'].lower()}"
+            elif CHAMPION_TAG not in m['tags'] or pid in demoted:
+                leave[pid] = 'left Proven'
+            else:
+                roster[pid] = m
+        # FOLLOW: out of Hero (capped - more than HERO_CHANGE_CAP in one run is treated as a data glitch)
+        if len(leave) > HERO_CHANGE_CAP:
+            res['warn'] = f'SAFETY STOP: {len(leave)} Heroes would leave at once (> {HERO_CHANGE_CAP}) - none moved, check the data'
+            for pid in leave: roster[pid] = tagged[pid]
+            leave = {}
+        for pid, why in leave.items():
+            m = tagged[pid]
             o = 'DRY' if dry else _hero_untag(tok, pid, run_date)
             res['cleaned'].append(dict(pid=pid, name=m['name'], why=why, outcome=o))
             log_rows.append([ts, run_date.isoformat(), 'LEFT', pid, m['name'], why, '', '', o])
             print(f"  {'would take' if dry else 'take'} {pid} out of Hero ({why}) -> {o} | {m['name'][:40]}")
-        # EXIT: all-tier spend since the day after the last sale > price / 2.0
-        if roster:
-            if life is None:
-                life, _n = _lifetime_sales(tok)
-            if not life:
-                raise RuntimeError('lifetime orders pull returned nothing - glitch, Hero exits not judged')
-            if shared and shared[1] is not None and set(roster) <= {str(p) for p in shared[0]}:
-                spend = shared[1]
-            else:
-                spend = _tier_daily_spend(run_date, set(roster))
-            for pid, m in roster.items():
-                if m['price'] <= 0:
-                    print(f"  !! Hero {pid}: price unreadable - exit not judged this run"); continue
-                slist = _since_reset(life.get(pid, []), _lc_reset_date(m['tags']))
-                allow = m['price'] / HERO_PACE_ROAS
-                if slist:
-                    last = slist[-1]['date']
-                    spent = sum(v for d, v in spend.get(pid, ()) if d > last); opened = f"since last sale {last}"
+            if not _hero_ok(o) and m['status'] == 'ACTIVE' and CHAMPION_TAG in m['tags']:
+                roster[pid] = m                             # untag failed on a still-Proven product: keep it consistent
+        # EXIT: all-tier spend since the day after the last sale > price / 2.0 (isolated: errors never skip the trees)
+        try:
+            if roster:
+                if life is None:
+                    life, _n = _lifetime_sales(tok)
+                if not life:
+                    raise RuntimeError('lifetime orders pull returned nothing - glitch, Hero exits not judged')
+                if shared and shared[1] is not None and set(roster) <= {str(p) for p in shared[0]}:
+                    spend = shared[1]
                 else:
-                    spent = sum(v for _, v in spend.get(pid, ())); opened = 'no sale on record'
-                row = dict(pid=pid, name=m['name'], price=m['price'], allow=allow, spent=spent,
-                           pct=spent / allow * 100, opened=opened)
-                if spent > allow:
-                    res['exits'].append(row)
-                elif row['pct'] >= 50:
-                    res['watch'].append(row)
-            for r in res['exits']:
-                r['outcome'] = 'DRY' if dry else _hero_untag(tok, r['pid'], run_date)
-                log_rows.append([ts, run_date.isoformat(), 'EXIT', r['pid'], r['name'], r['opened'],
-                                 round(r['allow'], 2), round(r['spent'], 2), r['outcome']])
-                print(f"  {'would move' if dry else 'move'} Hero {r['pid']} back to Champions: spent £{r['spent']:.2f} > "
-                      f"£{r['allow']:.2f} (price £{r['price']:.2f} / {HERO_PACE_ROAS:g}, {r['opened']}) -> {r['outcome']} | {r['name'][:40]}")
-            res['watch'].sort(key=lambda x: -x['pct'])
-        final = set(roster) - {r['pid'] for r in res['exits'] if _hero_ok(r.get('outcome'))}
-        res['roster'] = len(final)
-        res['trees'] = hero_ads_reconcile(final, dry, tok)
+                    lasts = [s[-1]['date'] for s in (life.get(p) for p in roster) if s]
+                    days = (run_date - datetime.date.fromisoformat(min(lasts))).days + 2 if lasts else WINNER_LOOKBACK_D
+                    spend = _tier_daily_spend(run_date, set(roster), max(WINNER_LOOKBACK_D, min(PROVEN_LOOKBACK_D, days)))
+                cand = []
+                for pid, m in roster.items():
+                    if m['price'] <= 0:
+                        print(f"  !! Hero {pid}: price unreadable - exit not judged this run"); continue
+                    slist = _since_reset(life.get(pid, []), _lc_reset_date(m['tags']))
+                    if not slist:
+                        print(f"  !! Hero {pid}: no sale on record for a Proven product - glitch, exit not judged"); continue
+                    allow = m['price'] / HERO_PACE_ROAS
+                    last = slist[-1]['date']
+                    spent = sum(v for d, v in spend.get(pid, ()) if d > last)
+                    row = dict(pid=pid, name=m['name'], price=m['price'], allow=allow, spent=spent,
+                               pct=spent / allow * 100, opened=f"since last sale {last}")
+                    if spent > allow:
+                        cand.append(row)
+                    elif row['pct'] >= 50:
+                        res['watch'].append(row)
+                if len(cand) > HERO_CHANGE_CAP:
+                    res['warn'] = f'SAFETY STOP: {len(cand)} Hero exits at once (> {HERO_CHANGE_CAP}) - none moved, check the data'
+                    cand = []
+                for r in cand:
+                    r['outcome'] = 'DRY' if dry else _hero_untag(tok, r['pid'], run_date)
+                    res['exits'].append(r)
+                    log_rows.append([ts, run_date.isoformat(), 'EXIT', r['pid'], r['name'], r['opened'],
+                                     round(r['allow'], 2), round(r['spent'], 2), r['outcome']])
+                    print(f"  {'would move' if dry else 'move'} Hero {r['pid']} back to Champions: spent £{r['spent']:.2f} > "
+                          f"£{r['allow']:.2f} (price £{r['price']:.2f} / {HERO_PACE_ROAS:g}, {r['opened']}) -> {r['outcome']} | {r['name'][:40]}")
+                res['watch'].sort(key=lambda x: -x['pct'])
+        except Exception as ex:
+            res['err'] = f'hero exits not judged this run: {type(ex).__name__}: {str(ex)[:120]}'
         if not dry and log_rows:
             _write_hero_log(log_rows)
-        return res
     except Exception as ex:
-        res['err'] = f'hero rule error (section skipped; other rules unaffected): {type(ex).__name__}: {str(ex)[:120]}'
-        return res
+        res['err'] = f'hero rule error: {type(ex).__name__}: {str(ex)[:120]}'
+        if tok is None or not roster:
+            return res                                       # nothing reliable to reconcile against
+    final = set(roster) - {r['pid'] for r in res['exits'] if _hero_ok(r.get('outcome'))}
+    res['roster'] = len(final)
+    res['trees'] = hero_ads_reconcile(final, dry, tok)
+    return res
 
 
 def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry):
@@ -2143,7 +2215,8 @@ def main():
         # section (a product demoted there leaves Hero in the same run), before the pace rule (Heroes stay Proven-exempt).
         he = None
         if HERO_ENABLED:
-            he = hero_run(feed, run_date, dry, life_sales, proven=ch.get('pace_exclude'),
+            _dem = {r['pid'] for r in ch.get('demoted', []) if r.get('outcome') == 'DRY' or r.get('moved')}
+            he = hero_run(feed, run_date, dry, life_sales, demoted=_dem,
                           shared=(ch.get('spend_pids') or set(), ch.get('spend')))
             t_ = he.get('trees') or {}
             print(f"hero: roster {he['roster']} | back to Champions {len(he['exits'])} | cleaned {len(he['cleaned'])} | "
@@ -2152,6 +2225,12 @@ def main():
                   + (f" | !! {he['err']}" if he['err'] else '') + (f" | !! {t_['err']}" if t_.get('err') else ''))
             for r in he['watch'][:3]:
                 print(f"  hero watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+            for _w in (he.get('warn'), t_.get('warn')):
+                if _w: print(f"  !! {_w}")
+        else:
+            t_ = hero_ads_reconcile(set(), dry, shopify_token(), disabled=True)   # switched off: no Champions exclusions,
+            print(f"hero: DISABLED | Champions exclusions -{t_.get('ch_rm', 0)} | campaign {t_.get('status')}"   # campaign paused
+                  + (f" | !! {t_['err']}" if t_.get('err') else ''))
 
         # SERVING-STATE JANITOR (audit 2026-08-16): heal missed node sweeps + draft tags
         js = reconcile_serving_state(dry, extra_roster={str(p['pid']) for p in (new_winners or [])})
@@ -2284,7 +2363,7 @@ def main():
         if he is not None:
             t_ = he.get('trees') or {}
             tg += (f"\n\n🦸 <b>Hero (own budget; back to Champions when spend since last sale &gt; price/{HERO_PACE_ROAS:g})</b>: "
-                   f"roster {he['roster']} | back to Champions {len(he['exits'])}"
+                   f"roster {he['roster']} | back to Champions {sum(1 for r in he['exits'] if _hero_ok(r.get('outcome')))}"
                    + (f" | campaign {html.escape(str(t_.get('status')))}" if t_.get('status') not in (None, 'ENABLED') else ''))
             for r in he['exits'][:8]:
                 tg += (f"\n⬇️ <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
@@ -2292,11 +2371,15 @@ def main():
                        + ("back to Champions" if _hero_ok(r.get('outcome'))
                           else f"NOT moved: {html.escape(str(r.get('outcome'))[:120])}"))
             for r in he['cleaned'][:5]:
-                tg += f"\n  ↩ left Hero: <code>{r['pid']}</code> {html.escape(r['name'][:40])} ({html.escape(r['why'])})"
+                tg += (f"\n  ↩ left Hero: <code>{r['pid']}</code> {html.escape(r['name'][:40])} ({html.escape(r['why'])})"
+                       + ("" if _hero_ok(r.get('outcome')) else f" → NOT moved: {html.escape(str(r.get('outcome'))[:80])}"))
             for r in he['watch'][:3]:
                 tg += f"\n👀 hero watch {r['pct']:.0f}%: <code>{r['pid']}</code> £{r['spent']:.2f} of £{r['allow']:.2f}"
-            if t_.get('paused'):
-                tg += "\n⏸ Hero roster empty → campaign PAUSED (re-enable by hand when new Heroes are added)"
+            if t_.get('paused') or t_.get('would_pause'):
+                tg += ("\n⏸ Hero roster empty → campaign " + ("PAUSED" if t_.get('paused') else "would be paused (dry)")
+                       + " (re-enable by hand when new Heroes are added)")
+            for _w in (he.get('warn'), t_.get('warn')):
+                if _w: tg += f"\n⚠️ {html.escape(_w)}"
             if he['err']:
                 tg += f"\n⚠️ {html.escape(he['err'])}"
             if t_.get('err'):

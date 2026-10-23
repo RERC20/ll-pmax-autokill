@@ -27,3 +27,4 @@ scratchpad/
 breakeven_snapshot.json
 champion_moves_log.csv
 winner_kills_log.csv
+hero_moves_log.csv
