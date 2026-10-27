@@ -83,6 +83,10 @@ WINNER_TAG = 'w_campaign'
 LC_TAG = 'lc_campaign'          # LAST CHANCE (owner 2026-08-13): pace-killed winners stay ACTIVE
 LC_CAMPAIGN_ID = '24127184079'  # 'PMax | Last Chance | UK' — £20/day, tROAS 2.2, UK presence-only
 LC_KILL_CAP = 15                # glitch guard for the lc exit rule
+WEEKLY_KILL_WEEKDAY = 0         # owner 2026-10-27: Testing kills weekly - Monday
+WEEKLY_KILL_HOURS   = (3, 5)    # ...every run 03:00-05:59 UK (several runs, so one GitHub outage cannot skip a week)
+DAILY_STOP_GBP      = 8.0       # ...plus a daily safety stop: never sold and >= GBP 8 spent (30d) -> draft any run
+WEEKLY_DRAFT_CAP    = 120       # drafts per run inside the weekly window (the next run continues)
 LC_LOOKBACK_D = 200             # ladder v7: LC spend window (no time rule, so a product can stay for months)
 LOST_TAG   = 'l_camp'      # "lost" — WAS a winner, killed by the pace rule (v11). Set on winner
                            # kills; stripped again if the product is ever resurrected and re-sells.
@@ -278,6 +282,17 @@ def resort_best_sellers(tok, life=None):
 WINNERS_AG_ID = '6684080392'
 TESTING_AG_ID = '6729681029'
 AW_TESTING_AG_ID = '6738045970'   # Testing|AW: aw26 subdivision added 2026-08-16 (node 15260771050)
+# CATEGORY TESTING (owner 2026-10-27): Testing | AW is replaced by one PMax per category. Each tree: label1 w/c/lc EXCLUDED,
+# label1-other -> ITEM-ID subdivision (fast-path excludes land here) -> label2 aw26 -> label3 cat_<key> INCLUDED, the
+# other four cats + no label EXCLUDED. custom_label_3 = mm-google-shopping.custom_label_3, written by label_categories().
+CATEGORY_TESTING = {   # key: (campaign id, asset group id)
+    'dresses':   ('24398844870', '6765759519'),
+    'outerwear': ('24409841410', '6765691655'),
+    'shoes':     ('24404057414', '6765759438'),
+    'knit':      ('24398846589', '6765654790'),
+    'small':     ('24409841689', '6765691661'),
+}
+CATEGORY_AG_IDS = [ag for _c, ag in CATEGORY_TESTING.values()]
 
 def _ads_search(ga, gt, query):
     """GoogleAdsService.search, every page. Ladder v7.1: a network error, a non-JSON reply or HTTP 429/5xx is retried twice
@@ -326,11 +341,11 @@ def ads_fast_path(new_winners, stok):
             "asset_group_listing_group_filter.case_value.product_custom_attribute.index, "
             "asset_group_listing_group_filter.case_value.product_custom_attribute.value, "
             "asset_group_listing_group_filter.case_value.product_item_id.value "
-            "FROM asset_group_listing_group_filter WHERE asset_group.id IN (6684080392,6729681029,6738045970)")
+            f"FROM asset_group_listing_group_filter WHERE asset_group.id IN ({','.join([WINNERS_AG_ID, TESTING_AG_ID, AW_TESTING_AG_ID] + CATEGORY_AG_IDS)})")
         info = {}
-        for agid in (WINNERS_AG_ID, TESTING_AG_ID, AW_TESTING_AG_ID):
+        for agid in [WINNERS_AG_ID, TESTING_AG_ID, AW_TESTING_AG_ID] + CATEGORY_AG_IDS:
             ag = [x for x in rows if str(x['assetGroup']['id']) == agid]
-            subdiv = None; have = set()
+            subdiv = None; have = set(); found = []
             for x in ag:
                 # item-id subdivision: in Winners/Testing it is the SUBDIVISION whose
                 # case is attr1-with-no-value; in Testing-AW it is the SUBDIVISION
@@ -341,24 +356,31 @@ def ads_fast_path(new_winners, stok):
                     continue
                 if agid == AW_TESTING_AG_ID:
                     if pca.get('value') == 'aw26':
-                        subdiv = f['resourceName']
-                elif 'value' not in pca:
-                    subdiv = f['resourceName']
+                        found.append(f['resourceName'])
+                elif 'value' not in pca and pca.get('index', 'INDEX1') == 'INDEX1':
+                    found.append(f['resourceName'])
+            # review 2026-10-27: exactly one match, else this tree is skipped with a warning - one rebuilt tree must never
+            # block the others (above all the Winners include)
+            subdiv = found[0] if len(found) == 1 else None
             for x in ag:
                 f = x['assetGroupListingGroupFilter']; cv = f.get('caseValue', {})
                 if f.get('parentListingGroupFilter') == subdiv and cv.get('productItemId', {}).get('value'):
                     have.add(cv['productItemId']['value'].lower())
-            if not subdiv: raise RuntimeError(f"item-id subdivision not found in AG {agid}")
+            if not subdiv:
+                print(f"  !! fast-path: AG {agid} has {len(found)} candidate item-id subdivisions - tree skipped (label path covers it)")
+                continue
             info[agid] = (subdiv, have, len(ag))          # len(ag) = nodes already in this tree (Google caps at 1,000)
         global _TREE_NODES_SEEN                            # cheapest possible trigger for the prune: we just read the trees
-        _TREE_NODES_SEEN = max(v[2] for v in info.values())
-        made = 0
-        for agid, node_type in ((WINNERS_AG_ID, 'UNIT_INCLUDED'), (TESTING_AG_ID, 'UNIT_EXCLUDED'),
-                                (AW_TESTING_AG_ID, 'UNIT_EXCLUDED')):
+        _TREE_NODES_SEEN = max([v[2] for v in info.values()] or [0])
+        made = 0; tree_err = None
+        iids = {p['pid']: _variant_item_ids(stok, p['pid']) for p in new_winners}   # once per winner, not once per tree
+        for agid, node_type in [(WINNERS_AG_ID, 'UNIT_INCLUDED'), (TESTING_AG_ID, 'UNIT_EXCLUDED'),
+                                (AW_TESTING_AG_ID, 'UNIT_EXCLUDED')] + [(ag, 'UNIT_EXCLUDED') for ag in CATEGORY_AG_IDS]:
+            if agid not in info: continue
             subdiv, have, n_nodes = info[agid]
             ops = []
             for p in new_winners:
-                for iid in _variant_item_ids(stok, p['pid']):
+                for iid in iids[p['pid']]:
                     if iid not in have:
                         ops.append({"create": {"assetGroup": f"customers/{ga.CUSTOMER_ID}/assetGroups/{agid}",
                                                "type": node_type, "listingSource": "SHOPPING",
@@ -370,10 +392,13 @@ def ads_fast_path(new_winners, stok):
             if ops:
                 r = requests.post(f"{ga.ADS_BASE}/customers/{ga.CUSTOMER_ID}/assetGroupListingGroupFilters:mutate",
                                   headers=ga._headers(gt), json={"operations": ops}, timeout=60).json()
-                if 'error' in r: raise RuntimeError(str(r)[:300])
+                if 'error' in r:                              # one tree failing never stops the others
+                    tree_err = (tree_err or '') + f" AG {agid}: {str(r)[:120]}"
+                    continue
                 made += len(ops)
-        print(f"  fast-path: {made} item-id nodes written (Winners include / Testing+AW exclude)")
-        return made, None
+        print(f"  fast-path: {made} item-id nodes written (Winners include / Testing + category Testing exclude)"
+              + (f" | !! {tree_err}" if tree_err else ''))
+        return made, (tree_err[:150] if tree_err else None)
     except Exception as ex:
         print(f"  !! fast-path FAILED (harmless - label path still moves it on next feed sync): {ex}")
         return 0, str(ex)[:150]
@@ -465,12 +490,17 @@ def sync_bestseller_collection(tok, dry):
 #     warns — it can never block or distort the testing kills. A glitchy run
 #     that flags more than WINNER_KILL_CAP winners aborts (data glitch guard,
 #     same philosophy as the testing KILL_CAP).
-WINNER_PACE_ROAS  = 2.0                            # 2.4 -> 2.0 owner 2026-08-14: max spend absorption; survival ~2.1 sits under the tROAS-2.2 gate, so the bidder is the real control and this is a deep backstop; LC catches exits
+WINNER_PACE_ROAS  = 2.3                            # 2.0 -> 2.3 owner 2026-10-27: "exit at 2.3 spend not 2 to last chance, safer". Was: 2.4 -> 2.0 owner 2026-08-14: max spend absorption; survival ~2.1 sits under the tROAS-2.2 gate, so the bidder is the real control and this is a deep backstop; LC catches exits
 WINNER_KILL_START = datetime.date(2026, 7, 13)     # LIVE (owner 2026-07-13: "if a winner hits the rules kill it, don't wait for Jul 25")
 WINNER_LOOKBACK_D = 60                             # last-sale + spend lookback window
-WINNER_KILL_CAP   = 10                             # >N winner kills in one run = glitch -> abort + alert
+WINNER_KILL_CAP   = 40                             # >N winner kills in one run = glitch -> abort + alert. 10 -> 40 owner 2026-10-27: the pace
+                                                   # line moved 2.0 -> 2.3 and the Champions roster joined the pace rule, so the
+                                                   # first run legitimately moves 34 (dry run 27 Oct) to Last Chance at once
 WINNER_POOL_ALERT = 25                             # warn when the winner pool drops below this
 WINNER_KILLS_LOG  = 'winner_kills_log.csv'
+TRIAL_DAYS        = 14                             # owner 2026-10-27: 14-day Winners trial - no 2nd sale in 14 days -> Last Chance
+TRIAL_START       = datetime.date(2026, 10, 28)    # only products whose first sale is on/after this (no back-dated mass move)
+TRIAL_CAP         = 40                             # more trial moves than this in one run = glitch: none moved
 
 def _winner_products(tok):
     """Live winners (ACTIVE + w_campaign) -> {pid: {name, price}} (min variant price)."""
@@ -817,6 +847,7 @@ def prune_settled_nodes(dry):
         import google_ads_connect as ga
         gt = ga.get_access_token()
         ags = {WINNERS_AG_ID: 'winners', TESTING_AG_ID: 'testing_uk', AW_TESTING_AG_ID: 'testing_aw'}
+        ags.update({ag: f'testing_{k}' for k, (_c, ag) in CATEGORY_TESTING.items()})
         rows = _ads_search(ga, gt,
             "SELECT asset_group.id, asset_group_listing_group_filter.id, asset_group_listing_group_filter.type, "
             "asset_group_listing_group_filter.case_value.product_item_id.value "
@@ -848,6 +879,7 @@ def prune_settled_nodes(dry):
             if l1 and l1 <= {'w_campaign', 'lc_campaign', 'c_champion'}: return True   # the l1 rule already excludes it (c_champion: ladder v7 tree rule)
             if agid == AW_TESTING_AG_ID: return len(l2) == 1 and 'aw26' not in l2   # not admitted by the aw26 rule anyway
             if agid == TESTING_AG_ID:    return l2 == {'aw26'}                       # Testing|UK excludes aw26 anyway
+            if agid in CATEGORY_AG_IDS:  return len(l2) == 1 and 'aw26' not in l2   # category trees admit aw26 only
             return False
         todo = collections.defaultdict(list)
         for agid, nid, ntype, pid in items:
@@ -922,6 +954,98 @@ def _label_state(tok, pids):
                 m = n.get('l1') or {}
                 out[str(n['legacyResourceId'])] = (m.get('value'), m.get('updatedAt'), n.get('updatedAt'))
     return out
+
+
+# ── CATEGORY LABEL (owner 2026-10-27) ─────────────────────────────────────────────────────────────────────────────────
+# The category Testing campaigns route on custom_label_3 = cat_<key>, read by the feed app from the product metafield
+# mm-google-shopping.custom_label_3. Once an hour every ACTIVE product WITHOUT that metafield (a new import) gets one from its
+# title (Google product category as the fallback), so new launches reach their Testing campaign with no human step.
+# Never overwrites an existing value (a hand correction stays). Warn-only.
+import re as _re
+_CAT_DRESS = [r'\bdress(es)?\b', r'\bgowns?\b', r'\bsundress', r'\bkaftans?\b']
+_CAT_NOTDRESS = [r'dress(y)? (shoes?|boots?|sandals?|heels?|coat|jacket|trousers?|pants)', r'\bfancy dress\b', r'\bdressing gowns?\b']
+_CAT_SHOE = [r'\bboots?\b(?! ?cut)', r'\bbooties\b', r'\bheels?\b', r'\bsandals?\b', r'\btrainers?\b', r'\bsneakers?\b', r'\bloafers?\b', r'\bpumps\b',
+             r'\bmules?\b', r'\bflats\b', r'\bslippers?\b', r'\bwedges?\b', r'\bshoes?\b', r'\bslingbacks?\b', r'\bclogs?\b', r'\bespadrilles?\b',
+             r'\bstilettos?\b', r'\bplatforms?\b', r'\bflip[- ]flops?\b', r'\bslides\b']
+_CAT_SMALLFIRST = [r'\bjumpsuits?\b', r'\bplaysuits?\b', r'\brompers?\b', r'\bco-?ords?\b', r'\btracksuits?\b', r'\b(two|2)[- ]piece\b',
+                   r'\bsets?\b', r'\bdungarees?\b', r'\boveralls?\b', r'\btrousers?\b', r'\bjeans?\b', r'\bpants\b', r'\bjoggers?\b',
+                   r'\bsweatpants\b', r'\bleggings?\b', r'\bskirts?\b', r'\bskorts?\b', r'\bshorts\b', r'\bculottes?\b', r'\bsuits?\b', r'\bwaistcoats?\b']
+_CAT_OUTER = [r'\bcoats?\b', r'\bjackets?\b', r'\bblazers?\b', r'\bpuffers?\b', r'\bparkas?\b', r'\btrench\b', r'\bgilets?\b', r'\bcapes?\b(?! sleeves?)',
+              r'\bponchos?\b', r'\bshackets?\b', r'\bbombers?\b', r'\bovercoats?\b', r'\banoraks?\b', r'\bwindbreakers?\b', r'\bpeacoats?\b',
+              r'\b(down|puffer|quilted|padded|body ?warmer) vests?\b', r'\bbodywarmers?\b', r'\braincoats?\b']
+_CAT_KNIT = [r'\bjumpers?\b', r'\bsweaters?\b', r'\bcardigans?\b', r'\bknit', r'\bturtlenecks?\b', r'\broll ?necks?\b', r'\bhood(ie|y|ies)\b',
+             r'\bsweatshirts?\b', r'\bpullovers?\b', r'\bfleece\b', r'\bcrew ?neck sweat', r'\bquarter zip\b', r'\bhalf zip\b', r'\bsweater vests?\b',
+             r'\bknitwear\b']
+_CAT_GPC = {'2271': 'dresses', '187': 'shoes', '5598': 'outerwear', '203': 'outerwear', '1831': 'outerwear', '5182': 'small', '204': 'small',
+            '1581': 'small', '7313': 'small', '5322': 'small'}
+CATEGORY_LABEL_CAP = 400       # more unlabelled products than this in one run = something odd: label the first 400, warn
+
+
+def product_category(title, gpc=None):
+    """'dresses' | 'shoes' | 'small' | 'outerwear' | 'knit' - first match wins, in this order (a knit dress is a dress, a
+    knitted co-ord set is a set, a hooded jacket is outerwear)."""
+    t = ' ' + (title or '').lower() + ' '
+    has = lambda pats: any(_re.search(p, t) for p in pats)
+    if has(_CAT_DRESS) and not has(_CAT_NOTDRESS): return 'dresses'
+    if has(_CAT_SHOE): return 'shoes'
+    if has(_CAT_SMALLFIRST): return 'small'
+    if has(_CAT_OUTER): return 'outerwear'
+    if has(_CAT_KNIT): return 'knit'
+    return _CAT_GPC.get(str(gpc or ''), 'small')
+
+
+def label_categories(dry, now=None, force=False):
+    now = now or datetime.datetime.now(UK)
+    if not (force or now.minute < LABEL_SYNC_MINUTE_MAX):
+        return None
+    res = dict(checked=0, written=0, err=None, by={}, bad={})
+    try:
+        import time as _time
+        tok = shopify_token()
+        # hourly: products created in the last 14 days (new imports); the 04:xx run sweeps every active product
+        scope = 'status:active' if (force or now.hour == PRUNE_HOUR_UK) else \
+            f"status:active created_at:>={(now - datetime.timedelta(days=14)).date().isoformat()}"
+        Q = ('query($c:String,$q:String){products(first:100,after:$c,query:$q){pageInfo{hasNextPage endCursor} '
+             'nodes{legacyResourceId title l3:metafield(namespace:"mm-google-shopping",key:"custom_label_3"){value} '
+             'gpc:metafield(namespace:"mm-google-shopping",key:"google_product_category"){value}}}}')
+        valid = {'cat_' + k for k in CATEGORY_TESTING}
+        todo = []; cur = None
+        while True:
+            for attempt in range(6):          # the bucket refills ~50-100 pts/s: wait it out instead of giving up
+                try:
+                    j = _shopify_read(tok, Q, {'c': cur, 'q': scope}); break
+                except Exception:
+                    if attempt == 5: raise
+                    _time.sleep(5 * (attempt + 1))
+            c = j['data']['products']
+            for n in c['nodes']:
+                res['checked'] += 1
+                v = (n.get('l3') or {}).get('value')
+                if not v:
+                    todo.append((str(n['legacyResourceId']), 'cat_' + product_category(n['title'], (n.get('gpc') or {}).get('value'))))
+                elif v not in valid:
+                    res['bad'][str(n['legacyResourceId'])] = v      # serves in NO Testing campaign - reported, never rewritten
+            if c['pageInfo']['hasNextPage']: cur = c['pageInfo']['endCursor']
+            else: break
+        if len(todo) > CATEGORY_LABEL_CAP:      # far more than a normal import day = a read glitch: write NOTHING
+            res['err'] = f'SAFETY STOP: {len(todo)} active products read without a category label (cap {CATEGORY_LABEL_CAP}) - nothing written'
+            return res
+        for pid, v in todo:
+            res['by'][v] = res['by'].get(v, 0) + 1
+        if dry or not todo:
+            return res
+        m = 'mutation($mf:[MetafieldsSetInput!]!){metafieldsSet(metafields:$mf){userErrors{message}}}'
+        for i in range(0, len(todo), 25):
+            ch = todo[i:i + 25]
+            r = _shopify_write(tok, m, {'mf': [{'ownerId': f"gid://shopify/Product/{pid}", 'namespace': 'mm-google-shopping',
+                                                 'key': 'custom_label_3', 'type': 'single_line_text_field', 'value': v,
+                                                 'compareDigest': None} for pid, v in ch]},   # null digest: only creates, never overwrites
+                               'metafieldsSet')
+            if r == 'ok': res['written'] += len(ch)
+            else: res['err'] = f'metafieldsSet: {str(r)[:100]}'
+    except Exception as ex:
+        res['err'] = str(ex)[:120]
+    return res
 
 
 def label_sync_check(feed, dry, now=None, force=False):
@@ -1159,7 +1283,30 @@ def winner_pace_run(run_date, dry, life=None, shared=None, skip=None, exclude=No
         rows.sort(key=lambda x: -x['pct'])
         res['closest'] = [r for r in rows if 60 <= r['pct'] <= 100][:5]
         flagged = [r for r in rows if r['spent'] > r['allow']]
+        # 14-DAY TRIAL (owner 2026-10-27): a product that entered Winners on its first-ever sale ON/AFTER TRIAL_START and
+        # still has only that one sale 14 days later goes to Last Chance, even inside its pace allowance.
+        # Own list + own cap, so a busy graduation day 14 days ago can never block the pace rule's safety stop.
+        trial = []
+        for r in rows:
+            if r in flagged: continue
+            lifetime = life.get(r['pid'], [])
+            if len(lifetime) == 1:          # review 2026-10-27: brand-new graduates only (ONE lifetime sale), never an LC return
+                d0 = datetime.date.fromisoformat(str(lifetime[0]['date'])[:10])
+                if d0 >= TRIAL_START and (run_date - d0).days >= TRIAL_DAYS:
+                    r['opened'] = f"14-day trial: one sale ({d0}), no second by {run_date}"
+                    trial.append(r)
+        res['trial'] = trial
         res['flagged'] = flagged
+        if trial and len(trial) > TRIAL_CAP:
+            res['trial_err'] = f'SAFETY STOP: {len(trial)} 14-day-trial moves > cap {TRIAL_CAP} - none moved'
+            res['trial'] = trial = []
+        if trial:
+            for r in trial:
+                r['outcome'] = shopify_winner_kill(tok, r['pid'], run_date) if live else ('DRY' if dry else 'PREVIEW (dormant)')
+                print(f"  winner TRIAL -> Last Chance {r['pid']} -> {r['outcome']} | {r['opened']} | {r['name'][:40]}")
+            if live:
+                ads_remove_winner_item_nodes([r['pid'] for r in trial if str(r.get('outcome', '')).startswith('ok')])
+                _write_winner_kills_log(trial, run_date)
         if not flagged: return res
         if len(flagged) > WINNER_KILL_CAP:
             res['err'] = (f'SAFETY STOP: {len(flagged)} winner kills > cap {WINNER_KILL_CAP} — '
@@ -1216,7 +1363,8 @@ def winner_pace_run(run_date, dry, life=None, shared=None, skip=None, exclude=No
 # Entry 4th sale + last-4 ROAS >= max(2.5, own break-even); exit when the last 4 sales fall under that line;
 # re-entry 2 sales after the demotion + ROAS >= 2.5 since; routing by LABEL only (Testing trees exclude
 # c_champion); every spend window counts Rising + Proven + Last Chance spend. Evidence: plan v7 on the Desktop.
-CHAMPIONS_ENABLED       = True
+CHAMPIONS_ENABLED       = False   # owner 2026-10-27: Champions + Hero merge into ONE Winners campaign (tROAS 2.3); c_champion
+                                  # stripped back to w_campaign at the switch, Champions paused. Was True (ladder v7).
 CHAMPION_TAG            = 'c_champion'
 CHAMPION_DEMOTED_PREFIX = 'champ_demoted:'          # champ_demoted:YYYY-MM-DD, set on demotion
 LC_GRAD_PREFIX          = 'lc_grad:'                # v7.5 (owner 2026-10-03): lc_grad:YYYY-MM-DD = the date of the sale that took the product
@@ -1263,7 +1411,7 @@ LIFETIME_SINCE          = '2026-01-01'              # predates the store — lif
 #   FOLLOW    a Hero product demoted out of Proven, drafted or archived leaves Hero in the same run (tag + nodes).
 #   EMPTY     no roster left -> the Hero campaign is PAUSED (never left serving products that are back in Champions);
 #             re-enabling is manual, when new Heroes are added.
-HERO_ENABLED     = True
+HERO_ENABLED     = False           # owner 2026-10-27: Hero folds into Winners with Champions (campaign stays paused)
 HERO_TAG         = 'h_hero'
 HERO_EXIT_PREFIX = 'hero_exit:'
 HERO_CAMPAIGN_ID = '24388812638'             # PMax | Hero | UK  (created 2026-10-23)
@@ -2156,7 +2304,7 @@ def main():
     real = sys.stdout; sys.stdout = _Tee(real, logf)
     try:
         print(f"== kill_engine GOOGLE AUTO == {run_date} ({run_date.strftime('%A')}) | "
-              f"Mon tiers 3&4 {'ON' if is_monday else 'OFF'} | {'DRY-RUN' if dry else 'LIVE'} | {ts}")
+              f"{'DRY-RUN' if dry else 'LIVE'} | {ts}")
         feed = build_feed(run_date)
         print(f"feed: Google Ads + live Shopify -> {len(feed)} active products")
 
@@ -2209,7 +2357,7 @@ def main():
                 print(f"  champion watch {r['pct']:.0f}%: {r['pid']} | {r['name'][:40]}")
         else:
             ch = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
-            print("champions: DISABLED (campaign paused 2026-08-07 — roster folded into Winners)")
+            print("champions: DISABLED (owner 2026-10-27: Champions + Hero merged into Winners, campaign paused)")
 
         # HERO TIER (owner 2026-10-23): hand-picked Proven products scaling in their own campaign. After the Proven
         # section (a product demoted there leaves Hero in the same run), before the pace rule (Heroes stay Proven-exempt).
@@ -2272,16 +2420,35 @@ def main():
                 print(f"  label {kind} {r['pid']} should be {r['want']} | {r['wrong']}/{r['offers']} offers wrong at Google | "
                       f"label written {(r['label_age'] or 0):.1f} h ago | {r['name'][:40]}")
 
+        # TESTING KILLS (owner 2026-10-27): the v4 rules unchanged, but judged ONCE A WEEK (Monday 03:00-05:59 UK, every run in
+        # that window), so a product gets a full week of data between moves. Every other run only applies the DAILY SAFETY
+        # STOP: never sold and GBP 8+ spent in 30 days (2x the GBP 4 gate) -> draft now.
+        _uk = datetime.datetime.now(UK)
+        weekly = (_uk.weekday() == WEEKLY_KILL_WEEKDAY and WEEKLY_KILL_HOURS[0] <= _uk.hour <= WEEKLY_KILL_HOURS[1]) or '--weekly' in sys.argv
+        print(f"testing kills: {'WEEKLY full rules' if weekly else f'daily safety stop only (GBP {DAILY_STOP_GBP:g} no-sale)'}")
+        if (w.get('trial') or []) or w.get('trial_err'):
+            print(f"winner 14-day trial: {len(w.get('trial') or [])} {'would move' if dry else 'moved'} to Last Chance"
+                  + (f" | !! {w['trial_err']}" if w.get('trial_err') else ''))
         kills = []
         for p in feed:
             if WINNER_TAG in p['tags'] or LC_TAG in p['tags']:
                 continue                      # winners + last-chance: their own rules — never killed here
-            dec, tier, why = evaluate(p, run_date, is_monday)
+            if life_sales is None and not p.get('ever_sold'):
+                continue                      # review 2026-10-27: lifetime pull failed -> "never sold" is unknown: no no-sale kill this run
+            if weekly:
+                dec, tier, why = evaluate(p, run_date, is_monday)
+            elif not p.get('ever_sold') and p['rev30'] <= 0 and p['cost30'] >= DAILY_STOP_GBP:
+                dec, tier, why = 'KILL', 'Daily stop', f'no sale ever, GBP{p["cost30"]:.2f} spent in 30d >= GBP{DAILY_STOP_GBP:g} safety stop'
+            else:
+                dec = 'KEEP'
             if dec == 'KILL':
                 kills.append((p, tier, why))
 
-        # no cap — draft EVERY product the rules flag
-        to_draft = kills
+        # A week of Testing kills lands in the Monday window: at most WEEKLY_DRAFT_CAP per run keeps a run inside the 7-minute job
+        # limit (every run 03:00-05:59 re-applies the rules, so the rest follow 8 minutes later). Otherwise no cap.
+        to_draft = kills[:WEEKLY_DRAFT_CAP] if weekly else kills
+        if len(to_draft) < len(kills):
+            print(f"  weekly draft cap: {len(to_draft)} drafted now, {len(kills) - len(to_draft)} left for the next run in the window")
         print(f"kills found: {len(kills)}")
         outcomes = {}
         if to_draft:
@@ -2337,7 +2504,7 @@ def main():
 
         # CHAMPIONS section — roster + every move, every run (single line while disabled)
         if not CHAMPIONS_ENABLED:
-            tg += "\n\n👑 Champions: disabled (paused 2026-08-07, folded into Winners)"
+            tg += "\n\n👑 Champions: merged into Winners (owner 2026-10-27, campaign paused)"
         else:
             ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
                       - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY') or x.get('moved')))
@@ -2424,7 +2591,19 @@ def main():
             tg += ("\n🎁 <b>upsell-offer product drafted:</b> "
                    + ", ".join(f"<code>{p}</code>" for p in pp_hit)
                    + " — pool self-heals, refills tonight")
+        if (w.get('trial') or []) or w.get('trial_err'):
+            tg += f"\n⏳ <b>14-day trial</b>: {len(w.get('trial') or [])} to Last Chance (one sale, no second in 14 days)"
+            for r in (w.get('trial') or [])[:8]:
+                tg += f"\n  ➡ <code>{r['pid']}</code> {html.escape(r['name'][:40])} → {html.escape(str(r.get('outcome', ''))[:40])}"
+            if w.get('trial_err'): tg += f"\n⚠️ {html.escape(w['trial_err'])}"
         send_telegram(tg, xlsx)
+        # CATEGORY LABELS last (review 2026-10-27): never in the weekly kill window, so it cannot crowd the drafts out
+        if not weekly:
+            cl = label_categories(dry, force=('--labels' in sys.argv))
+            if cl is not None:
+                print(f"category labels: {cl['checked']} active checked | {sum(cl['by'].values())} without one -> "
+                      f"{'would write' if dry else 'written'} {cl['by'] if cl['by'] else 0}" + (f" | !! {cl['err']}" if cl['err'] else '')
+                      + (f" | unknown values: {cl['bad']}" if cl.get('bad') else ''))
 
         # RESEND email — twice a day (SUMMARY_HOURS): TEXT digest of last 12h + the .xlsx
         maybe_send_12h_email(ts, force=('--test' in sys.argv or '--email' in sys.argv))

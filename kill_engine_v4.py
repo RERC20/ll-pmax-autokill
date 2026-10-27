@@ -256,9 +256,8 @@ def evaluate(p, run_date, is_monday):
         # I don't want age to be identified, it's not right"). Kills must be
         # evidence-based (spend with zero sales), never calendar-based. The
         # spend-gated tiers (2/5/6/7) remain the only kill paths.
-        if False and is_monday and dl>=40 and clk<5 and not p.get('ever_sold') \
-                and run_date >= datetime.date(2026, 10, 1):
-            return ('KILL','Tier 4',f'ghost: {clk} clicks/{dl}d')
+        # Tiers 3 (stale) and 4 (ghost) REMOVED in all engines (owner 2026-10-27: "this no remove in all") - kills are
+        # evidence-based only (spend with zero sales); no age/calendar rule exists any more.
     # -- REVERT BLOCK: pre-2026-07-15 no-sale tiers (flat £5 / 40 / 70 clicks). To switch back,
     #    delete the price/7 block above and un-comment this (backup also in
     #    Desktop\rules_backup_v4_20260715 and in git history). ------------------------------
@@ -267,10 +266,6 @@ def evaluate(p, run_date, is_monday):
     #         return ('KILL','Tier 1',f'{clk} clicks, £0 rev')
     #     if (clk>=40 or cost30>=5) and zero30:
     #         return ('KILL','Tier 2',f'no-sale: {clk} clicks/£{cost30:.2f}, £0 rev')
-    #     if is_monday and dl>=7 and cost30>=5 and zero30:
-    #         return ('KILL','Tier 3',f'stale: £{cost30:.2f}, £0 rev')
-    #     if is_monday and dl>=21 and clk<5:
-    #         return ('KILL','Tier 4',f'ghost: {clk} clicks/{dl}d')
     # ---- Tier 7 backstop: slow dribblers under Tier 6's radar (owner 2026-07-03) ----
     # Tier 6 needs cost7>=5 (>= £0.71/day), so a product bleeding £3-4/week below target never
     # trips it. 30d window = burn rates down to ~£0.33/day AND a less noisy ROAS at tiny
