@@ -283,8 +283,11 @@ WINNERS_AG_ID = '6684080392'
 TESTING_AG_ID = '6729681029'
 AW_TESTING_AG_ID = '6738045970'   # Testing|AW: aw26 subdivision added 2026-08-16 (node 15260771050)
 # CATEGORY TESTING (owner 2026-10-27): Testing | AW is replaced by one PMax per category. Each tree: label1 w/c/lc EXCLUDED,
-# label1-other -> ITEM-ID subdivision (fast-path excludes land here) -> label2 aw26 -> label3 cat_<key> INCLUDED, the
-# other four cats + no label EXCLUDED. custom_label_3 = mm-google-shopping.custom_label_3, written by label_categories().
+# label1-other -> ITEM-ID subdivision (fast-path excludes land here, plus the few title exceptions where Google's category
+# is not what the garment is) -> label2 aw26 -> GOOGLE PRODUCT CATEGORY: Apparel > Shoes (187) = Shoes; Clothing (1604) >
+# Dresses (2271) / Outerwear (203) / Shirts & Tops (212, = Knit & Sweats) each their campaign; everything else = Small.
+# Google's category agreed with the title classifier on all but 5 of the 4,990 testing products (27 Oct), and it needs no
+# feed-label round trip. custom_label_3 (label_categories) is kept as a second, title-based record - not routed on.
 CATEGORY_TESTING = {   # key: (campaign id, asset group id)
     'dresses':   ('24398844870', '6765759519'),
     'outerwear': ('24409841410', '6765691655'),
