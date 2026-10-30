@@ -421,7 +421,8 @@ def resolve_mode(now, event, explicit):
       - all afternoon/evening ticks (23:11, 23:49 UK) -> skip."""
     if explicit in ('start', 'end', 'rollover', 'settle'): return explicit
     if now.hour < 2:  return 'rollover'
-    if now.hour < 12: return 'settle'
+    if now.hour < 3:  return 'skip'      # 30 Oct 2026: Railway cron is UTC ('11 0,2,3,23'), so in winter a 02:11 UK tick
+    if now.hour < 12: return 'settle'    # exists - settle only from 03:00 UK, as the cron-job.org 03:11 tick always did
     return 'skip'
 
 def main():
