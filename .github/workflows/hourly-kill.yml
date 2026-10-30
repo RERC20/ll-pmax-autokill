@@ -37,6 +37,9 @@ concurrency:
 
 jobs:
   run:
+    # 30 Oct 2026: the engine now runs on Railway cron (service lolalooks-autokill, 1,9,16,24,31,39,46,54 * * * * UTC).
+    # GitHub only runs it if the repo variable RUN_ON_GITHUB = 1 (rollback switch), so cron-job.org ticks do nothing.
+    if: ${{ vars.RUN_ON_GITHUB == '1' }}
     runs-on: ubuntu-latest
     timeout-minutes: 7           # (v7.3: 6 -> 7, still under the 8-min tick) a hung execution fails fast so the next run isn't delayed
                                  # (normal run is ~20-40s; GitHub runner-queue waits are separate)
