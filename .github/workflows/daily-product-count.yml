@@ -54,6 +54,9 @@ concurrency:
 
 jobs:
   count:
+    # 30 Oct 2026: moved to RAILWAY (service daily-product-count, cron '11 0,2,3,23 * * *' UTC = 00:11 + 03:11 UK).
+    # GitHub runs only if the repo variable RUN_ON_GITHUB = 1, so cron-job.org / schedule ticks here do nothing.
+    if: ${{ vars.RUN_ON_GITHUB == '1' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
