@@ -44,8 +44,8 @@ TESTING_CAMPAIGN_ID = TESTING_CAMPAIGN_IDS[0]                # back-compat alias
 # ── ONE-CAMPAIGN SETUP (owner 2026-11-01) ───────────────────────────────────
 # LolaLooks moved to a NEW Google Ads account (778-370-4709) with ONE PMax testing campaign at 00:03 UK on 2 Nov 2026.
 # The old account (GOOGLE_CUSTOMER_ID, GBP) is paused from then. From ONE_CAMPAIGN_FROM the engine runs the weekly
-# Testing rules only (Monday 03:00-05:59 UK) and judges spend in BOTH accounts, so 30-day windows keep their history:
-#   old account  -> the testing campaigns above, already GBP
+# Testing rules only (Monday 03:00-05:59 UK) on the NEW account's spend only - every product starts from the beginning
+# (owner 2026-11-01). Winners are judged like any other product.
 #   new account  -> NEW_TESTING_CAMPAIGN_ID, billed in USD -> CONVERTED TO GBP before any rule sees it, because every
 #                   KPI (gates, ROAS vs Shopify GBP revenue) is in GBP. A wrong currency would fire every limit ~25% early.
 import os as _os
@@ -147,7 +147,8 @@ def google_product_perf(run_date):
     # sale counts immediately, so a cross-sell / low-spend sale isn't mis-read as £0 revenue and
     # false-killed. Rolling (vs the old "ending yesterday") = no abrupt midnight boundary. RULES UNCHANGED.
     end=run_date.isoformat()                                        # TODAY (included)
-    for win,days in (('7',7),('30',30)):
+    # owner 2026-11-01: in one-campaign mode every product STARTS FROM THE BEGINNING - only new-account spend counts.
+    for win,days in ((() if one_campaign_mode() else (('7',7),('30',30)))):
         start=(run_date-datetime.timedelta(days=days-1)).isoformat()  # today + (N-1) prior days = N dates
         q=(f"SELECT campaign.id, segments.product_item_id, metrics.cost_micros, metrics.clicks "
            f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{end}' "

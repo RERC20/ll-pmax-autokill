@@ -2352,7 +2352,7 @@ def main():
         # WINNERS first: tag new 2+ lifetime-order actives, then EXEMPT all tagged from the kill rules
         new_winners = tag_new_winners(feed, dry, life_sales)
         exempt = sum(1 for p in feed if WINNER_TAG in p['tags'])
-        print(f"winners: +{len(new_winners)} newly tagged | {exempt} total exempt from kill rules")
+        print(f"winners: +{len(new_winners)} newly tagged | {exempt} " + ("tagged winners, judged like any product (one-campaign)" if oc else "total exempt from kill rules"))
         fp_err = None
         if new_winners and not dry and not oc:   # one-campaign mode: no Winners campaign to move them into
             _, fp_err = ads_fast_path(new_winners, shopify_token())   # instant campaign move (label = backup)
@@ -2452,7 +2452,7 @@ def main():
                   + (f" | !! {w['trial_err']}" if w.get('trial_err') else ''))
         kills = []
         for p in feed:
-            if (WINNER_TAG in p['tags']) if oc else (WINNER_TAG in p['tags'] or LC_TAG in p['tags']):   # one-campaign: Last Chance products are judged by the testing rules
+            if (not oc) and (WINNER_TAG in p['tags'] or LC_TAG in p['tags']):   # one-campaign (owner 2026-11-01): winners + Last Chance judged like any product
                 continue                      # winners + last-chance: their own rules — never killed here
             if life_sales is None and not p.get('ever_sold'):
                 continue                      # review 2026-10-27: lifetime pull failed -> "never sold" is unknown: no no-sale kill this run
@@ -2506,7 +2506,7 @@ def main():
 
         if oc:
             tg += (f"\n\n📌 One campaign: new account {NEW_CUSTOMER_ID} (USD). Spend converted at 1 USD = £{usd_to_gbp():.4f}; "
-                   f"old-account testing spend still counts in the 30-day windows. Winners stay exempt.")
+                   f"only new-account spend counts (clean start). Winners are judged like any other product.")
         else:
             # WINNERS pace section — one status line every run + detail per kill/preview
             tg += (f"\n\n🩹 <b>Last Chance</b>: pool {lc['pool']} | ⬆ {len(lc['graduated'])} back to Winners | "
