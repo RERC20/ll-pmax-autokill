@@ -41,6 +41,41 @@ TESTING_CAMPAIGN_IDS = ('24027270949', '24116871559', '24231514492', '2422483167
                         # Testing spend - every no-sale gate reads it. The old ids stay so the 30-day windows keep their history.
                         '24398844870', '24409841410', '24404057414', '24398846589', '24409841689')   # Testing | UK  +  Testing | AW | UK  +  Testing | AW-B | UK (owner 2026-09-08: no-spend AW products, label aw26b, GBP 100/day)  +  Testing | Men | UK (owner 2026-09-09: the 809 men parked under custom_label_2=mens_paused, GBP 50/day)
 TESTING_CAMPAIGN_ID = TESTING_CAMPAIGN_IDS[0]                # back-compat alias
+# ── ONE-CAMPAIGN SETUP (owner 2026-11-01) ───────────────────────────────────
+# LolaLooks moved to a NEW Google Ads account (778-370-4709) with ONE PMax testing campaign at 00:03 UK on 2 Nov 2026.
+# The old account (GOOGLE_CUSTOMER_ID, GBP) is paused from then. From ONE_CAMPAIGN_FROM the engine runs the weekly
+# Testing rules only (Monday 03:00-05:59 UK) and judges spend in BOTH accounts, so 30-day windows keep their history:
+#   old account  -> the testing campaigns above, already GBP
+#   new account  -> NEW_TESTING_CAMPAIGN_ID, billed in USD -> CONVERTED TO GBP before any rule sees it, because every
+#                   KPI (gates, ROAS vs Shopify GBP revenue) is in GBP. A wrong currency would fire every limit ~25% early.
+import os as _os
+NEW_CUSTOMER_ID         = _os.environ.get('NEW_GOOGLE_CUSTOMER_ID', '7783704709')
+NEW_TESTING_CAMPAIGN_ID = _os.environ.get('NEW_TESTING_CAMPAIGN_ID', '24425197606')
+NEW_ACCOUNT_LIVE_FROM   = datetime.date(2026, 11, 2)                       # first day the new campaign can spend
+ONE_CAMPAIGN_FROM = datetime.datetime.fromisoformat(_os.environ.get('ONE_CAMPAIGN_FROM', '2026-11-02T06:00:00+00:00'))
+USD_TO_GBP_FALLBACK = float(_os.environ.get('USD_TO_GBP', '0.75'))       # only if the live rate cannot be fetched
+_FX = {}
+
+def one_campaign_mode(now=None):
+    """True once the switch is done (after the 2 Nov Monday window, which still judges last week's old-account spend)."""
+    if _os.environ.get('ONE_CAMPAIGN_MODE') in ('0', '1'):
+        return _os.environ['ONE_CAMPAIGN_MODE'] == '1'
+    return (now or datetime.datetime.now(datetime.timezone.utc)) >= ONE_CAMPAIGN_FROM
+
+def usd_to_gbp():
+    """GBP per 1 USD. Live ECB rate (frankfurter.app), sanity-checked; else the USD_TO_GBP fallback. Cached per run."""
+    if 'rate' in _FX: return _FX['rate']
+    rate, src = USD_TO_GBP_FALLBACK, 'fallback'
+    try:
+        j = requests.get('https://api.frankfurter.app/latest', params={'from': 'USD', 'to': 'GBP'}, timeout=15).json()
+        v = float(j['rates']['GBP'])
+        if 0.55 <= v <= 0.95: rate, src = v, f"ECB {j.get('date', '')}"
+    except Exception as e:
+        src = f'fallback ({str(e)[:60]})'
+    _FX.update(rate=rate, src=src)
+    print(f"fx: 1 USD = {rate:.4f} GBP ({src}) - new-account spend is converted to GBP before the rules")
+    return rate
+
 RUN_LOG   = 'kill_engine_google_runs.log'
 KILLS_LOG = 'kills_log_google.csv'
 
@@ -71,7 +106,7 @@ def _gql(tok, q, v=None):
 def google_product_perf(run_date):
     tok=ga.get_access_token()
     base=ga.ADS_BASE; cid=ga.CUSTOMER_ID
-    def search(q):
+    def search(q, cid=cid, with_login=True):
         # 429-aware: brief backoff for per-minute throttles; a persistent 429 means the
         # DEVELOPER token's daily op quota (Basic Access 15k/day) is spent — raise a
         # recognisable error so the runner reports "quota exhausted, skipped" not FAILED.
@@ -88,7 +123,7 @@ def google_product_perf(run_date):
         while True:
             body = {'query': q}
             if token: body['pageToken'] = token
-            r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json=body, timeout=90)
+            r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok, with_login), json=body, timeout=90)
             if r.status_code == 200:
                 j = r.json()
                 out += j.get('results', [])
@@ -123,6 +158,26 @@ def google_product_perf(run_date):
             if not pid: continue
             g[pid][f'cost{win}'] += int(row['metrics'].get('costMicros',0))/1e6
             if win=='30': g[pid]['clicks30'] += int(row['metrics'].get('clicks',0) or 0)
+    # NEW ACCOUNT (USD) -> converted to GBP and added to the same windows. Before the switch a failure here only warns
+    # (the old account is still the whole picture); after it, it raises so nothing is judged on half the spend.
+    if run_date >= NEW_ACCOUNT_LIVE_FROM - datetime.timedelta(days=1):
+        try:
+            fx = usd_to_gbp(); n = 0
+            for win,days in (('7',7),('30',30)):
+                start=(run_date-datetime.timedelta(days=days-1)).isoformat()
+                q=(f"SELECT campaign.id, segments.product_item_id, metrics.cost_micros, metrics.clicks "
+                   f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{end}' "
+                   f"AND campaign.id = {NEW_TESTING_CAMPAIGN_ID}")
+                for row in search(q, cid=NEW_CUSTOMER_ID, with_login=False):
+                    parts=str(row['segments']['productItemId']).split('_')
+                    pid=norm(parts[2]) if len(parts)>=3 else None
+                    if not pid: continue
+                    g[pid][f'cost{win}'] += int(row['metrics'].get('costMicros',0))/1e6 * fx      # USD -> GBP
+                    if win=='30': g[pid]['clicks30'] += int(row['metrics'].get('clicks',0) or 0); n += 1
+            print(f"new account {NEW_CUSTOMER_ID}: {n} product rows (30d) added, USD spend x {fx:.4f} -> GBP")
+        except Exception as e:
+            if one_campaign_mode(): raise
+            print(f"  (new account read warn, ignored before the switch: {str(e)[:160]})")
     return g
 
 # ── Shopify: live ACTIVE products (id, title, publishedAt, tags) ──

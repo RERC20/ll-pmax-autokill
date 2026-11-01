@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 
 # reuse the EXACT feed + rules + Shopify write + logging from the existing engines
 from kill_engine_google import build_feed, PMAX_CAMPAIGN_ID as WINNERS_CAMPAIGN_ID
+from kill_engine_google import one_campaign_mode, usd_to_gbp, NEW_CUSTOMER_ID, NEW_TESTING_CAMPAIGN_ID
 from kill_engine_v4 import evaluate, shopify_token, shopify_draft, _Tee, SHOP, SHOP_API
 from creds import cred                          # env -> _secrets_local.py -> '' (so local testing works too)
 
@@ -2297,7 +2298,8 @@ def _write_kills_log(rows, outcomes, run_date, ts, dry):
                         round(p['roas7'], 2), outcomes.get(p['pid'], '')])
 
 def main():
-    dry = '--dry' in sys.argv or '--dry-run' in sys.argv
+    if os.environ.get('KILL_FORCE_WEEKLY') == '1' and '--weekly' not in sys.argv: sys.argv.append('--weekly')   # test switch (Railway env)
+    dry = '--dry' in sys.argv or '--dry-run' in sys.argv or os.environ.get('KILL_DRY') == '1'   # KILL_DRY=1: test run, drafts nothing
     run_date = datetime.datetime.now(UK).date()
     is_monday = (run_date.weekday() == 0)
     ts = datetime.datetime.now(UK).strftime('%Y-%m-%d %H:%M:%S')
@@ -2308,6 +2310,16 @@ def main():
     try:
         print(f"== kill_engine GOOGLE AUTO == {run_date} ({run_date.strftime('%A')}) | "
               f"{'DRY-RUN' if dry else 'LIVE'} | {ts}")
+        # ONE-CAMPAIGN MODE (owner 2026-11-01): one PMax testing campaign in the new USD account, the engine runs ONLY in the
+        # Monday 03:00-05:59 UK window (every tick in it, so one failed tick cannot skip a week). Nothing happens on other days.
+        oc = one_campaign_mode()
+        _uk0 = datetime.datetime.now(UK)
+        weekly_now = (_uk0.weekday() == WEEKLY_KILL_WEEKDAY and WEEKLY_KILL_HOURS[0] <= _uk0.hour <= WEEKLY_KILL_HOURS[1]) or '--weekly' in sys.argv
+        if oc:
+            print(f"one-campaign mode: new account {NEW_CUSTOMER_ID}, campaign {NEW_TESTING_CAMPAIGN_ID} | Monday-only engine")
+            if not weekly_now:
+                print("outside the Monday 03:00-05:59 UK window -> nothing to do this run")
+                return
         feed = build_feed(run_date)
         print(f"feed: Google Ads + live Shopify -> {len(feed)} active products")
 
@@ -2342,86 +2354,92 @@ def main():
         exempt = sum(1 for p in feed if WINNER_TAG in p['tags'])
         print(f"winners: +{len(new_winners)} newly tagged | {exempt} total exempt from kill rules")
         fp_err = None
-        if new_winners and not dry:
+        if new_winners and not dry and not oc:   # one-campaign mode: no Winners campaign to move them into
             _, fp_err = ads_fast_path(new_winners, shopify_token())   # instant campaign move (label = backup)
 
         # BEST SELLERS: every active winner belongs to the storefront collection (add-only)
         bs_added, bs_err = sync_bestseller_collection(shopify_token(), dry)
 
-        # CHAMPIONS TIER (2026-07-20): promote 3-lifetime-order winners into the Champions
-        # campaign; demote champions whose trailing 2-gap window fell below 2.0. Runs BEFORE
-        # the winner pace rule so fresh promotions are already champion-exempt this same run.
-        if CHAMPIONS_ENABLED:
-            ch = champion_run(feed, run_date, dry, life_sales)
-            print(f"champions: roster {ch['roster']} | promoted {len(ch['promoted'])} | "
-                  f"demoted {len(ch['demoted'])}" + (f" | !! {ch['err']}" if ch['err'] else ""))
-            if ch.get('warn'): print(f"  !! {ch['warn']}")
-            for r in ch['watch']:   # ladder v7.1: figures only in the private Telegram chat (public log must not reveal a break-even)
-                print(f"  champion watch {r['pct']:.0f}%: {r['pid']} | {r['name'][:40]}")
+        if oc:   # old-account tiers (Champions/Hero/janitor/pace/Last Chance/feed labels) do not exist in the new account
+            ch = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None); he = None; ls = None
+            w = dict(evaluated=0, flagged=[], killed=0, live=False, closest=[], err=None, pool=10**6, trial=[], trial_err=None)
+            lc = dict(pool=0, graduated=[], drafted=[], err=None)
+            print('old-account tiers: skipped (one-campaign mode)')
         else:
-            ch = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
-            print("champions: DISABLED (owner 2026-10-27: Champions + Hero merged into Winners, campaign paused)")
+            # CHAMPIONS TIER (2026-07-20): promote 3-lifetime-order winners into the Champions
+            # campaign; demote champions whose trailing 2-gap window fell below 2.0. Runs BEFORE
+            # the winner pace rule so fresh promotions are already champion-exempt this same run.
+            if CHAMPIONS_ENABLED:
+                ch = champion_run(feed, run_date, dry, life_sales)
+                print(f"champions: roster {ch['roster']} | promoted {len(ch['promoted'])} | "
+                      f"demoted {len(ch['demoted'])}" + (f" | !! {ch['err']}" if ch['err'] else ""))
+                if ch.get('warn'): print(f"  !! {ch['warn']}")
+                for r in ch['watch']:   # ladder v7.1: figures only in the private Telegram chat (public log must not reveal a break-even)
+                    print(f"  champion watch {r['pct']:.0f}%: {r['pid']} | {r['name'][:40]}")
+            else:
+                ch = dict(roster=0, promoted=[], demoted=[], flagged=[], watch=[], err=None)
+                print("champions: DISABLED (owner 2026-10-27: Champions + Hero merged into Winners, campaign paused)")
 
-        # HERO TIER (owner 2026-10-23): hand-picked Proven products scaling in their own campaign. After the Proven
-        # section (a product demoted there leaves Hero in the same run), before the pace rule (Heroes stay Proven-exempt).
-        he = None
-        if HERO_ENABLED:
-            _dem = {r['pid'] for r in ch.get('demoted', []) if r.get('outcome') == 'DRY' or r.get('moved')}
-            he = hero_run(feed, run_date, dry, life_sales, demoted=_dem,
-                          shared=(ch.get('spend_pids') or set(), ch.get('spend')))
-            t_ = he.get('trees') or {}
-            print(f"hero: roster {he['roster']} | back to Champions {len(he['exits'])} | cleaned {len(he['cleaned'])} | "
-                  f"trees +{t_.get('hero_add', 0)}/-{t_.get('hero_rm', 0)} Hero, +{t_.get('ch_add', 0)}/-{t_.get('ch_rm', 0)} Champions exclusions"
-                  f"{' (dry: not written)' if dry else ''} | campaign {t_.get('status')}"
-                  + (f" | !! {he['err']}" if he['err'] else '') + (f" | !! {t_['err']}" if t_.get('err') else ''))
-            for r in he['watch'][:3]:
-                print(f"  hero watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
-            for _w in (he.get('warn'), t_.get('warn')):
-                if _w: print(f"  !! {_w}")
-        else:
-            t_ = hero_ads_reconcile(set(), dry, shopify_token(), disabled=True)   # switched off: no Champions exclusions,
-            print(f"hero: DISABLED | Champions exclusions -{t_.get('ch_rm', 0)} | campaign {t_.get('status')}"   # campaign paused
-                  + (f" | !! {t_['err']}" if t_.get('err') else ''))
+            # HERO TIER (owner 2026-10-23): hand-picked Proven products scaling in their own campaign. After the Proven
+            # section (a product demoted there leaves Hero in the same run), before the pace rule (Heroes stay Proven-exempt).
+            he = None
+            if HERO_ENABLED:
+                _dem = {r['pid'] for r in ch.get('demoted', []) if r.get('outcome') == 'DRY' or r.get('moved')}
+                he = hero_run(feed, run_date, dry, life_sales, demoted=_dem,
+                              shared=(ch.get('spend_pids') or set(), ch.get('spend')))
+                t_ = he.get('trees') or {}
+                print(f"hero: roster {he['roster']} | back to Champions {len(he['exits'])} | cleaned {len(he['cleaned'])} | "
+                      f"trees +{t_.get('hero_add', 0)}/-{t_.get('hero_rm', 0)} Hero, +{t_.get('ch_add', 0)}/-{t_.get('ch_rm', 0)} Champions exclusions"
+                      f"{' (dry: not written)' if dry else ''} | campaign {t_.get('status')}"
+                      + (f" | !! {he['err']}" if he['err'] else '') + (f" | !! {t_['err']}" if t_.get('err') else ''))
+                for r in he['watch'][:3]:
+                    print(f"  hero watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+                for _w in (he.get('warn'), t_.get('warn')):
+                    if _w: print(f"  !! {_w}")
+            else:
+                t_ = hero_ads_reconcile(set(), dry, shopify_token(), disabled=True)   # switched off: no Champions exclusions,
+                print(f"hero: DISABLED | Champions exclusions -{t_.get('ch_rm', 0)} | campaign {t_.get('status')}"   # campaign paused
+                      + (f" | !! {t_['err']}" if t_.get('err') else ''))
 
-        # SERVING-STATE JANITOR (audit 2026-08-16): heal missed node sweeps + draft tags
-        js = reconcile_serving_state(dry, extra_roster={str(p['pid']) for p in (new_winners or [])})
-        _now_uk = datetime.datetime.now(UK)   # v7.3: once a day (first run of 04:00-04:09 UK) at the 8-min cadence
-        if (_now_uk.hour == PRUNE_HOUR_UK and _now_uk.minute < 10) or _TREE_NODES_SEEN > PRUNE_TRIGGER_NODES or '--prune' in sys.argv:
-            pj = prune_settled_nodes(dry)
-            print(f"fast-path hygiene: {pj['checked']} item-id node(s) checked | {pj['removed']} {'would be ' if dry else ''}removed (label has taken over) | "
-                  f"{pj['kept']} kept | biggest tree {_TREE_NODES_SEEN} nodes" + (f" | !! {pj['err']}" if pj['err'] else ""))
-        print(f"janitor: {js['nodes_swept']} stray Winners node(s) swept | "
-              f"{js['drafts_stripped']} draft w_campaign strip(s)"
-              + (f" | !! {js['err']}" if js['err'] else ""))
+            # SERVING-STATE JANITOR (audit 2026-08-16): heal missed node sweeps + draft tags
+            js = reconcile_serving_state(dry, extra_roster={str(p['pid']) for p in (new_winners or [])})
+            _now_uk = datetime.datetime.now(UK)   # v7.3: once a day (first run of 04:00-04:09 UK) at the 8-min cadence
+            if (_now_uk.hour == PRUNE_HOUR_UK and _now_uk.minute < 10) or _TREE_NODES_SEEN > PRUNE_TRIGGER_NODES or '--prune' in sys.argv:
+                pj = prune_settled_nodes(dry)
+                print(f"fast-path hygiene: {pj['checked']} item-id node(s) checked | {pj['removed']} {'would be ' if dry else ''}removed (label has taken over) | "
+                      f"{pj['kept']} kept | biggest tree {_TREE_NODES_SEEN} nodes" + (f" | !! {pj['err']}" if pj['err'] else ""))
+            print(f"janitor: {js['nodes_swept']} stray Winners node(s) swept | "
+                  f"{js['drafts_stripped']} draft w_campaign strip(s)"
+                  + (f" | !! {js['err']}" if js['err'] else ""))
 
-        # WINNER PACE RULE (v11): judge the Winners campaign at 2.8-pace
-        w = winner_pace_run(run_date, dry, life_sales, shared=(ch.get('spend_pids') or set(), ch.get('spend')),
-                            skip=ch.get('skip_pace'), exclude=ch.get('pace_exclude'))
-        print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
-              f"{len(w['flagged'])} over allowance | killed {w['killed']} | "
-              f"{'LIVE' if w['live'] else ('DRY' if dry else 'dormant -> live ' + WINNER_KILL_START.isoformat())}"
-              + (f" | !! {w['err']}" if w['err'] else ""))
-        for r in w['closest']:
-            print(f"  pace watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
+            # WINNER PACE RULE (v11): judge the Winners campaign at 2.8-pace
+            w = winner_pace_run(run_date, dry, life_sales, shared=(ch.get('spend_pids') or set(), ch.get('spend')),
+                                skip=ch.get('skip_pace'), exclude=ch.get('pace_exclude'))
+            print(f"winner pace ({WINNER_PACE_ROAS}): {w['evaluated']} evaluated | "
+                  f"{len(w['flagged'])} over allowance | killed {w['killed']} | "
+                  f"{'LIVE' if w['live'] else ('DRY' if dry else 'dormant -> live ' + WINNER_KILL_START.isoformat())}"
+                  + (f" | !! {w['err']}" if w['err'] else ""))
+            for r in w['closest']:
+                print(f"  pace watch {r['pct']:.0f}%: {r['pid']} spent £{r['spent']:.2f} of £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
 
-        # LAST CHANCE rule (owner 2026-08-13): graduate/exit the lc pool
-        lc = lc_run(run_date, dry, life_sales)
-        print(f"last chance: pool {lc['pool']} | graduated {len(lc['graduated'])} | "
-              f"drafted {len(lc['drafted'])}" + (f" | !! {lc['err']}" if lc['err'] else ""))
+            # LAST CHANCE rule (owner 2026-08-13): graduate/exit the lc pool
+            lc = lc_run(run_date, dry, life_sales)
+            print(f"last chance: pool {lc['pool']} | graduated {len(lc['graduated'])} | "
+                  f"drafted {len(lc['drafted'])}" + (f" | !! {lc['err']}" if lc['err'] else ""))
 
-        # FEED LABEL SYNC GUARD (v7.6): once an hour, re-send any product whose label Google has not taken after 2 h
-        try:
-            ls = label_sync_check(feed, dry, force=('--labels' in sys.argv))
-        except Exception as _lx:
-            ls = dict(checked=0, syncing=[], waiting=[], resent=[], stuck_long=[], label_wrong=[], cleaned=0, err=str(_lx)[:120])
-        if ls is not None:
-            print(f"feed labels: {ls['checked']} checked | {len(ls['syncing'])} syncing (< {LABEL_STUCK_H:g} h) | {len(ls['resent'])} "
-                  f"{'would be ' if dry else ''}re-sent | {len(ls['waiting'])} re-sent earlier, waiting | {len(ls['label_wrong'])} Shopify label != tags"
-                  + (f" | cleaned {ls['cleaned']}" if ls['cleaned'] else "") + (f" | !! {ls['err']}" if ls['err'] else ""))
-            for r in ls['resent'] + ls['waiting'] + ls['label_wrong']:
-                kind = 're-send' if r in ls['resent'] else ('waiting' if r in ls['waiting'] else 'LABEL != TAGS')
-                print(f"  label {kind} {r['pid']} should be {r['want']} | {r['wrong']}/{r['offers']} offers wrong at Google | "
-                      f"label written {(r['label_age'] or 0):.1f} h ago | {r['name'][:40]}")
+            # FEED LABEL SYNC GUARD (v7.6): once an hour, re-send any product whose label Google has not taken after 2 h
+            try:
+                ls = label_sync_check(feed, dry, force=('--labels' in sys.argv))
+            except Exception as _lx:
+                ls = dict(checked=0, syncing=[], waiting=[], resent=[], stuck_long=[], label_wrong=[], cleaned=0, err=str(_lx)[:120])
+            if ls is not None:
+                print(f"feed labels: {ls['checked']} checked | {len(ls['syncing'])} syncing (< {LABEL_STUCK_H:g} h) | {len(ls['resent'])} "
+                      f"{'would be ' if dry else ''}re-sent | {len(ls['waiting'])} re-sent earlier, waiting | {len(ls['label_wrong'])} Shopify label != tags"
+                      + (f" | cleaned {ls['cleaned']}" if ls['cleaned'] else "") + (f" | !! {ls['err']}" if ls['err'] else ""))
+                for r in ls['resent'] + ls['waiting'] + ls['label_wrong']:
+                    kind = 're-send' if r in ls['resent'] else ('waiting' if r in ls['waiting'] else 'LABEL != TAGS')
+                    print(f"  label {kind} {r['pid']} should be {r['want']} | {r['wrong']}/{r['offers']} offers wrong at Google | "
+                          f"label written {(r['label_age'] or 0):.1f} h ago | {r['name'][:40]}")
 
         # TESTING KILLS (owner 2026-10-27): the v4 rules unchanged, but judged ONCE A WEEK (Monday 03:00-05:59 UK, every run in
         # that window), so a product gets a full week of data between moves. Every other run only applies the DAILY SAFETY
@@ -2434,7 +2452,7 @@ def main():
                   + (f" | !! {w['trial_err']}" if w.get('trial_err') else ''))
         kills = []
         for p in feed:
-            if WINNER_TAG in p['tags'] or LC_TAG in p['tags']:
+            if (WINNER_TAG in p['tags']) if oc else (WINNER_TAG in p['tags'] or LC_TAG in p['tags']):   # one-campaign: Last Chance products are judged by the testing rules
                 continue                      # winners + last-chance: their own rules — never killed here
             if life_sales is None and not p.get('ever_sold'):
                 continue                      # review 2026-10-27: lifetime pull failed -> "never sold" is unknown: no no-sale kill this run
@@ -2486,85 +2504,89 @@ def main():
             if len(to_draft) > DETAIL:
                 tg += f"\n\n…+{len(to_draft)-DETAIL} more — full reasons &amp; metrics in the attached Excel."
 
-        # WINNERS pace section — one status line every run + detail per kill/preview
-        tg += (f"\n\n🩹 <b>Last Chance</b>: pool {lc['pool']} | ⬆ {len(lc['graduated'])} back to Winners | "
-               f"🪦 {len(lc['drafted'])} drafted" + (f" | ⚠ {html.escape(lc['err'])}" if lc['err'] else ""))   # v7.7.1: escaped
-        for g in lc['graduated'][:5]:
-            tg += f"\n  ⬆ <code>{g['pid']}</code> {html.escape(g['name'][:40])}"
-        for g in lc['drafted'][:5]:
-            tg += f"\n  🪦 <code>{g['pid']}</code> {html.escape(g['name'][:40])}"
-        tg += (f"\n\n🎯 <b>Winners pace {WINNER_PACE_ROAS}</b>: {w['evaluated']} checked, "
-               f"{len(w['flagged'])} over allowance"
-               + ("" if w['live'] else (" (DRY)" if dry else f" — dormant, live {WINNER_KILL_START.strftime('%d %b')}")))
-        for r in w['flagged'][:8]:
-            tg += (f"\n🔻 <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
-                   f"   spent £{r['spent']:.2f} &gt; allowance £{r['allow']:.2f} ({html.escape(r['opened'])})"
-                   + (f" → {html.escape(str(r.get('outcome', '')))}" if w['live'] else " → would kill"))
-        if len(w['flagged']) > 8:
-            tg += f"\n   …+{len(w['flagged']) - 8} more — see winner_kills_log.csv"
-        if w['err']:
-            tg += f"\n⚠️ {html.escape(w['err'])}"
-
-        # CHAMPIONS section — roster + every move, every run (single line while disabled)
-        if not CHAMPIONS_ENABLED:
-            tg += "\n\n👑 Champions: merged into Winners (owner 2026-10-27, campaign paused)"
+        if oc:
+            tg += (f"\n\n📌 One campaign: new account {NEW_CUSTOMER_ID} (USD). Spend converted at 1 USD = £{usd_to_gbp():.4f}; "
+                   f"old-account testing spend still counts in the 30-day windows. Winners stay exempt.")
         else:
-            ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
-                      - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY') or x.get('moved')))
-            tg += (f"\n\n👑 <b>Proven (Champions; in at last-4 ROAS {CHAMPION_LINE}+, out under {CHAMPION_EXIT_LINE} or own BE)</b>: "
-                   f"roster {ch_now} | promoted {len(ch['promoted'])} | demoted {len(ch['demoted'])}")
-        for x in ch['promoted'][:10]:
-            tg += (f"\n⬆️ <b>{html.escape(x['name'][:42])}</b> <code>{x['pid']}</code> — "
-                   f"{x['orders']} lifetime orders{' (re-promoted)' if x['re'] else ''}"
-                   + (f" → {html.escape(str(x['outcome']))}" if x['outcome'] not in ('ok', 'DRY') else ''))
-        for r in ch['demoted'][:10]:
-            tg += (f"\n⬇️ <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
-                   f"   spent £{r['spent']:.2f} &gt; allowance £{r['allow']:.2f} "
-                   f"({html.escape(r['opened'])}) → "
-                   + ("back to Rising" if (r.get('outcome') in ('ok', 'DRY') or r.get('moved'))
-                      else f"NOT moved: {html.escape(str(r.get('outcome'))[:120])}"))   # cut BEFORE escaping (never split an entity)
-        for r in ch['watch'][:3]:
-            tg += (f"\n👀 champion watch {r['pct']:.0f}%: <code>{r['pid']}</code> "
-                   f"£{r['spent']:.2f} of £{r['allow']:.2f}")
-        if ch['err']:
-            tg += f"\n⚠️ {html.escape(ch['err'])}"
-        if ch.get('warn'):
-            tg += f"\n⚠️ {html.escape(ch['warn'])}"
-        if he is not None:
-            t_ = he.get('trees') or {}
-            tg += (f"\n\n🦸 <b>Hero (own budget; back to Champions when spend since last sale &gt; price/{HERO_PACE_ROAS:g})</b>: "
-                   f"roster {he['roster']} | back to Champions {sum(1 for r in he['exits'] if _hero_ok(r.get('outcome')))}"
-                   + (f" | campaign {html.escape(str(t_.get('status')))}" if t_.get('status') not in (None, 'ENABLED') else ''))
-            for r in he['exits'][:8]:
+            # WINNERS pace section — one status line every run + detail per kill/preview
+            tg += (f"\n\n🩹 <b>Last Chance</b>: pool {lc['pool']} | ⬆ {len(lc['graduated'])} back to Winners | "
+                   f"🪦 {len(lc['drafted'])} drafted" + (f" | ⚠ {html.escape(lc['err'])}" if lc['err'] else ""))   # v7.7.1: escaped
+            for g in lc['graduated'][:5]:
+                tg += f"\n  ⬆ <code>{g['pid']}</code> {html.escape(g['name'][:40])}"
+            for g in lc['drafted'][:5]:
+                tg += f"\n  🪦 <code>{g['pid']}</code> {html.escape(g['name'][:40])}"
+            tg += (f"\n\n🎯 <b>Winners pace {WINNER_PACE_ROAS}</b>: {w['evaluated']} checked, "
+                   f"{len(w['flagged'])} over allowance"
+                   + ("" if w['live'] else (" (DRY)" if dry else f" — dormant, live {WINNER_KILL_START.strftime('%d %b')}")))
+            for r in w['flagged'][:8]:
+                tg += (f"\n🔻 <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
+                       f"   spent £{r['spent']:.2f} &gt; allowance £{r['allow']:.2f} ({html.escape(r['opened'])})"
+                       + (f" → {html.escape(str(r.get('outcome', '')))}" if w['live'] else " → would kill"))
+            if len(w['flagged']) > 8:
+                tg += f"\n   …+{len(w['flagged']) - 8} more — see winner_kills_log.csv"
+            if w['err']:
+                tg += f"\n⚠️ {html.escape(w['err'])}"
+
+            # CHAMPIONS section — roster + every move, every run (single line while disabled)
+            if not CHAMPIONS_ENABLED:
+                tg += "\n\n👑 Champions: merged into Winners (owner 2026-10-27, campaign paused)"
+            else:
+                ch_now = (ch['roster'] + sum(1 for x in ch['promoted'] if x['outcome'] in ('ok', 'DRY'))
+                          - sum(1 for x in ch['demoted'] if x.get('outcome') in ('ok', 'DRY') or x.get('moved')))
+                tg += (f"\n\n👑 <b>Proven (Champions; in at last-4 ROAS {CHAMPION_LINE}+, out under {CHAMPION_EXIT_LINE} or own BE)</b>: "
+                       f"roster {ch_now} | promoted {len(ch['promoted'])} | demoted {len(ch['demoted'])}")
+            for x in ch['promoted'][:10]:
+                tg += (f"\n⬆️ <b>{html.escape(x['name'][:42])}</b> <code>{x['pid']}</code> — "
+                       f"{x['orders']} lifetime orders{' (re-promoted)' if x['re'] else ''}"
+                       + (f" → {html.escape(str(x['outcome']))}" if x['outcome'] not in ('ok', 'DRY') else ''))
+            for r in ch['demoted'][:10]:
                 tg += (f"\n⬇️ <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
-                       f"   spent £{r['spent']:.2f} &gt; £{r['allow']:.2f} ({html.escape(r['opened'])}) → "
-                       + ("back to Champions" if _hero_ok(r.get('outcome'))
-                          else f"NOT moved: {html.escape(str(r.get('outcome'))[:120])}"))
-            for r in he['cleaned'][:5]:
-                tg += (f"\n  ↩ left Hero: <code>{r['pid']}</code> {html.escape(r['name'][:40])} ({html.escape(r['why'])})"
-                       + ("" if _hero_ok(r.get('outcome')) else f" → NOT moved: {html.escape(str(r.get('outcome'))[:80])}"))
-            for r in he['watch'][:3]:
-                tg += f"\n👀 hero watch {r['pct']:.0f}%: <code>{r['pid']}</code> £{r['spent']:.2f} of £{r['allow']:.2f}"
-            if t_.get('paused') or t_.get('would_pause'):
-                tg += ("\n⏸ Hero roster empty → campaign " + ("PAUSED" if t_.get('paused') else "would be paused (dry)")
-                       + " (re-enable by hand when new Heroes are added)")
-            for _w in (he.get('warn'), t_.get('warn')):
-                if _w: tg += f"\n⚠️ {html.escape(_w)}"
-            if he['err']:
-                tg += f"\n⚠️ {html.escape(he['err'])}"
-            if t_.get('err'):
-                tg += f"\n⚠️ {html.escape(t_['err'])}"
-        if ls is not None and (ls['resent'] or ls['stuck_long'] or ls['label_wrong'] or ls['err']):
-            tg += (f"\n\n🏷 <b>Feed labels</b>: {len(ls['resent'])} re-sent to Google | {len(ls['waiting'])} waiting | "
-                   f"{len(ls['syncing'])} still syncing (&lt; {LABEL_STUCK_H:g} h)")
-            for r in ls['resent'][:8]:
-                tg += f"\n  ↻ <code>{r['pid']}</code> {html.escape(r['name'][:40])} - Google still not {r['want']} after {r['label_age']:.0f} h"
-            for r in ls['stuck_long'][:5]:
-                tg += f"\n  ⚠️ stuck {r['label_age']:.0f} h: <code>{r['pid']}</code> {html.escape(r['name'][:40])}"
-            for r in ls['label_wrong'][:5]:
-                tg += f"\n  ⚠️ Shopify label disagrees with its tags: <code>{r['pid']}</code> {html.escape(r['name'][:40])}"
-            if ls['err']:
-                tg += f"\n⚠️ {html.escape(ls['err'])}"
+                       f"   spent £{r['spent']:.2f} &gt; allowance £{r['allow']:.2f} "
+                       f"({html.escape(r['opened'])}) → "
+                       + ("back to Rising" if (r.get('outcome') in ('ok', 'DRY') or r.get('moved'))
+                          else f"NOT moved: {html.escape(str(r.get('outcome'))[:120])}"))   # cut BEFORE escaping (never split an entity)
+            for r in ch['watch'][:3]:
+                tg += (f"\n👀 champion watch {r['pct']:.0f}%: <code>{r['pid']}</code> "
+                       f"£{r['spent']:.2f} of £{r['allow']:.2f}")
+            if ch['err']:
+                tg += f"\n⚠️ {html.escape(ch['err'])}"
+            if ch.get('warn'):
+                tg += f"\n⚠️ {html.escape(ch['warn'])}"
+            if he is not None:
+                t_ = he.get('trees') or {}
+                tg += (f"\n\n🦸 <b>Hero (own budget; back to Champions when spend since last sale &gt; price/{HERO_PACE_ROAS:g})</b>: "
+                       f"roster {he['roster']} | back to Champions {sum(1 for r in he['exits'] if _hero_ok(r.get('outcome')))}"
+                       + (f" | campaign {html.escape(str(t_.get('status')))}" if t_.get('status') not in (None, 'ENABLED') else ''))
+                for r in he['exits'][:8]:
+                    tg += (f"\n⬇️ <b>{html.escape(r['name'][:42])}</b> <code>{r['pid']}</code>\n"
+                           f"   spent £{r['spent']:.2f} &gt; £{r['allow']:.2f} ({html.escape(r['opened'])}) → "
+                           + ("back to Champions" if _hero_ok(r.get('outcome'))
+                              else f"NOT moved: {html.escape(str(r.get('outcome'))[:120])}"))
+                for r in he['cleaned'][:5]:
+                    tg += (f"\n  ↩ left Hero: <code>{r['pid']}</code> {html.escape(r['name'][:40])} ({html.escape(r['why'])})"
+                           + ("" if _hero_ok(r.get('outcome')) else f" → NOT moved: {html.escape(str(r.get('outcome'))[:80])}"))
+                for r in he['watch'][:3]:
+                    tg += f"\n👀 hero watch {r['pct']:.0f}%: <code>{r['pid']}</code> £{r['spent']:.2f} of £{r['allow']:.2f}"
+                if t_.get('paused') or t_.get('would_pause'):
+                    tg += ("\n⏸ Hero roster empty → campaign " + ("PAUSED" if t_.get('paused') else "would be paused (dry)")
+                           + " (re-enable by hand when new Heroes are added)")
+                for _w in (he.get('warn'), t_.get('warn')):
+                    if _w: tg += f"\n⚠️ {html.escape(_w)}"
+                if he['err']:
+                    tg += f"\n⚠️ {html.escape(he['err'])}"
+                if t_.get('err'):
+                    tg += f"\n⚠️ {html.escape(t_['err'])}"
+            if ls is not None and (ls['resent'] or ls['stuck_long'] or ls['label_wrong'] or ls['err']):
+                tg += (f"\n\n🏷 <b>Feed labels</b>: {len(ls['resent'])} re-sent to Google | {len(ls['waiting'])} waiting | "
+                       f"{len(ls['syncing'])} still syncing (&lt; {LABEL_STUCK_H:g} h)")
+                for r in ls['resent'][:8]:
+                    tg += f"\n  ↻ <code>{r['pid']}</code> {html.escape(r['name'][:40])} - Google still not {r['want']} after {r['label_age']:.0f} h"
+                for r in ls['stuck_long'][:5]:
+                    tg += f"\n  ⚠️ stuck {r['label_age']:.0f} h: <code>{r['pid']}</code> {html.escape(r['name'][:40])}"
+                for r in ls['label_wrong'][:5]:
+                    tg += f"\n  ⚠️ Shopify label disagrees with its tags: <code>{r['pid']}</code> {html.escape(r['name'][:40])}"
+                if ls['err']:
+                    tg += f"\n⚠️ {html.escape(ls['err'])}"
         if bs_added:
             tg += f"\n🛍️ Best Sellers collection: +{bs_added} winner(s) added"
         if bs_err:
