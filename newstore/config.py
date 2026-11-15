@@ -107,5 +107,8 @@ CAPS = {
 DAILY_GOOGLE_OPS_BUDGET = int(_env('DAILY_GOOGLE_OPS_BUDGET', '600'))
 SPEND_LOOKBACK_D = 400               # how far back spend is read (covers any Winners/LC anchor; 778 started 2026-11-01)
 
+# ---- per-run Telegram report (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID, same as the old engine); NS_TELEGRAM=0 = off --
+TELEGRAM = _env('TELEGRAM', '1') == '1'
+
 # ---- writes are OFF unless both are set (the branch ships dry) ----------------------------------------------------
 LIVE = _env('LIVE', '0') == '1'

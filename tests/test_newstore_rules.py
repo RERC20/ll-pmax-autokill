@@ -374,3 +374,51 @@ class Config(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Telegram(unittest.TestCase):
+    REPORT = {'run_date': '2026-11-15', 'live': True, 'account': '7783704709', 'google_ops_this_run': 3,
+              'spend': {'usd_total': 0.0, 'fx_latest': 0.756}, 'roles': {'testing': 4652, 'winner': 2, 'last_chance': 0},
+              'rules': {r: {'action': rules.ACTION[r], 'count': 0, 'blocked_by_cap': False, 'examples': []} for r in rules.RULES},
+              'writes': {}}
+
+    def test_summary_lists_counts_and_writes(self):
+        from newstore import notify
+        rep = json_copy(self.REPORT)
+        rep['rules']['first_sale'].update(count=1, examples=[{'handle': 'nell-blazer', 'pid': '1', 'reason': 'x'}])
+        rep['writes'] = {'1': 'ok'}
+        text = notify.summary(rep)
+        self.assertIn('LIVE', text)
+        self.assertIn('first_sale (tag_winner): 1', text)
+        self.assertIn('nell-blazer', text)
+        self.assertIn('Writes: 1 ok, 0 failed', text)
+
+    def test_quiet_run_says_nothing_to_do(self):
+        from newstore import notify
+        self.assertIn('Nothing to do this run.', notify.summary(json_copy(self.REPORT)))
+
+    def test_long_message_is_split_under_limit(self):
+        from newstore import notify
+        ps = notify.parts('\n'.join('x' * 100 for _ in range(100)))
+        self.assertTrue(len(ps) > 1 and all(len(p) <= notify.LIMIT for p in ps))
+
+    def test_send_never_raises_or_prints_token(self):
+        import io, contextlib
+        from newstore import notify
+        creds = {'TELEGRAM_BOT_TOKEN': 'SECRET123', 'TELEGRAM_CHAT_ID': '42'}
+
+        def boom(url, **kw):
+            raise ConnectionError(f'cannot reach {url}')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertFalse(notify.send(creds.get, 'hi', post=boom))
+        self.assertNotIn('SECRET123', out.getvalue())
+
+    def test_send_skips_without_config(self):
+        from newstore import notify
+        self.assertFalse(notify.send(lambda k: '', 'hi'))
+
+
+def json_copy(d):
+    import json
+    return json.loads(json.dumps(d))

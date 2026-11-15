@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from creds import cred                                    # noqa: E402  (env first, then _secrets_local.py)
 
-from . import actions, config as C, data, rules           # noqa: E402
+from . import actions, config as C, data, notify, rules   # noqa: E402
 
 EXAMPLES = 10
 
@@ -85,10 +85,19 @@ def main(argv=None):
     ap.add_argument('--live', action='store_true', help='write (also needs NS_LIVE=1)')
     ap.add_argument('--run-date')
     ap.add_argument('--json')
+    ap.add_argument('--no-telegram', action='store_true', help='do not send the Telegram run report')
     a = ap.parse_args(argv)
     if a.live and not C.LIVE:
         print('--live given but NS_LIVE is not 1: running DRY')
-    run(datetime.date.fromisoformat(a.run_date) if a.run_date else None, a.live, a.json)
+    tg = C.TELEGRAM and not a.no_telegram
+    try:
+        report = run(datetime.date.fromisoformat(a.run_date) if a.run_date else None, a.live, a.json)
+    except Exception as ex:
+        if tg:
+            notify.send(cred, notify.failure(ex))
+        raise
+    if tg:
+        notify.send(cred, notify.summary(report))
 
 
 if __name__ == '__main__':
