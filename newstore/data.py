@@ -73,6 +73,23 @@ def is_excluded_order(o):
     return bool(o.get('test')) or bool(o.get('cancelledAt')) or bool(tags & {'test-order', 'test_order', 'test'})
 
 
+def credit_reason(o):
+    """Why this order is a store-credit order that must not count (config: CREDIT_* / MIN_REVENUE_SHARE), else None.
+    Orders without list-price data (older dicts) are never filtered here."""
+    lst, sub = o.get('list_total'), o.get('subtotal')
+    if not lst or lst <= 0 or sub is None:
+        return None
+    share = sub / lst                                             # product revenue after discounts / list price
+    codes = [str(c).upper() for c in (o.get('discount_codes') or [])]
+    titles = [str(t).lower() for t in (o.get('discount_titles') or [])]
+    credit = any(c.startswith(C.CREDIT_CODE_PREFIX) for c in codes) or any(t.startswith(C.CREDIT_TITLE_PREFIX) for t in titles)
+    if credit and (1 - share) >= C.CREDIT_MAIN_SHARE:
+        return f'store credit covered {1 - share:.0%} of list price'
+    if share < C.MIN_REVENUE_SHARE:
+        return f'product revenue {share:.0%} of list price (< {C.MIN_REVENUE_SHARE:.0%})'
+    return None
+
+
 def is_old_store_copy(o):
     return any(str(t).lower().startswith(C.OLD_ORDER_TAG) for t in (o.get('tags') or []))
 
@@ -85,13 +102,16 @@ def sales_by_product(orders, cutover=None):
     """{pid: [UK date of processedAt, one per order]} - NEW-SETUP sales only (owner 2026-11-15 19:16): processed at or
     after `cutover` (default config.CUTOVER) and never a copy of an old-store order (tag old-order / old-order-#...).
     processedAt, not createdAt. Cancelled and test orders never count. A line that brought in GBP 0 (exchange /
-    replacement / 100% discount) is not a sale. cutover=False switches the new-setup filter off (tests only)."""
+    replacement / 100% discount) is not a sale. Store-credit orders (credit_reason) never count.
+    cutover=False switches the new-setup filter off (tests only)."""
     cut = None if cutover is False else _ts(cutover or C.CUTOVER)
     out = collections.defaultdict(set)
     for o in orders:
         if is_excluded_order(o):
             continue
         if cut is not None and (is_old_store_copy(o) or _ts(o['processedAt']) < cut):
+            continue
+        if credit_reason(o):                                      # store-credit orders are not sales (owner 2026-11-16)
             continue
         day = _ts(o['processedAt']).astimezone(UK).date()
         lines = [li for li in o['lineItems'] if li.get('pid')]
@@ -259,8 +279,11 @@ def fetch_products(shop):
 def fetch_orders(shop, since='2026-11-13'):
     """Orders PROCESSED since `since` (a day before the cutover; sales_by_product applies the exact cutover)."""
     Q = ('query($c:String,$q:String!){orders(first:250,after:$c,query:$q,sortKey:PROCESSED_AT){pageInfo{hasNextPage endCursor} '
-         'nodes{id name processedAt createdAt cancelledAt test tags subtotalPriceSet{shopMoney{amount}} '
-         'lineItems(first:100){nodes{product{legacyResourceId} discountedTotalSet{shopMoney{amount}}}}}}}')
+         'nodes{id name processedAt createdAt cancelledAt test tags discountCodes subtotalPriceSet{shopMoney{amount}} '
+         'discountApplications(first:20){nodes{... on DiscountCodeApplication{code} ... on ManualDiscountApplication{title} '
+         '... on AutomaticDiscountApplication{title} ... on ScriptDiscountApplication{title}}} '
+         'lineItems(first:100){nodes{product{legacyResourceId} quantity originalUnitPriceSet{shopMoney{amount}} '
+         'discountedTotalSet{shopMoney{amount}}}}}}}')
     out, cur = [], None
     while True:
         d = shop.read(Q, {'c': cur, 'q': f'processed_at:>={since}'})['orders']
@@ -269,6 +292,10 @@ def fetch_orders(shop, since='2026-11-13'):
             out.append({'id': o['id'], 'name': o['name'], 'processedAt': o['processedAt'], 'createdAt': o['createdAt'],
                         'cancelledAt': o['cancelledAt'], 'test': o['test'], 'tags': o['tags'],
                         'subtotal': float(sub) if sub is not None else None,
+                        'discount_codes': o.get('discountCodes') or [],
+                        'discount_titles': [a.get('title') or a.get('code') or '' for a in (o.get('discountApplications') or {}).get('nodes', [])],
+                        'list_total': sum(float(li['originalUnitPriceSet']['shopMoney']['amount']) * int(li['quantity'] or 0)
+                                          for li in o['lineItems']['nodes']),
                         'lineItems': [{'pid': (li.get('product') or {}).get('legacyResourceId') and str(li['product']['legacyResourceId']),
                                        'amount': float(li['discountedTotalSet']['shopMoney']['amount'])}
                                       for li in o['lineItems']['nodes']]})

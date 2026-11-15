@@ -422,3 +422,55 @@ class Telegram(unittest.TestCase):
 def json_copy(d):
     import json
     return json.loads(json.dumps(d))
+
+
+class StoreCredit(unittest.TestCase):
+    """Owner 2026-11-16: orders paid wholly/mainly with store credit never count as sales (any rule)."""
+
+    def credit_order(self, sub, lst=49.95, codes=('CREDIT-9E5PZTR2WJ',), titles=(), pid='8118990405693', when='2026-11-15T16:35:11Z'):
+        return order('c', when, lines=((pid, lst),), subtotal=sub, discount_codes=list(codes), discount_titles=list(titles),
+                     list_total=lst)
+
+    def test_llx4311_store_credit_order_is_ignored(self):           # GBP 0.49 of a GBP 49.95 coat, CREDIT- code
+        o = self.credit_order(0.49)
+        self.assertIn('store credit', data.credit_reason(o))
+        self.assertEqual(data.sales_by_product([o]), {})
+
+    def test_credit_covering_exactly_half_is_ignored(self):
+        self.assertIsNotNone(data.credit_reason(self.credit_order(25.0, lst=50.0)))
+
+    def test_small_credit_on_a_real_purchase_counts(self):           # credit covered 40% -> a real sale
+        o = self.credit_order(30.0, lst=50.0)
+        self.assertIsNone(data.credit_reason(o))
+        self.assertEqual(len(data.sales_by_product([o])['8118990405693']), 1)
+
+    def test_store_credit_title_without_code_prefix(self):
+        o = self.credit_order(5.0, lst=50.0, codes=('XMAS',), titles=('Store credit #LLX4300',))
+        self.assertIn('store credit', data.credit_reason(o))
+
+    def test_revenue_under_20pct_ignored_whatever_the_discount_name(self):
+        self.assertIn('< 20%', data.credit_reason(self.credit_order(9.0, lst=50.0, codes=('VIP90',))))
+        self.assertIsNone(data.credit_reason(self.credit_order(10.0, lst=50.0, codes=('VIP80',))))    # exactly 20% counts
+
+    def test_normal_discount_code_counts(self):
+        self.assertIsNone(data.credit_reason(self.credit_order(40.0, lst=50.0, codes=('WELCOME20',))))
+
+    def test_credit_order_cannot_make_a_winner_or_rescue_last_chance(self):
+        o = self.credit_order(0.49, when='2026-11-18T10:00:00Z')
+        sales = data.sales_by_product([o])
+        tester = P(['has_sales'], pid='8118990405693')
+        lc = P([C.LC_TAG, C.LC_STAMP + '2026-11-16'], pid='8118990405693')
+        self.assertEqual(rules.evaluate([tester], sales, {}, {}, RUN), [])
+        self.assertEqual(rules.evaluate([lc], sales, {}, {}, RUN), [])
+
+    def test_credit_order_does_not_reset_the_winner_clock(self):
+        C.WINNERS_LAUNCH_DATE = '2026-09-01'
+        try:
+            real = order('r', '2026-11-14T14:00:00Z', lines=(('5', 40.0),), list_total=40.0)
+            cred = self.credit_order(0.4, lst=40.0, pid='5', when='2026-12-10T10:00:00Z')
+            sales = data.sales_by_product([real, cred])
+            self.assertEqual(sales['5'], [D(2026, 11, 14)])
+            d = rules.evaluate([P([C.WINNER_TAG], pid='5')], sales, {}, {}, D(2026, 12, 14))[0]
+            self.assertEqual(d.rule, 'zombie')
+        finally:
+            C.WINNERS_LAUNCH_DATE = ''

@@ -8,7 +8,8 @@
 #                    c. else spend in the (up to) 30 days since its last sale >= price / 2 (no sale since) -> lc_campaign
 #   4 ZOMBIE       Winner with no new sale for 30 days since the LATER of its last sale / Winners entry and the day the
 #                  Winners campaign was first enabled (config.WINNERS_LAUNCH_DATE; empty = never = no zombie moves).
-# Every rule sees NEW-SETUP sales only (data.sales_by_product: processed >= cutover, no old-order copies). Products
+# Every rule sees NEW-SETUP sales only (data.sales_by_product: processed >= cutover, no old-order copies, no
+# store-credit orders - see config CREDIT_* / MIN_REVENUE_SHARE). Products
 # tagged was_w_campaign / was_lc_campaign are ordinary Testing products (history tags, never read here).
 #   5 LAST CHANCE  a new sale (after the lc: stamp) -> back to w_campaign;
 #                  spend since entry > min(price / 2, GBP 20) with no sale -> draft.

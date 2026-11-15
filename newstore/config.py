@@ -79,6 +79,19 @@ WINNERS_ANCHOR_FALLBACK = datetime.date.fromisoformat(_env('WINNERS_ANCHOR_FALLB
 LC_ANCHOR_FALLBACK = datetime.date.fromisoformat(_env('LC_ANCHOR_FALLBACK', '2026-11-14'))
 WAS_TAGS = ('was_w_campaign', 'was_lc_campaign')   # history only - never read by the rules
 
+# ---- store-credit orders are NOT sales (owner 2026-11-16 00:25) -----------------------------------------------------
+# The support desk issues credit as discount codes "CREDIT-XXXXXXXXXX" titled "Store credit #<order>". An order is
+# ignored by EVERY rule when either:
+#   (a) it used a store-credit code/title AND the discounts covered >= CREDIT_MAIN_SHARE of its list price
+#       ("paid wholly or mainly with store credit"), or
+#   (b) its product revenue after all discounts is < MIN_REVENUE_SHARE of its list price (any name - catches credits
+#       given another way, e.g. a manual discount).
+# list price = sum of the lines' original prices x quantity; product revenue = order subtotal after discounts.
+CREDIT_CODE_PREFIX = 'CREDIT-'
+CREDIT_TITLE_PREFIX = 'store credit'
+CREDIT_MAIN_SHARE = float(_env('CREDIT_MAIN_SHARE', '0.5'))
+MIN_REVENUE_SHARE = float(_env('MIN_REVENUE_SHARE', '0.2'))
+
 # ---- the owner's confirmed rules (2026-11-15) ----------------------------------------------------------------------
 NEVER_SOLD_PRICE_DIV = 7.0           # rule 2: spend > min(price / 7, GBP 5) ...
 NEVER_SOLD_CAP_GBP = 5.0

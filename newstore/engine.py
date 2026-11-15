@@ -44,8 +44,11 @@ def run(run_date=None, live=False, json_out=None, fx_raw=None):
     n_sales = sum(len(v) for v in sales.values())
     excl = sum(1 for o in orders if data.is_excluded_order(o))
     copies = sum(1 for o in orders if data.is_old_store_copy(o))
+    credit = [(o['name'], data.credit_reason(o)) for o in orders if not data.is_old_store_copy(o) and data.credit_reason(o)]
     print(f"   shopify: {len(products)} active products | {len(orders)} orders processed since 13 Nov "
-          f"({excl} cancelled/test, {copies} old-store copies - ignored) | NEW-setup sales: {n_sales} on {len(sales)} products")
+          f"({excl} cancelled/test, {copies} old-store copies, {len(credit)} store-credit - ignored) | NEW-setup sales: {n_sales} on {len(sales)} products")
+    for name, why in credit:
+        print(f"   store-credit order ignored: {name} ({why})")
     if not products or not orders:
         raise RuntimeError('products or orders pull returned 0 - data glitch, nothing judged')
     roles = {r: sum(1 for p in products if rules.role(p) == r) for r in ('testing', 'winner', 'last_chance')}
