@@ -21,8 +21,12 @@ STORE_TIMEZONE = 'Europe/London'                                     # every rul
 # ---- campaigns (week 1: only Testing exists) -----------------------------------------------------------------------
 TESTING_CAMPAIGN_ID = _env('TESTING_CAMPAIGN_ID', '24425197606')    # PMax | Testing | UK
 TESTING_AG_ID = _env('TESTING_AG_ID', '6767707734')
-# Empty = that campaign does not exist yet. While Winners/Last Chance are empty the engine ONLY writes tags, the
-# custom_label_1 metafield and drafts - it never moves items between campaigns through listing trees.
+# Empty = that campaign does not exist yet (set on Railway: Winners 24467845823 / AG 6773604242, Last Chance
+# 24467846096 / AG 6773605874, created PAUSED 2026-11-15). Their spend counts in the rules once set.
+# ROUTING never uses listing-tree item moves: the engine writes the w_campaign / lc_campaign tag + the
+# mm-google-shopping.custom_label_1 metafield; the Google & YouTube feed carries the METAFIELD into custom_label_1
+# (verified 2026-11-15: 100% of 90k items match the metafields, cat_* labels exist only as metafields), and the
+# Winners / Last Chance listing filters select custom_label_1 = w_campaign / lc_campaign.
 WINNERS_CAMPAIGN_ID = _env('WINNERS_CAMPAIGN_ID', '')
 WINNERS_AG_ID = _env('WINNERS_AG_ID', '')
 LC_CAMPAIGN_ID = _env('LC_CAMPAIGN_ID', '')
@@ -35,8 +39,22 @@ def campaign_ids():
 
 
 def tree_moves_enabled():
-    """Listing-tree moves need BOTH the Winners and Last Chance campaign + asset group ids. Not built in this branch."""
-    return all((WINNERS_CAMPAIGN_ID, WINNERS_AG_ID, LC_CAMPAIGN_ID, LC_AG_ID))
+    """Always False: this engine routes by custom_label_1 (feed label), never by listing-tree item moves."""
+    return False
+
+
+# ---- the NEW setup (owner 2026-11-15 19:16) ------------------------------------------------------------------------
+# Only sales of the new setup count in EVERY rule: orders processed at/after CUTOVER that are not copies of old-store
+# orders (tag old-order / old-order-#...). The old w/lc tags were renamed to was_w_campaign / was_lc_campaign (history
+# only - those products are Testing products now), so Winners and Last Chance start empty and fill from new sales.
+CUTOVER = _env('CUTOVER', '2026-11-14T13:00:00+00:00')
+# Zombie clock (owner-safe default 2026-11-15): 30 days from the LATER of the last sale and the day the Winners campaign
+# was first enabled. Empty = Winners has never been enabled = no zombie moves. Set it (YYYY-MM-DD) on launch day.
+WINNERS_LAUNCH_DATE = _env('WINNERS_LAUNCH_DATE', '')
+
+
+def winners_launch():
+    return datetime.date.fromisoformat(WINNERS_LAUNCH_DATE) if WINNERS_LAUNCH_DATE else None
 
 
 # ---- schedule (owner 2026-11-15 18:43: every 30 minutes = 48 runs a day) ------------------------------------------
@@ -55,10 +73,11 @@ LABEL_NAMESPACE = 'mm-google-shopping'
 LABEL_KEY = 'custom_label_1'
 MENS_PAUSED_LABEL = 'mens_paused'   # custom_label_2 - excluded from Testing by the listing tree, not by the engine
 
-# Products with no w_since: stamp yet (earned their w_campaign tag on the old store) use their last sale; if they have
-# no sale on record either, this day (the store move) is their Winners anchor.
-WINNERS_ANCHOR_FALLBACK = datetime.date.fromisoformat(_env('WINNERS_ANCHOR_FALLBACK', '2026-11-13'))
-LC_ANCHOR_FALLBACK = datetime.date.fromisoformat(_env('LC_ANCHOR_FALLBACK', '2026-11-13'))
+# A Winner with neither a new sale nor a w_since: stamp (should not happen in the new setup) is anchored at the cutover
+# day; a Last Chance product without an lc: stamp likewise.
+WINNERS_ANCHOR_FALLBACK = datetime.date.fromisoformat(_env('WINNERS_ANCHOR_FALLBACK', '2026-11-14'))
+LC_ANCHOR_FALLBACK = datetime.date.fromisoformat(_env('LC_ANCHOR_FALLBACK', '2026-11-14'))
+WAS_TAGS = ('was_w_campaign', 'was_lc_campaign')   # history only - never read by the rules
 
 # ---- the owner's confirmed rules (2026-11-15) ----------------------------------------------------------------------
 NEVER_SOLD_PRICE_DIV = 7.0           # rule 2: spend > min(price / 7, GBP 5) ...

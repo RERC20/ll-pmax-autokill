@@ -113,9 +113,11 @@ class WeakSeller(unittest.TestCase):
         self.assertEqual(d.detail['window'], '14d')
 
     def test_since_sale_window_caps_at_30_days(self):
-        # spend 31+ days after the last sale is outside 3c (and the product is a zombie anyway)
-        d = ev(P(self.W, price=40), sales=[days_ago(35)], spend={days_ago(2): 0.0, days_ago(3): 0.0})
-        self.assertEqual(d.rule, 'zombie')
+        # sale 50 days ago: spend 35 days after it (15 days ago, outside the 7/14-day windows) is outside 3c ...
+        self.assertIsNone(ev(P(self.W, price=40), sales=[days_ago(50)], spend={days_ago(15): 30.0}))
+        # ... spend 25 days after it is inside 3c
+        d = ev(P(self.W, price=40), sales=[days_ago(50)], spend={days_ago(25): 20.0})
+        self.assertEqual((d.rule, d.detail['window']), ('weak_seller', 'since-anchor(<= 30d)'))
 
     def test_entry_stamp_is_the_anchor_when_later_than_sale(self):
         # back from Last Chance 3 days ago (w_since stamp) - old sale 40 days ago must not make it a zombie
@@ -134,6 +136,12 @@ class WeakSeller(unittest.TestCase):
 class Zombie(unittest.TestCase):
     W = [C.WINNER_TAG]
 
+    def setUp(self):
+        C.WINNERS_LAUNCH_DATE = '2026-09-01'                   # Winners enabled long ago: anchor = the last sale
+
+    def tearDown(self):
+        C.WINNERS_LAUNCH_DATE = ''
+
     def test_exactly_30_days_without_sale_moves(self):
         d = ev(P(self.W), sales=[days_ago(30)])
         self.assertEqual((d.rule, d.action, d.detail['days_without_sale']), ('zombie', 'to_last_chance', 30))
@@ -144,10 +152,26 @@ class Zombie(unittest.TestCase):
     def test_moves_with_zero_spend(self):
         self.assertEqual(ev(P(self.W), sales=[days_ago(45)], spend={}).rule, 'zombie')
 
-    def test_winner_without_any_sale_uses_store_move_day(self):
+    def test_winner_without_any_sale_uses_cutover_day(self):
         run = C.WINNERS_ANCHOR_FALLBACK + datetime.timedelta(days=30)
         self.assertEqual(ev(P(self.W), run=run).rule, 'zombie')
         self.assertIsNone(ev(P(self.W), run=run - datetime.timedelta(days=1)))
+
+    def test_no_zombie_moves_while_winners_never_enabled(self):
+        C.WINNERS_LAUNCH_DATE = ''
+        self.assertIsNone(ev(P(self.W), sales=[days_ago(90)]))
+
+    def test_clock_starts_at_winners_launch_when_later_than_sale(self):
+        C.WINNERS_LAUNCH_DATE = days_ago(10).isoformat()        # sold 60 days ago, Winners enabled 10 days ago
+        self.assertIsNone(ev(P(self.W), sales=[days_ago(60)]))
+        C.WINNERS_LAUNCH_DATE = days_ago(30).isoformat()        # ... enabled exactly 30 days ago
+        d = ev(P(self.W), sales=[days_ago(60)])
+        self.assertEqual((d.rule, d.detail['zombie_anchor']), ('zombie', days_ago(30).isoformat()))
+
+    def test_sale_later_than_launch_is_the_anchor(self):
+        C.WINNERS_LAUNCH_DATE = days_ago(50).isoformat()
+        self.assertIsNone(ev(P(self.W), sales=[days_ago(29)]))
+        self.assertEqual(ev(P(self.W), sales=[days_ago(31)]).rule, 'zombie')
 
 
 # ------------------------------------------------------------------------------------------------ rule 5
@@ -254,7 +278,7 @@ def order(oid, processed, created='2026-11-13T20:43:53Z', lines=(('1', 30.0),), 
 
 class Sales(unittest.TestCase):
     def test_processed_at_not_created_at(self):
-        s = data.sales_by_product([order('a', '2026-08-02T10:00:00Z', tags=['old-order', 'old-order-#550001'])])
+        s = data.sales_by_product([order('a', '2026-08-02T10:00:00Z', tags=['old-order', 'old-order-#550001'])], cutover=False)
         self.assertEqual(s['1'], [D(2026, 8, 2)])
 
     def test_cancelled_and_test_excluded(self):
@@ -264,11 +288,11 @@ class Sales(unittest.TestCase):
         self.assertEqual(s, {})
 
     def test_zero_value_line_is_not_a_sale(self):
-        s = data.sales_by_product([order('a', '2026-11-13T15:16:58Z', lines=(('1', 49.0),), subtotal=0.0)])
+        s = data.sales_by_product([order('a', '2026-11-15T15:16:58Z', lines=(('1', 49.0),), subtotal=0.0)])
         self.assertEqual(s, {})
 
     def test_uk_day_boundary_in_summer(self):                 # 23:30 UTC in BST = 00:30 UK next day
-        s = data.sales_by_product([order('a', '2026-08-01T23:30:00Z')])
+        s = data.sales_by_product([order('a', '2026-08-01T23:30:00Z')], cutover=False)
         self.assertEqual(s['1'], [D(2026, 8, 2)])
 
     def test_two_orders_same_day_are_two_sales(self):
@@ -280,14 +304,69 @@ class Sales(unittest.TestCase):
         self.assertEqual(list(s), ['2'])
 
 
+class NewSetupOnly(unittest.TestCase):
+    """Owner 2026-11-15 19:16: only new-setup sales count; copied old-store orders never make a Winner again."""
+
+    def test_old_store_copy_never_counts(self):
+        self.assertEqual(data.sales_by_product([order('a', '2026-11-14T15:00:00Z', tags=['old-order-#554786'])]), {})
+        self.assertEqual(data.sales_by_product([order('a', '2026-11-15T15:00:00Z', tags=['old-order'])]), {})
+
+    def test_cutover_boundary(self):
+        self.assertEqual(data.sales_by_product([order('a', '2026-11-14T12:59:59Z')]), {})
+        self.assertEqual(data.sales_by_product([order('a', '2026-11-14T13:00:00Z')])['1'], [D(2026, 11, 14)])
+
+    def test_llx4310_counts(self):
+        o = order('gid://shopify/Order/7826830590013', '2026-11-15T13:56:24Z', created='2026-11-15T13:56:25Z',
+                  lines=(('8118985097277', 44.95),), tags=['whop-checkout'])
+        self.assertEqual(data.sales_by_product([o]), {'8118985097277': [D(2026, 11, 15)]})
+
+    def test_old_sales_only_plus_was_tag_stays_testing(self):
+        p = P(['was_w_campaign', 'aw26'], pid='9')
+        sales = data.sales_by_product([order('a', '2026-10-01T10:00:00Z', lines=(('9', 30.0),), tags=['old-order']),
+                                       order('b', '2026-11-10T10:00:00Z', lines=(('9', 30.0),))])
+        self.assertEqual(rules.role(p), 'testing')
+        self.assertIsNone(rules.evaluate([p], sales, {}, {}, RUN) or None)
+
+    def test_was_tag_product_with_spend_and_no_new_sale_is_judged_as_testing(self):
+        p = P(['was_lc_campaign'], price=21.0, pid='9')
+        d = rules.evaluate([p], {}, {'9': {RUN: 3.5}}, {}, RUN)[0]
+        self.assertEqual(d.rule, 'never_sold')
+
+    def test_new_sale_writes_winner_tag_and_label(self):
+        from newstore import actions
+
+        class FakeShop:
+            def __init__(self): self.calls = []
+            def gql(self, q, v=None):
+                self.calls.append((q, v))
+                field = 'metafieldsSet' if 'metafieldsSet' in q else None
+                return {'data': {k: {'userErrors': []} for k in ('metafieldsSet', 'tagsAdd', 'tagsRemove')}}
+        p = P(['was_w_campaign'], pid='8118985097277')
+        sales = data.sales_by_product([order('x', '2026-11-15T13:56:24Z', lines=(('8118985097277', 44.95),))])
+        d = rules.evaluate([p], sales, {}, {}, D(2026, 11, 15))[0]
+        self.assertEqual(d.rule, 'first_sale')
+        shop = FakeShop()
+        self.assertEqual(actions.apply(shop, d, p, D(2026, 11, 15)), 'ok')
+        (q1, v1), (q2, v2) = shop.calls
+        self.assertIn('metafieldsSet', q1)
+        self.assertEqual((v1['mf'][0]['namespace'], v1['mf'][0]['key'], v1['mf'][0]['value']),
+                         ('mm-google-shopping', 'custom_label_1', 'w_campaign'))
+        self.assertIn('tagsAdd', q2)
+        self.assertEqual(set(v2['add']), {'w_campaign', 'w_since:2026-11-15'})
+        self.assertNotIn('was_w_campaign', str(v2))           # history tag is left alone
+
+
 class Config(unittest.TestCase):
     def test_schedule_is_30_minutes(self):
         self.assertEqual(C.SCHEDULE_MINUTES, 30)
         self.assertEqual(len(C.RAILWAY_CRON.split()[0].split(',')), 2)    # two runs an hour = 48 a day
 
-    def test_week1_only_testing_campaign_and_no_tree_moves(self):
-        self.assertEqual(C.campaign_ids(), ['24425197606'])
+    def test_defaults_testing_only_no_tree_moves_no_zombie_clock(self):
+        if not os.environ.get('NS_WINNERS_CAMPAIGN_ID'):
+            self.assertEqual(C.campaign_ids(), ['24425197606'])
         self.assertFalse(C.tree_moves_enabled())
+        self.assertIsNone(C.winners_launch())
+        self.assertEqual(C.CUTOVER, '2026-11-14T13:00:00+00:00')
 
     def test_ships_dry(self):
         self.assertFalse(C.LIVE)

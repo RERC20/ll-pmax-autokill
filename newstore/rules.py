@@ -6,7 +6,10 @@
 #                    a. no sale in the last 7 days  AND spend in the last 7 days  >= price / 2 -> lc_campaign
 #                    b. else no sale in the last 14 days AND spend in the last 14 days >= price / 2 -> lc_campaign
 #                    c. else spend in the (up to) 30 days since its last sale >= price / 2 (no sale since) -> lc_campaign
-#   4 ZOMBIE       Winner with no new sale for 30 days since its last sale (or Winners entry) -> lc_campaign, any spend.
+#   4 ZOMBIE       Winner with no new sale for 30 days since the LATER of its last sale / Winners entry and the day the
+#                  Winners campaign was first enabled (config.WINNERS_LAUNCH_DATE; empty = never = no zombie moves).
+# Every rule sees NEW-SETUP sales only (data.sales_by_product: processed >= cutover, no old-order copies). Products
+# tagged was_w_campaign / was_lc_campaign are ordinary Testing products (history tags, never read here).
 #   5 LAST CHANCE  a new sale (after the lc: stamp) -> back to w_campaign;
 #                  spend since entry > min(price / 2, GBP 20) with no sale -> draft.
 # REMOVED vs the old engine: winner pace, the 14-day Winners trial; the 7/30-day ROAS < 2.4 draft rule is replaced by 3.
@@ -124,9 +127,14 @@ def eval_winner(p, sales, spend, run):
                                 f'no sale since {anchor}; spend since GBP {sp:.2f} >= price/2 GBP {half:.2f}',
                                 {**det, 'window': f'since-anchor(<= {C.WEAK_SINCE_SALE_D}d)', 'spend_gbp': round(sp, 2),
                                  'threshold_gbp': round(half, 2)})
-    days = (run - anchor).days
-    if days >= C.ZOMBIE_D:                                           # 4
-        return Decision('zombie', p.pid, p.handle, f'no sale for {days}d (anchor {anchor})', {**det, 'days_without_sale': days})
+    launch = C.winners_launch()                                      # 4: no zombie moves before Winners is enabled
+    if launch is None:
+        return None
+    zanchor = max(anchor, launch)
+    days = (run - zanchor).days
+    if days >= C.ZOMBIE_D:
+        return Decision('zombie', p.pid, p.handle, f'no sale for {days}d (since {zanchor}; Winners launched {launch})',
+                        {**det, 'zombie_anchor': zanchor.isoformat(), 'days_without_sale': days})
     return None
 
 

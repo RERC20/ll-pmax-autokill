@@ -28,8 +28,10 @@ def run(run_date=None, live=False, json_out=None, fx_raw=None):
     live = live and C.LIVE
     print(f"== new-store engine == {run_date} | store {C.SHOPIFY_STORE} | Ads {C.GOOGLE_CUSTOMER_ID} | "
           f"{'LIVE' if live else 'DRY RUN (nothing written)'} | every {C.SCHEDULE_MINUTES} min")
-    print(f"   campaigns counted: {C.campaign_ids()} | listing-tree moves: "
-          f"{'ON' if C.tree_moves_enabled() else 'OFF (Winners/Last Chance ids empty: tags + labels + drafts only)'}")
+    print(f"   campaigns counted: {C.campaign_ids()} | routing: tag + custom_label_1 metafield -> feed label -> "
+          f"Winners/Last Chance listing filters (no listing-tree item moves)")
+    print(f"   new-setup sales only: processed >= {C.CUTOVER}, old-order copies ignored | zombie clock: "
+          f"{'from Winners launch ' + C.WINNERS_LAUNCH_DATE if C.WINNERS_LAUNCH_DATE else 'OFF (Winners never enabled)'}")
     ads = data.Ads(cred)
     data.check_account(ads)
     spend, clicks, sinfo = data.fetch_spend(ads, run_date, fx_raw)
@@ -41,11 +43,11 @@ def run(run_date=None, live=False, json_out=None, fx_raw=None):
     sales = data.sales_by_product(orders)
     n_sales = sum(len(v) for v in sales.values())
     excl = sum(1 for o in orders if data.is_excluded_order(o))
-    print(f"   shopify: {len(products)} active products | {len(orders)} orders by processedAt "
-          f"({excl} cancelled/test excluded, {sum(1 for o in orders if any(str(t).startswith(C.OLD_ORDER_TAG) for t in o['tags']))} "
-          f"old-store copies) | {n_sales} product-sales on {len(sales)} products")
-    if n_sales == 0:
-        raise RuntimeError('orders pull returned 0 sales - data glitch, nothing judged')
+    copies = sum(1 for o in orders if data.is_old_store_copy(o))
+    print(f"   shopify: {len(products)} active products | {len(orders)} orders processed since 13 Nov "
+          f"({excl} cancelled/test, {copies} old-store copies - ignored) | NEW-setup sales: {n_sales} on {len(sales)} products")
+    if not products or not orders:
+        raise RuntimeError('products or orders pull returned 0 - data glitch, nothing judged')
     roles = {r: sum(1 for p in products if rules.role(p) == r) for r in ('testing', 'winner', 'last_chance')}
     print(f"   roles: {roles}")
 

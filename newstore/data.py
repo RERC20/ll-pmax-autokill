@@ -73,15 +73,27 @@ def is_excluded_order(o):
     return bool(o.get('test')) or bool(o.get('cancelledAt')) or bool(tags & {'test-order', 'test_order', 'test'})
 
 
-def sales_by_product(orders):
-    """{pid: [UK date of processedAt, one per order]}. processedAt, NOT createdAt (copies of old-store orders were
-    created on 13 Nov 2026 but processedAt keeps the real sale time). Cancelled and test orders never count. A line
-    that brought in GBP 0 (exchange / replacement / 100% discount) is not a sale."""
+def is_old_store_copy(o):
+    return any(str(t).lower().startswith(C.OLD_ORDER_TAG) for t in (o.get('tags') or []))
+
+
+def _ts(s):
+    return datetime.datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+
+
+def sales_by_product(orders, cutover=None):
+    """{pid: [UK date of processedAt, one per order]} - NEW-SETUP sales only (owner 2026-11-15 19:16): processed at or
+    after `cutover` (default config.CUTOVER) and never a copy of an old-store order (tag old-order / old-order-#...).
+    processedAt, not createdAt. Cancelled and test orders never count. A line that brought in GBP 0 (exchange /
+    replacement / 100% discount) is not a sale. cutover=False switches the new-setup filter off (tests only)."""
+    cut = None if cutover is False else _ts(cutover or C.CUTOVER)
     out = collections.defaultdict(set)
     for o in orders:
         if is_excluded_order(o):
             continue
-        day = datetime.datetime.fromisoformat(o['processedAt'].replace('Z', '+00:00')).astimezone(UK).date()
+        if cut is not None and (is_old_store_copy(o) or _ts(o['processedAt']) < cut):
+            continue
+        day = _ts(o['processedAt']).astimezone(UK).date()
         lines = [li for li in o['lineItems'] if li.get('pid')]
         line_sum = sum(li['amount'] for li in lines)
         sub = o.get('subtotal')
@@ -244,8 +256,8 @@ def fetch_products(shop):
         cur = d['pageInfo']['endCursor']
 
 
-def fetch_orders(shop, since='2026-01-01'):
-    """Every order PROCESSED since `since` (the copies of old-store orders included)."""
+def fetch_orders(shop, since='2026-11-13'):
+    """Orders PROCESSED since `since` (a day before the cutover; sales_by_product applies the exact cutover)."""
     Q = ('query($c:String,$q:String!){orders(first:250,after:$c,query:$q,sortKey:PROCESSED_AT){pageInfo{hasNextPage endCursor} '
          'nodes{id name processedAt createdAt cancelledAt test tags subtotalPriceSet{shopMoney{amount}} '
          'lineItems(first:100){nodes{product{legacyResourceId} discountedTotalSet{shopMoney{amount}}}}}}}')
