@@ -264,6 +264,16 @@ class Shop:
         return j['data']
 
 
+def check_shop(shop):
+    """Stop before judging anything if the store is not the one these settings were written for (a missing NS_ variable
+    would silently fall back to Lola's values: wrong currency, wrong calendar day)."""
+    s = shop.read('{shop{currencyCode ianaTimezone myshopifyDomain}}')['shop']
+    if (s['currencyCode'], s['ianaTimezone'], s['myshopifyDomain']) != (C.STORE_CURRENCY, C.STORE_TIMEZONE, C.SHOPIFY_STORE):
+        raise RuntimeError(f"store is {s['myshopifyDomain']} {s['currencyCode']}/{s['ianaTimezone']}, settings say "
+                           f"{C.SHOPIFY_STORE} {C.STORE_CURRENCY}/{C.STORE_TIMEZONE} - stopped")
+    return s
+
+
 def fetch_products(shop):
     Q = ('query($c:String){products(first:250,after:$c,query:"status:active"){pageInfo{hasNextPage endCursor} '
          'nodes{legacyResourceId handle title status tags priceRangeV2{minVariantPrice{amount}}}}}')

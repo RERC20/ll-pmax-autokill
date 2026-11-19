@@ -233,5 +233,25 @@ class ReportAndWrites(unittest.TestCase):
         self.assertIn('w_since:' + ago(1).isoformat(), calls[1][1]['add'])
 
 
+class ShopGuard(unittest.TestCase):
+    class Shop:
+        def __init__(self, cur, tz, dom='z6hjj1-ae.myshopify.com'):
+            self.v = {'shop': {'currencyCode': cur, 'ianaTimezone': tz, 'myshopifyDomain': dom}}
+
+        def read(self, q, v=None):
+            return self.v
+
+    def test_matching_store_passes(self):
+        data.check_shop(self.Shop('USD', 'America/New_York'))
+
+    def test_wrong_currency_stops(self):
+        with self.assertRaises(RuntimeError):
+            data.check_shop(self.Shop('GBP', 'America/New_York'))
+
+    def test_wrong_store_stops(self):
+        with self.assertRaises(RuntimeError):
+            data.check_shop(self.Shop('USD', 'America/New_York', 'gwvmrw-vm.myshopify.com'))
+
+
 if __name__ == '__main__':
     unittest.main()

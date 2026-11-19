@@ -38,6 +38,7 @@ def run(run_date=None, live=False, json_out=None, fx_raw=None):
     print(f"   spend: {sinfo['rows']} product-day rows, USD {sinfo['usd_total']:.2f} total, "
           f"1 USD = {C.STORE_CURRENCY} {sinfo['fx_latest']:.4f} ({'ECB' if C.STORE_CURRENCY != C.ACCOUNT_CURRENCY else 'same currency'}) | Google Ads ops this run: {ads.run_ops}")
     shop = data.Shop(cred)
+    data.check_shop(shop)
     products = data.fetch_products(shop)
     orders = data.fetch_orders(shop)
     sales = data.sales_by_product(orders)
