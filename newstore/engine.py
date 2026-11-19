@@ -36,7 +36,7 @@ def run(run_date=None, live=False, json_out=None, fx_raw=None):
     data.check_account(ads)
     spend, clicks, sinfo = data.fetch_spend(ads, run_date, fx_raw)
     print(f"   spend: {sinfo['rows']} product-day rows, USD {sinfo['usd_total']:.2f} total, "
-          f"1 USD = GBP {sinfo['fx_latest']:.4f} (ECB) | Google Ads ops this run: {ads.run_ops}")
+          f"1 USD = {C.STORE_CURRENCY} {sinfo['fx_latest']:.4f} ({'ECB' if C.STORE_CURRENCY != C.ACCOUNT_CURRENCY else 'same currency'}) | Google Ads ops this run: {ads.run_ops}")
     shop = data.Shop(cred)
     products = data.fetch_products(shop)
     orders = data.fetch_orders(shop)
@@ -45,7 +45,7 @@ def run(run_date=None, live=False, json_out=None, fx_raw=None):
     excl = sum(1 for o in orders if data.is_excluded_order(o))
     copies = sum(1 for o in orders if data.is_old_store_copy(o))
     credit = [(o['name'], data.credit_reason(o)) for o in orders if not data.is_old_store_copy(o) and data.credit_reason(o)]
-    print(f"   shopify: {len(products)} active products | {len(orders)} orders processed since 13 Nov "
+    print(f"   shopify: {len(products)} active products | {len(orders)} orders processed since {C.ORDERS_SINCE} "
           f"({excl} cancelled/test, {copies} old-store copies, {len(credit)} store-credit - ignored) | NEW-setup sales: {n_sales} on {len(sales)} products")
     for name, why in credit:
         print(f"   store-credit order ignored: {name} ({why})")

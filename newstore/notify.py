@@ -3,6 +3,8 @@
 # (request errors can contain the URL, which holds the token - only the error TYPE is printed).
 import requests
 
+from . import config as C
+
 LIMIT = 4000
 EXAMPLES = 5
 
@@ -29,8 +31,8 @@ def summary(report):
     """One short message per run: mode, data, each rule's count (+ up to 5 handles), writes and their results."""
     live = 'LIVE' if report.get('live') else 'DRY RUN'
     sp = report.get('spend') or {}
-    lines = [f"Auto-Kill v2 (new store) {report.get('run_date')} | {live}",
-             f"Ads {report.get('account')}: spend USD {sp.get('usd_total', 0):.2f} (1 USD = GBP {sp.get('fx_latest', 0):.4f}) | "
+    lines = [f"Auto-Kill v2 ({C.LABEL}) {report.get('run_date')} | {live}",
+             f"Ads {report.get('account')}: spend USD {sp.get('usd_total', 0):.2f} (1 USD = {C.STORE_CURRENCY} {sp.get('fx_latest', 0):.4f}) | "
              f"{report.get('google_ops_this_run', 0)} API ops",
              f"Roles: {report.get('roles')}"]
     total = 0
@@ -50,7 +52,7 @@ def summary(report):
 
 
 def failure(err):
-    return f"Auto-Kill v2 (new store) FAILED: {type(err).__name__}: {str(err)[:300]}\nNothing more was written this run."
+    return f"Auto-Kill v2 ({C.LABEL}) FAILED: {type(err).__name__}: {str(err)[:300]}\nNothing more was written this run."
 
 
 def send(cred, text, post=requests.post):

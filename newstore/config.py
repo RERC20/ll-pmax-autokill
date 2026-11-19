@@ -15,8 +15,16 @@ SHOPIFY_STORE = _env('SHOPIFY_STORE', 'gwvmrw-vm.myshopify.com')
 SHOPIFY_API = _env('SHOPIFY_API', '2026-01')
 GOOGLE_CUSTOMER_ID = _env('GOOGLE_CUSTOMER_ID', '7783704709')      # bills in USD, America/New_York
 ACCOUNT_CURRENCY = 'USD'                                             # checked against the account on every run
-ACCOUNT_TIMEZONE = 'America/New_York'
-STORE_TIMEZONE = 'Europe/London'                                     # every rule window is a UK calendar day
+ACCOUNT_TIMEZONE = _env('ACCOUNT_TIMEZONE', 'America/New_York')
+STORE_TIMEZONE = _env('STORE_TIMEZONE', 'Europe/London')            # every rule window is a STORE calendar day (UK for Lola)
+# The store's money. GBP (Lola): USD spend is converted with ECB rates. Same as the account (USD, Everly): no conversion.
+STORE_CURRENCY = _env('STORE_CURRENCY', 'GBP')
+# First day the account could have spend for these campaigns (778: Testing started 2026-11-01).
+ACCOUNT_SPEND_FROM = _env('ACCOUNT_SPEND_FROM', '2026-11-01')
+# Orders are pulled from this processed day on (a day before the cutover is enough).
+ORDERS_SINCE = _env('ORDERS_SINCE', '2026-11-13')
+# Name used in the Telegram report.
+LABEL = _env('LABEL', 'new store')
 
 # ---- campaigns (week 1: only Testing exists) -----------------------------------------------------------------------
 TESTING_CAMPAIGN_ID = _env('TESTING_CAMPAIGN_ID', '24425197606')    # PMax | Testing | UK
@@ -94,7 +102,7 @@ MIN_REVENUE_SHARE = float(_env('MIN_REVENUE_SHARE', '0.2'))
 
 # ---- the owner's confirmed rules (2026-11-15) ----------------------------------------------------------------------
 NEVER_SOLD_PRICE_DIV = 7.0           # rule 2: spend > min(price / 7, GBP 5) ...
-NEVER_SOLD_CAP_GBP = 5.0
+NEVER_SOLD_CAP_GBP = float(_env('NEVER_SOLD_CAP', '5.0'))   # in STORE_CURRENCY (name kept from the GBP-only version)
 NEVER_SOLD_CLICKS = 25               # ... or 25+ clicks, with 0 sales -> draft
 NEVER_SOLD_LOOKBACK_D = int(_env('NEVER_SOLD_LOOKBACK_D', '30'))   # spend/click window (UK days incl. today)
 WEAK_PRICE_DIV = 2.0                 # rule 3: spend >= price / 2 in the window -> Last Chance
@@ -102,7 +110,7 @@ WEAK_WINDOWS_D = (7, 14)             # 3a, 3b
 WEAK_SINCE_SALE_D = 30               # 3c: the 30 days after the last sale
 ZOMBIE_D = 30                        # rule 4: no sale for 30 days since the last sale / Winners entry -> Last Chance
 LC_PRICE_DIV = 2.0                   # rule 5: spend > min(price / 2, GBP 20) with no sale since entry -> draft
-LC_CAP_GBP = 20.0
+LC_CAP_GBP = float(_env('LC_CAP', '20.0'))         # in STORE_CURRENCY
 
 # ---- glitch guards: more than this many moves of one kind in one run = data problem, NONE of that kind is written --
 CAPS = {

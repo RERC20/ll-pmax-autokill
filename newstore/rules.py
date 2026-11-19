@@ -101,7 +101,7 @@ def eval_testing(p, sales, spend, clicks, run):
     ck = spend_between(clicks, d0, run)
     allow = min(p.price / C.NEVER_SOLD_PRICE_DIV, C.NEVER_SOLD_CAP_GBP) if p.price > 0 else C.NEVER_SOLD_CAP_GBP
     if sp > allow or ck >= C.NEVER_SOLD_CLICKS:
-        why = (f'spend GBP {sp:.2f} > GBP {allow:.2f}' if sp > allow else f'{ck:.0f} clicks >= {C.NEVER_SOLD_CLICKS}')
+        why = (f'spend {C.STORE_CURRENCY} {sp:.2f} > {C.STORE_CURRENCY} {allow:.2f}' if sp > allow else f'{ck:.0f} clicks >= {C.NEVER_SOLD_CLICKS}')
         return Decision('never_sold', p.pid, p.handle, f'never sold; {why} ({C.NEVER_SOLD_LOOKBACK_D}d)',
                         {'spend_gbp': round(sp, 2), 'clicks': round(ck, 1), 'allowance_gbp': round(allow, 2)})
     return None
@@ -118,14 +118,14 @@ def eval_winner(p, sales, spend, run):
                 sp = spend_between(spend, run - datetime.timedelta(days=n - 1), run)
                 if sp >= half:
                     return Decision('weak_seller', p.pid, p.handle,
-                                    f'no sale in {n}d (anchor {anchor}); {n}d spend GBP {sp:.2f} >= price/2 GBP {half:.2f}',
+                                    f'no sale in {n}d (anchor {anchor}); {n}d spend {C.STORE_CURRENCY} {sp:.2f} >= price/2 {C.STORE_CURRENCY} {half:.2f}',
                                     {**det, 'window': f'{n}d', 'spend_gbp': round(sp, 2), 'threshold_gbp': round(half, 2)})
         if anchor < run:                                             # 3c: the (up to) 30 days after the anchor
             end = min(anchor + datetime.timedelta(days=C.WEAK_SINCE_SALE_D), run)
             sp = spend_between(spend, anchor + datetime.timedelta(days=1), end)
             if sp >= half:
                 return Decision('weak_seller', p.pid, p.handle,
-                                f'no sale since {anchor}; spend since GBP {sp:.2f} >= price/2 GBP {half:.2f}',
+                                f'no sale since {anchor}; spend since {C.STORE_CURRENCY} {sp:.2f} >= price/2 {C.STORE_CURRENCY} {half:.2f}',
                                 {**det, 'window': f'since-anchor(<= {C.WEAK_SINCE_SALE_D}d)', 'spend_gbp': round(sp, 2),
                                  'threshold_gbp': round(half, 2)})
     launch = C.winners_launch()                                      # 4: no zombie moves before Winners is enabled
@@ -148,7 +148,7 @@ def eval_last_chance(p, sales, spend, run):
     sp = spend_between(spend, entry + datetime.timedelta(days=1), run)
     allow = min(p.price / C.LC_PRICE_DIV, C.LC_CAP_GBP) if p.price > 0 else C.LC_CAP_GBP
     if sp > allow:
-        return Decision('lc_draft', p.pid, p.handle, f'LC spend GBP {sp:.2f} > GBP {allow:.2f}, no sale since {entry}',
+        return Decision('lc_draft', p.pid, p.handle, f'LC spend {C.STORE_CURRENCY} {sp:.2f} > {C.STORE_CURRENCY} {allow:.2f}, no sale since {entry}',
                         {'lc_entry': entry.isoformat(), 'spend_gbp': round(sp, 2), 'allowance_gbp': round(allow, 2)})
     return None
 

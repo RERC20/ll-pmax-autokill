@@ -15,7 +15,7 @@ from .rules import Product
 UK = ZoneInfo(C.STORE_TIMEZONE)
 NY = ZoneInfo(C.ACCOUNT_TIMEZONE)
 PT = ZoneInfo('America/Los_Angeles')       # Google's quota day
-ACCOUNT_SPEND_FROM = datetime.date(2026, 11, 1)   # 778's first possible spend day (Testing started 2026-11-01)
+ACCOUNT_SPEND_FROM = datetime.date.fromisoformat(C.ACCOUNT_SPEND_FROM)   # first possible spend day of the counted campaigns
 ADS_VERSION = os.environ.get('NS_ADS_API_VERSION', 'v24')
 
 
@@ -203,7 +203,10 @@ def fetch_spend(ads, run, fx_raw=None):
                         f"WHERE segments.date BETWEEN '{d0}' AND '{d1}' AND campaign.id IN ({ids}) AND metrics.cost_micros > 0"):
         hourly[(x['campaign']['id'], datetime.date.fromisoformat(x['segments']['date']))][int(x['segments']['hour'])] = \
             int(x['metrics']['costMicros']) / 1e6
-    fx = fill_rates(fx_raw if fx_raw is not None else ecb_usd_gbp(d0, d1), d0, d1)
+    if fx_raw is None:
+        # store money = account money (Everly: USD/USD) -> 1:1, no ECB call; else ECB USD -> GBP
+        fx_raw = {d0: 1.0} if C.STORE_CURRENCY == C.ACCOUNT_CURRENCY else ecb_usd_gbp(d0, d1)
+    fx = fill_rates(fx_raw, d0, d1)
     spend, clicks = align_to_uk(rows, hourly, fx)
     return spend, clicks, {'rows': len(rows), 'usd_total': round(sum(r[3] for r in rows), 2),
                            'fx_latest': fx[min(run, d1)], 'fx_days': len(fx)}
@@ -276,7 +279,7 @@ def fetch_products(shop):
         cur = d['pageInfo']['endCursor']
 
 
-def fetch_orders(shop, since='2026-11-13'):
+def fetch_orders(shop, since=None):
     """Orders PROCESSED since `since` (a day before the cutover; sales_by_product applies the exact cutover)."""
     Q = ('query($c:String,$q:String!){orders(first:250,after:$c,query:$q,sortKey:PROCESSED_AT){pageInfo{hasNextPage endCursor} '
          'nodes{id name processedAt createdAt cancelledAt test tags discountCodes subtotalPriceSet{shopMoney{amount}} '
@@ -284,6 +287,7 @@ def fetch_orders(shop, since='2026-11-13'):
          '... on AutomaticDiscountApplication{title} ... on ScriptDiscountApplication{title}}} '
          'lineItems(first:100){nodes{product{legacyResourceId} quantity originalUnitPriceSet{shopMoney{amount}} '
          'discountedTotalSet{shopMoney{amount}}}}}}}')
+    since = since or C.ORDERS_SINCE
     out, cur = [], None
     while True:
         d = shop.read(Q, {'c': cur, 'q': f'processed_at:>={since}'})['orders']
