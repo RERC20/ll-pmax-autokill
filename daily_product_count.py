@@ -48,6 +48,21 @@ HIST_COLS    = ['date', 'start_count', 'end_count', 'published', 'killed', 'net'
 TG_TOKEN = cred('TELEGRAM_SUMMARY_BOT_TOKEN') or cred('TELEGRAM_BOT_TOKEN')
 TG_CHAT  = cred('TELEGRAM_SUMMARY_CHAT_ID')  or cred('TELEGRAM_CHAT_ID')
 EXTRA_STORES = [('loreya', 'Loreya', 'LOR'), ('solevair', 'SoleVair', 'SOL')]   # (id, label, secret prefix)
+# LolaLooks = the NEW store (owner 2026-11-24). The old store (lolalooks / Google Ads 751-243-1652) was closed by Shopify on
+# ~22 Nov 2026, and every run since crashed on it ("LolaLooks store could not be opened - nothing sent"), so NO store's
+# message went out. LolaLooks now reads gwvmrw-vm + Google Ads 778-370-4709 (USD, New York time -> UK-day hourly split),
+# with the same NS_* credentials the new-store engine uses; Google login falls back to the shared GOOGLE_* secrets.
+# Its state/history files are new (_product_count_*_lolalooks.*), so the closed store's snapshots are never compared.
+LOLA_STORE = ('lolalooks', 'LolaLooks', 'NS')
+DEFAULTS = {'NS_SHOPIFY_STORE': 'gwvmrw-vm.myshopify.com', 'NS_GOOGLE_CUSTOMER_ID': '7783704709'}
+
+
+def pcred(prefix, name):
+    """A store's secret: <PREFIX>_<NAME>, then the shared <NAME> for the Google login / developer token, then a default."""
+    v = cred(f'{prefix}_{name}')
+    if not v and name in ('GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN', 'GOOGLE_DEVELOPER_TOKEN'):
+        v = cred(name)
+    return v or DEFAULTS.get(f'{prefix}_{name}', '')
 
 
 # ---------------------------------------------------------------- stores
@@ -60,12 +75,16 @@ class Store:
         if prefix is None:
             self.shop, self.tok = SHOP, shopify_token()
         else:
-            self.shop = cred(f'{prefix}_SHOPIFY_STORE').replace('https://', '').rstrip('/')
+            self.shop = pcred(prefix, 'SHOPIFY_STORE').replace('https://', '').rstrip('/')
             if not self.shop:
                 raise RuntimeError(f'{prefix}_SHOPIFY_STORE not set')
+            if not pcred(prefix, 'SHOPIFY_CLIENT_ID'):
+                raise RuntimeError(f'{prefix}_SHOPIFY_CLIENT_ID not set')
             r = requests.post(f"https://{self.shop}/admin/oauth/access_token", timeout=40, json={
-                'grant_type': 'client_credentials', 'client_id': cred(f'{prefix}_SHOPIFY_CLIENT_ID'),
-                'client_secret': cred(f'{prefix}_SHOPIFY_CLIENT_SECRET')})
+                'grant_type': 'client_credentials', 'client_id': pcred(prefix, 'SHOPIFY_CLIENT_ID'),
+                'client_secret': pcred(prefix, 'SHOPIFY_CLIENT_SECRET')})
+            if r.status_code != 200 or 'json' not in r.headers.get('content-type', ''):
+                raise RuntimeError(f'Shopify token HTTP {r.status_code} for {self.shop}')
             self.tok = r.json()['access_token']
 
     def gql(self, q, v=None):
@@ -91,12 +110,14 @@ class Store:
             return sum(int(row['metrics'].get('costMicros', 0)) / 1e6 for row in r.json().get('results', [])), 'GBP'
         p = self.prefix
         tok = requests.post('https://oauth2.googleapis.com/token', timeout=30, data={
-            'grant_type': 'refresh_token', 'client_id': cred(f'{p}_GOOGLE_CLIENT_ID'),
-            'client_secret': cred(f'{p}_GOOGLE_CLIENT_SECRET'), 'refresh_token': cred(f'{p}_GOOGLE_REFRESH_TOKEN')}).json()['access_token']
+            'grant_type': 'refresh_token', 'client_id': pcred(p, 'GOOGLE_CLIENT_ID'),
+            'client_secret': pcred(p, 'GOOGLE_CLIENT_SECRET'), 'refresh_token': pcred(p, 'GOOGLE_REFRESH_TOKEN')}).json()['access_token']
         h = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
-        if cred(f'{p}_GOOGLE_LOGIN_CUSTOMER_ID'):
-            h['login-customer-id'] = cred(f'{p}_GOOGLE_LOGIN_CUSTOMER_ID').replace('-', '')
-        url = f"https://googleads.googleapis.com/v25/customers/{cred(f'{p}_GOOGLE_CUSTOMER_ID').replace('-', '')}/googleAds:search"
+        if pcred(p, 'GOOGLE_DEVELOPER_TOKEN'):
+            h['developer-token'] = pcred(p, 'GOOGLE_DEVELOPER_TOKEN')
+        if pcred(p, 'GOOGLE_LOGIN_CUSTOMER_ID'):
+            h['login-customer-id'] = pcred(p, 'GOOGLE_LOGIN_CUSTOMER_ID').replace('-', '')
+        url = f"https://googleads.googleapis.com/v25/customers/{pcred(p, 'GOOGLE_CUSTOMER_ID').replace('-', '')}/googleAds:search"
 
         def search(q):
             rows, page = [], None
@@ -123,7 +144,7 @@ class Store:
 def open_stores():
     """[(store or None, label, error)] - LolaLooks first. A store that cannot be opened is reported, not fatal."""
     out = []
-    for sid, label, prefix in [('lolalooks', 'LolaLooks', None)] + EXTRA_STORES:
+    for sid, label, prefix in [LOLA_STORE] + EXTRA_STORES:
         try:
             out.append((Store(sid, label, prefix), label, None))
         except Exception as ex:
@@ -261,8 +282,12 @@ def product_lines(start_n, end_n, published, killed, note=''):
             f"   ➕ published: {published}\n"
             f"   \U0001F53B killed:    {killed}" + (f"\n<i>{note}</i>" if note else ""))
 
+def anchor(stores):
+    """The store whose state/history files carry the once-per-day guard: LolaLooks, else the first store that opened."""
+    return next((st for st, _, _ in stores if st is not None), None)
+
 def do_start(stores, today, dry, force):
-    lola = stores[0][0]
+    lola = anchor(stores)
     if not force and lola is not None and os.path.exists(lola.state_file):
         try: st0 = json.load(open(lola.state_file, encoding='utf-8'))
         except Exception: st0 = {}
@@ -295,7 +320,7 @@ def do_start(stores, today, dry, force):
     send_telegram(msg)
 
 def do_end(stores, today, dry, force):
-    lola = stores[0][0]
+    lola = anchor(stores)
     existing = load_history(lola.history_file).get(today.isoformat()) if lola is not None else None
     if not force and existing and str(existing.get('end_count') or '') != '':
         print(f"END already recorded for {today} (end={existing['end_count']}). Skipping (idempotent)."); return
@@ -439,8 +464,10 @@ def main():
     if mode == 'skip':
         print("grid tick outside the rollover/settle windows — nothing to do."); return
     stores = open_stores()
-    if stores[0][0] is None:
-        raise SystemExit("LolaLooks store could not be opened - nothing sent")
+    if anchor(stores) is None:
+        raise SystemExit("no store could be opened - nothing sent")
+    if stores[0][0] is None:   # one store down never blocks the others' message any more (owner 2026-11-24)
+        print(f"!! {stores[0][1]} not opened ({stores[0][2]}) - the other stores are still sent")
     yest = today - datetime.timedelta(days=1)
     if a.day:                                       # testing: close THIS day (END/SETTLE), START the next
         yest = datetime.date.fromisoformat(a.day); today = yest + datetime.timedelta(days=1)
