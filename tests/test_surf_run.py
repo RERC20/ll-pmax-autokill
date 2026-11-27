@@ -1,5 +1,5 @@
-# Wiring tests for surf/run.py with Google Ads / Shopify / Telegram faked. No network.
-#   python -m pytest tests/test_surf_run.py -q
+# Wiring tests for surf/run.py (rules v2) with Google Ads / Shopify / Telegram faked. No network.
+#   python -m unittest tests.test_surf_run -v
 import datetime as dt
 import os
 import sys
@@ -9,25 +9,21 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from surf import run                                             # noqa: E402
-from surf.rules import UK, UTC, Cfg                              # noqa: E402
+from surf.rules import NY, UK, UTC, Cfg                          # noqa: E402
 
 DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
 SCHED = [{"campaignCriterion": {"adSchedule": {"dayOfWeek": d, "startHour": s, "endHour": e}}}
          for d in DAYS for s, e in ((2, 8), (9, 11), (13, 19))]
 
 
-def body(date, hours):
-    """hourly.py-shaped body: hours = {uk_hour: (cost_usd, sales_usd)}"""
-    hs = [{"hour": h, "split": {"testing": {"cost_usd": hours.get(h, (0, 0))[0], "sales_usd": hours.get(h, (0, 0))[1],
-                                            "cost_gbp": 0, "sales_gbp": 0}}} for h in range(24)]
-    return {"ads": {"ok": True}, "shopify": {"ok": True}, "split_rules": {"ok": True},
-            "fx": {"gbp_usd_source": "test"}, "days": [{"date": date, "gbp_usd": 1.3, "hours": hs}]}
+def uk(d, h, m):
+    return dt.datetime(2026, 11, d, h, m, tzinfo=UK).astimezone(UTC)
 
 
 class Fake:
-    def __init__(self, budget=300.0, status="ENABLED", ny_spend=0.0, events=()):
-        self.micros, self.status, self.ny_spend, self.events, self.writes = int(budget * 1e6), status, ny_spend, list(events), []
-        self.ny_dates = []
+    """seg: {utc_hour_start: usd} (Testing hourly spend as Ads reports it)."""
+    def __init__(self, budget=300.0, status="ENABLED", seg=None, events=()):
+        self.micros, self.status, self.seg, self.events, self.writes = int(budget * 1e6), status, dict(seg or {}), list(events), []
 
     def campaign(self, a=None):
         return {"id": "1", "name": "t", "status": self.status, "serving_status": "SERVING",
@@ -39,96 +35,130 @@ class Fake:
     def budget_events(self, now, a=None):
         return self.events
 
+    def testing_spend(self, ny_from, ny_to, a=None):
+        days = {}
+        d = dt.date.fromisoformat(ny_from)
+        while d <= dt.date.fromisoformat(ny_to):
+            days[d.isoformat()] = 0.0; d += dt.timedelta(days=1)
+        for t, v in self.seg.items():
+            k = t.astimezone(NY).date().isoformat()
+            if k in days:
+                days[k] += v
+        return self.seg, days
+
     def ny_day_spend(self, d, a=None):
-        self.ny_dates.append(d); return self.ny_spend
+        return sum(v for t, v in self.seg.items() if t.astimezone(NY).date().isoformat() == d)
 
     def set_budget(self, micros, a=None):
         self.writes.append(micros); self.micros = micros
         return dt.datetime.now(UTC)
 
 
-class HourlyRun(unittest.TestCase):
+class Run(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        os.environ["SURF_DATA_DIR"] = self.tmp
-        self.store = run.Store(os.path.join(self.tmp, "s.json"))
-        self.sent = []
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SURF_DATA_DIR"] = self.tmp.name
+        self.store = run.Store(os.path.join(self.tmp.name, "s.json"))
+        self.msgs = []
 
-    def go(self, fake, now, hours, live=False):
-        with mock.patch.multiple(run.gads, campaign=fake.campaign, schedule_rows=fake.schedule_rows,
-                                 budget_events=fake.budget_events, ny_day_spend=fake.ny_day_spend,
-                                 set_budget=fake.set_budget), \
-             mock.patch.object(run.hourly, "build", lambda a, b, shop: body(a.isoformat(), hours)), \
-             mock.patch.object(run, "telegram", lambda t: self.sent.append(t) or True):
-            return run.hourly_run(now, Cfg(), live, self.store)
+    def tearDown(self):
+        self.tmp.cleanup()
 
-    def test_dry_run_steps_virtually_and_never_writes(self):
-        f = Fake()
-        now = dt.datetime(2026, 11, 27, 11, 50, tzinfo=UK).astimezone(UTC)        # evaluates UK 10:00-11:00
-        rec = self.go(f, now, {9: (20, 60), 10: (20, 60)})
-        self.assertEqual(rec["decision"]["action"], "step_up")
-        self.assertEqual(rec["decision"]["new"], 600)
-        self.assertEqual(f.writes, [])
-        self.assertIn("DRY RUN", self.sent[-1]); self.assertIn("Would set budget: $300 -> $600", self.sent[-1])
-        # next hour follows the virtual $600 path
-        rec = self.go(f, now + dt.timedelta(hours=1), {9: (20, 60), 10: (20, 60), 11: (30, 90)})
-        self.assertEqual((rec["decision"]["old"], rec["decision"]["new"]), (600, 900))
-        self.assertEqual(f.writes, [])
+    def go(self, f, now, orders=(), live=False, mode="window", cfg=None):
+        sent = lambda text, html_mode=True: self.msgs.append(text) or True     # noqa: E731
+        with mock.patch.multiple(run.gads, campaign=f.campaign, schedule_rows=f.schedule_rows,
+                                 budget_events=f.budget_events, testing_spend=f.testing_spend,
+                                 ny_day_spend=f.ny_day_spend, set_budget=f.set_budget), \
+                mock.patch.object(run.sales, "testing_orders", lambda shop, a, b: [o for o in orders if a <= o[0] < b]), \
+                mock.patch.object(run.sales, "gbp_usd", lambda d: (1.25, "test")), \
+                mock.patch.object(run, "telegram", sent), mock.patch.object(run, "log_line", lambda r: None):
+            fn = run.window_run if mode == "window" else run.reset_run
+            return fn(now, cfg or Cfg(), live, self.store)
 
-    def test_live_writes_and_verifies(self):
-        f = Fake()
-        now = dt.datetime(2026, 11, 27, 11, 50, tzinfo=UK).astimezone(UTC)
-        rec = self.go(f, now, {9: (20, 60), 10: (20, 60)}, live=True)
+    def test_dry_run_step_up_virtual_budget_and_table_message(self):
+        # Fri 27 Nov 12:20 UK (NY 07:20, run hours): window 11:00-12:00 UK
+        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0})
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)])            # GBP 40 -> $50, ROAS 2.5
+        d = rec["decision"]
+        self.assertEqual((d["window"], d["w_spend"], d["p_spend"], d["w_sales"]), ("11:00-12:00", 20.0, 15.0, 50.0))
+        self.assertEqual((d["action"], d["new"]), ("step_up", 600))
+        self.assertEqual(f.writes, [])                                              # dry run never writes
+        self.assertEqual(self.store.load()["virtual_budget"], 600)
+        m = self.msgs[-1]
+        self.assertIn("DRY RUN", m); self.assertIn("<pre>", m)
+        for col in ("window", "spend", "prev", "rise", "sales", "ROAS", "dROAS", "action", "old→new", "floor"):
+            self.assertIn(col, m)
+        self.assertIn("11:00-12:00", m); self.assertIn("300→600", m); self.assertIn("UP x2", m)
+
+    def test_next_run_uses_virtual_budget_and_snapshots(self):
+        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0, uk(27, 12, 0): 10.0})
+        self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)])
+        st = self.store.load()
+        self.assertIn(uk(27, 12, 0).isoformat(), st["snaps"])
+        f.seg[uk(27, 12, 0)] = 12.0
+        rec = self.go(f, uk(27, 12, 50), orders=[(uk(27, 11, 10), 4000), (uk(27, 12, 5), 4000)])
+        d = rec["decision"]
+        self.assertEqual(rec["figures"]["spend_method"], "hourly")                  # mark 11:30 / 10:30 readings missing
+        self.assertEqual(d["w_spend"], round(10.0 + 12.0 * 30 / 50, 2))
+        self.assertEqual((d["old"], d["action"], d["new"]), (600, "step_up", 900))
+
+    def test_live_write_and_verify(self):
+        f = Fake(budget=900, seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0})
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 2000)], live=True)  # $25 / $20 = 1.25: down
+        self.assertEqual((rec["decision"]["action"], rec["decision"]["new"]), ("step_down", 600))
         self.assertEqual(f.writes, [600_000_000])
         self.assertTrue(rec["decision"]["verified"])
-        # its own write is not a manual change in the next run
-        f.events = [{"changeEvent": {"changeDateTime": (dt.datetime.now(UTC).astimezone(run.NY)).strftime("%Y-%m-%d %H:%M:%S.%f"),
-                                     "clientType": "GOOGLE_ADS_API",
-                                     "oldResource": {"campaignBudget": {"amountMicros": "300000000"}},
-                                     "newResource": {"campaignBudget": {"amountMicros": "600000000"}}}}]
-        rec = self.go(f, dt.datetime.now(UTC), {})
-        self.assertEqual(rec["manual_recent"], [])
-
-    def test_floor_uses_ny_account_day(self):
-        f = Fake(budget=1350, ny_spend=1000)
-        st = self.store.load(); st["days"]["2026-11-27"] = {"evals": {}, "stepped_up": True, "guard": False,
-                                                          "base_lock": False, "changes": 2}; self.store.save(st)
-        now = dt.datetime(2026, 11, 27, 20, 50, tzinfo=UK).astimezone(UTC)        # NY 15:50 -> hours 15..18 left
-        rec = self.go(f, now, {19: (50, 75)}, live=True)                             # ROAS 1.5: one notch down
-        self.assertEqual(f.ny_dates[-1], "2026-11-27")
-        self.assertEqual(rec["remaining_ny_run_hours"], 4)
-        self.assertEqual(rec["decision"]["action"], "step_down")
-        self.assertEqual(rec["decision"]["new"], 1195)                               # floor, not 900
-        self.assertEqual(f.writes, [1_195_000_000])
-
-    def test_after_uk_midnight_floor_is_previous_ny_day(self):
-        f = Fake()
-        now = dt.datetime(2026, 11, 28, 0, 50, tzinfo=UK).astimezone(UTC)          # NY 27 Nov 19:50
-        rec = self.go(f, now, {23: (10, 0)})
-        self.assertEqual(f.ny_dates[-1], "2026-11-27")
-        self.assertEqual(rec["h_date"], "2026-11-27")
-        self.assertFalse(rec["cur_run"])
+        self.assertIn("LIVE", self.msgs[-1]); self.assertIn("Verified: yes", self.msgs[-1])
 
     def test_manual_override_refused(self):
-        t = (dt.datetime.now(UTC) - dt.timedelta(minutes=20)).astimezone(run.NY).strftime("%Y-%m-%d %H:%M:%S.%f")
-        f = Fake(events=[{"changeEvent": {"changeDateTime": t, "clientType": "GOOGLE_ADS_WEB_CLIENT",
+        t = (uk(27, 12, 0)).astimezone(NY).strftime("%Y-%m-%d %H:%M:%S.%f")
+        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0},
+                 events=[{"changeEvent": {"changeDateTime": t, "clientType": "GOOGLE_ADS_WEB_CLIENT",
                                           "oldResource": {"campaignBudget": {"amountMicros": "300000000"}},
                                           "newResource": {"campaignBudget": {"amountMicros": "300000000"}}}}])
-        now = dt.datetime.now(UTC)
-        uk = now.astimezone(UK)
-        hours = {(uk.hour - 1) % 24: (20, 60)}
-        rec = self.go(f, now, hours, live=True)
-        if rec["decision"]["action"] not in ("no_eval", "skip_lag"):
-            self.assertIn(rec["decision"]["action"], ("refused", "hold", "hold_outside_run"))
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)], live=True)
+        self.assertEqual(rec["decision"]["action"], "refused")
         self.assertEqual(len(rec["manual_recent"]), 1)
         self.assertEqual(f.writes, [])
 
     def test_paused_campaign_never_written(self):
-        f = Fake(status="PAUSED")
-        now = dt.datetime(2026, 11, 27, 11, 50, tzinfo=UK).astimezone(UTC)
-        rec = self.go(f, now, {10: (20, 60)}, live=True)
+        f = Fake(status="PAUSED", seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0})
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)], live=True)
         self.assertEqual(rec["decision"]["action"], "refused")
         self.assertEqual(f.writes, [])
+
+    def test_gap_carry_over_end_to_end(self):
+        f = Fake(seg={uk(27, 11, 0): 15.0, uk(27, 12, 0): 20.0})
+        rec = self.go(f, uk(27, 13, 20), orders=[(uk(27, 12, 10), 4000)])          # NY 08:20: gap
+        self.assertEqual(rec["decision"]["action"], "carry")
+        rec = self.go(f, uk(27, 14, 20), orders=[(uk(27, 12, 10), 4000)])          # NY 09:20: next block
+        self.assertEqual((rec["decision"]["action"], rec["decision"]["new"]), ("step_up", 600))
+        self.assertIn("UP x2*", self.msgs[-1])
+
+    def test_incomplete_data_skipped(self):
+        f = Fake(seg={uk(27, 10, 0): 15.0})                                        # hour 11 missing
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)])
+        self.assertEqual(rec["decision"]["action"], "skip_lag")
+        self.assertIn("SKIP data", self.msgs[-1])
+
+    def test_reset(self):
+        f = Fake(budget=2025)
+        st = self.store.load(); st["virtual_budget"] = 2025; self.store.save(st)
+        rec = self.go(f, uk(28, 0, 5), mode="reset")
+        self.assertEqual((rec["decision"]["action"], rec["decision"]["new"]), ("reset", 300))
+        self.assertEqual(self.store.load()["virtual_budget"], 300)
+        self.assertIn("RESET", self.msgs[-1])
+
+    def test_old_state_file_is_upgraded(self):
+        self.store.path.write_text('{"days": {"2026-11-27": {"evals": {"8": {}}, "guard": false}}, "writes": []}')
+        st = self.store.load()
+        self.assertEqual((st["v"], st["days"]), (2, {}))
+
+    def test_auto_mode(self):
+        self.assertEqual(run.auto_mode(uk(28, 0, 5)), "reset")
+        self.assertEqual(run.auto_mode(uk(27, 12, 5)), "idle")
+        self.assertEqual(run.auto_mode(uk(27, 12, 20)), "window")
+        self.assertEqual(run.auto_mode(uk(27, 12, 50)), "window")
 
 
 if __name__ == "__main__":

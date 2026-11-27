@@ -1,8 +1,22 @@
 # surf/rules.py - the owner-approved "surf scaler" rules for PMax | Testing | UK (pure functions, no network).
 #
+# Rules v2 (owner, 27 Nov 2026; revised the same day): every 30 minutes, judge a ROLLING 60-MINUTE WINDOW ending at
+# the last complete 30-minute mark (spend from Google Ads, true Testing sales from Shopify order createdAt, hourly.py
+# split rule).
+#   step up  = window ROAS >= 2.5 (SURF_UP_ROAS; nothing else: no "spend rising" test, no day guard): x SURF_FIRST_STEP (2) from
+#              base, then x SURF_STEP (1.5); no cap
+#   hold     = 1.75 <= ROAS < 2.5
+#   step down= ROAS < 1.75 (SURF_DOWN_ROAS): /1.5 one notch (SURF_STEP_DOWN), never below the floor, never below base;
+#              two consecutive judged windows < 1.75: straight to base pace (max(base, floor)). No lock: a later
+#              window >= 2.5 surfs up again from there.
+#   "rising" (window spend > previous 60 min spend) is reported only.
+#   acts only while the run time is inside Testing's run hours; a decision earned in the last window before a schedule
+#   gap is carried to the first run of the next run block (dropped if that run's window contradicts it)
+#   no limit on changes per day; skip on incomplete data; 60-min pause after a manual change; 00:05 UK reset to base.
+#
 # Time zones: the scaler thinks in UK hours/days (Europe/London); the Google Ads account (and so the DAILY BUDGET,
-# the ad schedule and segments.date) is New York (America/New_York). Offsets are always whole hours, so every UK
-# hour is exactly one New York hour.
+# the ad schedule and segments.date) is New York (America/New_York). Offsets are always whole hours, so every
+# 30-minute mark is the same instant in both.
 import copy
 import datetime as dt
 import math
@@ -15,34 +29,38 @@ NY = ZoneInfo("America/New_York")
 UTC = dt.timezone.utc
 DOW = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
 MINUTE = {"ZERO": 0, "FIFTEEN": 15, "THIRTY": 30, "FORTY_FIVE": 45}
+HALF = dt.timedelta(minutes=30)
+HOUR = dt.timedelta(hours=1)
+
+
+ENV_NAMES = {"first_mult": "SURF_FIRST_STEP", "step_mult": "SURF_STEP", "down_div": "SURF_STEP_DOWN"}
 
 
 @dataclass
 class Cfg:
-    base: float = 300.0          # base daily budget (USD)
-    cap: float = 1500.0          # hard cap of the ladder
-    first_mult: float = 2.0      # first step from base: x2
-    step_mult: float = 1.5       # later steps up / one notch down
-    up_roas: float = 2.2         # hour ROAS needed to step up
-    day_roas: float = 2.2        # day-to-date ROAS needed to step up (and the day guard)
-    down_roas: float = 1.75      # hour ROAS below this -> one notch down
-    hard_roas: float = 1.2       # hour ROAS below this -> base pace for the rest of the day
-    pace_share: float = 0.7      # hour spend must be >= 70% of budget / run hours of the day
+    base: float = 300.0          # base daily budget (USD); also the lowest budget the scaler ever sets
+    first_mult: float = 2.0      # SURF_FIRST_STEP: first step up from base
+    step_mult: float = 1.5       # SURF_STEP: every later step up (owner may set 2 = "keep doubling")
+    down_div: float = 1.5        # SURF_STEP_DOWN: one notch down = budget / this
+    up_roas: float = 2.5         # SURF_UP_ROAS: window ROAS needed to step up (owner 27 Nov: 2.5)
+    down_roas: float = 1.75      # SURF_DOWN_ROAS: window ROAS below this -> one notch down (two in a row -> base pace)
     buffer: float = 0.10         # floor buffer
-    max_changes: int = 8         # budget changes per UK day (resets included)
-    max_budget: float = 1500.0   # never write a budget above this
     min_change: float = 10.0     # a step down smaller than this (USD) is not written (floor noise)
+    window_min: int = 60         # judged window length (minutes)
+    # No budget cap and no daily change limit (owner, 27 Nov 2026): SURF_CAP / SURF_MAX_BUDGET / SURF_MAX_CHANGES
+    # are no longer read. No day guard and no base-pace lock either.
 
     @classmethod
     def from_env(cls, env=None):
         env = os.environ if env is None else env
         kw = {}
         for f in fields(cls):
-            v = env.get("SURF_" + f.name.upper())
+            v = env.get(ENV_NAMES.get(f.name, "SURF_" + f.name.upper()))
             if v not in (None, ""):
-                kw[f.name] = type(f.default)(float(v)) if isinstance(f.default, int) else float(v)
+                kw[f.name] = int(float(v)) if isinstance(f.default, int) else float(v)
         c = cls(**kw)
-        c.cap = min(c.cap, c.max_budget)
+        if c.first_mult <= 1 or c.step_mult <= 1 or c.down_div <= 1:
+            raise ValueError("SURF_FIRST_STEP / SURF_STEP / SURF_STEP_DOWN must be > 1")
         return c
 
 
@@ -64,12 +82,21 @@ def parse_schedule(rows):
     return {k: sorted(v) for k, v in out.items()} or None
 
 
-def ny_hour_runs(ny_t, sched):
-    """Does the New York hour starting at ny_t fall inside the ad schedule? (hour start inside a slot)"""
+def ny_time_runs(ny_t, sched):
+    """Is New York time ny_t inside the ad schedule (minute resolution)?"""
     if sched is None:
         return True
-    m = ny_t.hour * 60
+    m = ny_t.hour * 60 + ny_t.minute
     return any(s <= m < e for s, e in sched.get(DOW[ny_t.weekday()], []))
+
+
+def ny_hour_runs(ny_t, sched):
+    """Does the New York hour starting at ny_t fall inside the ad schedule? (hour start inside a slot)"""
+    return ny_time_runs(ny_t.replace(minute=0, second=0, microsecond=0), sched)
+
+
+def runs_at(t_utc, sched):
+    return ny_time_runs(t_utc.astimezone(NY), sched)
 
 
 def _hours_of(d, tz):
@@ -77,7 +104,7 @@ def _hours_of(d, tz):
     t = dt.datetime(d.year, d.month, d.day, tzinfo=tz).astimezone(UTC)
     while t.astimezone(tz).date() == d:
         yield t
-        t += dt.timedelta(hours=1)
+        t += HOUR
 
 
 def uk_run_hours(d, sched):
@@ -115,26 +142,102 @@ def budget_floor(ny_spend_so_far, base, run_hours_in_day, remaining, buffer=0.10
     return round((ny_spend_so_far + pace * remaining) * (1 + buffer), 2)
 
 
+# ------------------------------------------------------------------ 60-minute window figures
+def last_mark(now_utc):
+    """The last complete 30-minute mark at or before now (UTC; UK/NY offsets are whole hours)."""
+    return now_utc.replace(minute=0 if now_utc.minute < 30 else 30, second=0, microsecond=0)
+
+
+def hour_of(t):
+    return t.replace(minute=0, second=0, microsecond=0)
+
+
+def spend_hourly(seg, a, b, now_utc):
+    """Spend in [a, b) (30-minute marks, UTC) from Google Ads hourly segments {utc_hour_start: usd}.
+    A finished hour is split evenly over its two halves (Ads has no finer segment). The hour still running at now_utc
+    is a partial reading: its first half = reported spend x 30 / minutes elapsed in the hour (pro rata; >= 30)."""
+    tot, t = 0.0, a
+    while t < b:
+        h = hour_of(t)
+        v = float(seg.get(h, 0.0))
+        if h <= now_utc < h + HOUR:
+            if t.minute == 0:
+                tot += v * 30.0 / max(30.0, (now_utc - h).total_seconds() / 60.0)
+        else:
+            tot += v / 2.0
+        t += HALF
+    return round(tot, 2)
+
+
+def running_total(snap, day_totals):
+    """Testing spend from the start of the earliest NY date in day_totals up to the snapshot's reading, or None."""
+    nd = snap.get("ny_date")
+    if nd not in day_totals:
+        return None
+    return sum(v for d, v in day_totals.items() if d < nd) + float(snap["cum"])
+
+
+def spend_snapshots(snaps, a, b, day_totals):
+    """Spend in [a, b) from two stored cumulative NY-day spend readings (one per 30-minute mark, taken ~20 min after
+    it; the reading lag is the same at both ends so it cancels). Across a NY midnight the earlier day's final total
+    (read now) is added. None if a reading is missing or the difference is negative."""
+    sa, sb = snaps.get(a.isoformat()), snaps.get(b.isoformat())
+    if not sa or not sb:
+        return None
+    ta, tb = running_total(sa, day_totals), running_total(sb, day_totals)
+    if ta is None or tb is None or tb < ta - 0.005:
+        return None
+    return round(tb - ta, 2)
+
+
+def sales_between(orders, a, b, gbp_usd):
+    """True Testing sales (USD) of orders created in [a, b). orders: [(created_utc, testing_pennies_gbp)]."""
+    return round(sum(p for t, p in orders if a <= t < b) / 100.0 * gbp_usd, 2)
+
+
+def window_figures(seg, day_totals, snaps, orders, gbp_usd, end, now_utc, day_start, window_min=60):
+    """The judged window [end-60, end), the previous one [end-120, end-60) and day-to-date [day_start, end).
+    Spend: cumulative-spend snapshot deltas when the three readings exist, else hourly segments (see spend_hourly)."""
+    w = dt.timedelta(minutes=window_min)
+    a, pa = end - w, end - 2 * w
+    ws, ps = spend_snapshots(snaps, a, end, day_totals), spend_snapshots(snaps, pa, a, day_totals)
+    method = "snapshots"
+    if ws is None or ps is None:
+        ws, ps, method = spend_hourly(seg, a, end, now_utc), spend_hourly(seg, pa, a, now_utc), "hourly"
+    return {"w_spend": ws, "p_spend": ps, "spend_method": method,
+            "w_sales": sales_between(orders, a, end, gbp_usd), "p_sales": sales_between(orders, pa, a, gbp_usd),
+            "day_spend": spend_hourly(seg, day_start, end, now_utc),
+            "day_sales": sales_between(orders, day_start, end, gbp_usd),
+            "last_half_spend": spend_hourly(seg, end - HALF, end, now_utc)}
+
+
+def window_label(end):
+    a = (end - HOUR).astimezone(UK)
+    return f"{a:%H:%M}-{end.astimezone(UK):%H:%M}"
+
+
 # ------------------------------------------------------------------ decision
 def new_day_state():
-    return {"evals": {}, "stepped_up": False, "guard": False, "base_lock": False, "changes": 0}
+    return {"evals": {}, "stepped_up": False, "changes": 0, "last_bad": False, "pending": None, "rows": []}
 
 
 @dataclass
 class Snap:
-    """Everything one hourly decision needs. Money in USD (sales converted at the day's GBP->USD rate)."""
-    h: int                     # evaluated UK hour H (the previous full UK hour)
-    h_spend: float             # Testing spend in H
-    h_sales: float             # Testing true sales in H
-    day_spend: float           # Testing spend in the UK day up to and including H
-    day_sales: float           # Testing true sales in the UK day up to and including H
-    uk_run_hours: list         # Testing run hours (UK labels) of H's UK date
-    cur_run: bool              # is the CURRENT UK hour (the run's hour) a Testing run hour?
-    ny_run_hours_count: int    # run hours in the account (NY) day = the hourly pace divisor
+    """Everything one 30-minute decision needs. Money in USD (sales converted at the day's GBP->USD rate)."""
+    end: dt.datetime           # window end (UTC, a 30-minute mark); window = [end - 60 min, end)
+    w_spend: float             # Testing spend in the window
+    p_spend: float             # Testing spend in the previous 60 minutes (reported only)
+    w_sales: float             # Testing true sales in the window
+    day_spend: float           # Testing spend in the UK day up to the window end (reported only)
+    day_sales: float           # Testing true sales in the UK day up to the window end (reported only)
+    end_run: bool              # the window's last 30 minutes are inside Testing's run hours (window is judged)
+    cur_run: bool              # the run time is inside Testing's run hours (may act)
     floor: float               # budget_floor(...) for the current NY day
     budget: float              # current daily budget (live, or the dry-run virtual budget)
     campaign_status: str = "ENABLED"
     manual_recent: tuple = ()  # budget changes in the last 60 min that the scaler did not make
+    same_day: bool = True      # the window belongs to the current UK day (False: after the 00:05 reset)
+    last_half_spend: float = None   # spend in the window's last 30 min (hourly segments); 0 = data incomplete
 
 
 def _roas(sales, spend):
@@ -145,112 +248,123 @@ def _dollars_up(x):
     return float(math.ceil(round(x, 6)))
 
 
-def decide(cfg, s, state):
-    """-> (decision dict, new day state). The state is the UK day of H (evals, flags, change count)."""
-    st = copy.deepcopy(state) if state else new_day_state()
-    roas, droas = _roas(s.h_sales, s.h_spend), _roas(s.day_sales, s.day_spend)
-    d = {"action": "hold", "old": s.budget, "new": s.budget, "would": None, "reasons": [],
-         "h": s.h, "h_spend": round(s.h_spend, 2), "h_sales": round(s.h_sales, 2),
-         "roas": None if roas is None else round(roas, 2),
-         "day_spend": round(s.day_spend, 2), "day_sales": round(s.day_sales, 2),
-         "day_roas": None if droas is None else round(droas, 2), "floor": s.floor}
-    R = d["reasons"].append
+def _f(x):
+    return "n/a" if x is None else f"{x:.2f}"
 
-    if s.h not in s.uk_run_hours:
-        d["action"] = "no_eval"; R(f"hour {s.h:02d} is outside Testing's run hours")
-        return d, st
-    if s.h_spend <= 0 and s.campaign_status != "ENABLED":
-        d["action"] = "refused"; R(f"REFUSED: campaign is {s.campaign_status}, not ENABLED (no spend in hour {s.h:02d})")
-        return d, st
-    if s.h_spend <= 0:
-        d["action"] = "skip_lag"
-        R(f"Ads spend for hour {s.h:02d} is $0 while the campaign is {s.campaign_status} and in schedule - data looks incomplete, skipped")
-        return d, st
-    if str(s.h) in st["evals"]:
-        d["action"] = "already_evaluated"; R(f"hour {s.h:02d} was already evaluated today")
-        return d, st
 
-    bad, very = roas < cfg.down_roas, roas < cfg.hard_roas
-    i = s.uk_run_hours.index(s.h)
-    prev = s.uk_run_hours[i - 1] if i > 0 else None
-    prev_bad = prev is not None and st["evals"].get(str(prev), {}).get("bad", False)
-    two = bad and prev_bad
-    st["evals"][str(s.h)] = {"roas": round(roas, 4), "spend": round(s.h_spend, 2), "sales": round(s.h_sales, 2),
-                             "bad": bad, "very_bad": very, "day_roas": None if droas is None else round(droas, 4)}
-    if st["stepped_up"] and (droas is None or droas < cfg.day_roas) and not st["guard"]:
-        st["guard"] = True; R(f"day guard ON: day-to-date ROAS {droas:.2f} < {cfg.day_roas} after a step-up - no more step-ups today")
-
-    # "above base" = there is real room to go down: the floor (or the base) is at least min_change below the budget.
-    # A budget held a few dollars over base by the floor counts as base (no lock, no micro-changes).
-    # It also needs a reason to be up: a step-up today, or a budget at/over the first step (e.g. a manual raise).
-    # (A reset that had to stay on the floor because the NY day was still running is not a surf level.)
-    above = (s.budget - max(cfg.base, _dollars_up(s.floor)) >= cfg.min_change
-             and (st["stepped_up"] or s.budget >= cfg.base * cfg.first_mult - 0.5))
-    act, target = "hold", s.budget
-    if above and (very or two):
-        st["base_lock"] = True
-        act, target = "base_pace", cfg.base
-        R(f"ROAS {roas:.2f} < {cfg.hard_roas}" if very else f"two run hours in a row < {cfg.down_roas} ({prev:02d}, {s.h:02d})")
-        R("base pace for the rest of the day")
-    elif above and bad:
-        act, target = "step_down", max(cfg.base, s.budget / cfg.step_mult)
-        R(f"ROAS {roas:.2f} < {cfg.down_roas}: one notch down (/{cfg.step_mult})")
-    elif st["base_lock"]:
-        if above:
-            act, target = "base_pace", cfg.base; R("base pace locked for the rest of the day")
-        else:
-            R("base pace locked for the rest of the day")
+def _step_up_target(cfg, budget, floor):
+    first = cfg.base * cfg.first_mult
+    if budget < first - 0.5:
+        t, m = first, cfg.first_mult
     else:
-        need = cfg.pace_share * s.budget / max(1, s.ny_run_hours_count)
-        fails = []
-        if roas < cfg.up_roas:
-            fails.append(f"hour ROAS {roas:.2f} < {cfg.up_roas}")
-        if s.h_spend < need:
-            fails.append(f"hour spend ${s.h_spend:.2f} < 70% of hourly pace ${need:.2f}")
-        if droas is None or droas < cfg.day_roas:
-            fails.append(f"day ROAS {0 if droas is None else droas:.2f} < {cfg.day_roas}")
-        if st["guard"]:
-            fails.append("day guard is ON")
-        if s.budget >= min(cfg.cap, cfg.max_budget) - 0.5:
-            fails.append(f"budget at cap ${min(cfg.cap, cfg.max_budget):,.0f}")
-        if bad:
-            fails.insert(0, f"ROAS {roas:.2f} < {cfg.down_roas} but budget already at base / floor")
-        if fails:
-            R("hold: " + "; ".join(fails))
+        t, m = budget * cfg.step_mult, cfg.step_mult
+    return max(t, _dollars_up(floor)), m
+
+
+def decide(cfg, s, state):
+    """-> (decision dict, new day state). The state is the UK day of the window."""
+    st = copy.deepcopy(state) if state else new_day_state()
+    for k, v in new_day_state().items():
+        st.setdefault(k, copy.deepcopy(v))
+    mark = s.end.astimezone(UK).strftime("%H:%M")
+    roas, droas = _roas(s.w_sales, s.w_spend), _roas(s.day_sales, s.day_spend)
+    rising = s.w_spend > s.p_spend
+    d = {"action": "hold", "old": s.budget, "new": s.budget, "would": None, "reasons": [], "mark": mark,
+         "window": window_label(s.end), "w_spend": round(s.w_spend, 2), "p_spend": round(s.p_spend, 2),
+         "rising": rising, "w_sales": round(s.w_sales, 2), "roas": None if roas is None else round(roas, 2),
+         "day_spend": round(s.day_spend, 2), "day_sales": round(s.day_sales, 2),
+         "day_roas": None if droas is None else round(droas, 2), "floor": s.floor, "carried": False, "mult": None}
+    R = d["reasons"].append
+    low = max(cfg.base, _dollars_up(s.floor))          # the lowest budget a step down / base pace may set
+    pend = st.get("pending")
+    act, target = "hold", s.budget
+
+    if not s.same_day:
+        d["action"] = "no_eval"; R("window belongs to the previous UK day (the 00:05 reset already applied)")
+        return d, st
+    if not s.end_run:
+        if not (pend and s.cur_run):
+            d["action"] = "no_eval"; R(f"window {d['window']} ends outside Testing's run hours")
+            if pend:
+                R(f"carried decision waiting for the next run block: {pend['action']} (earned {pend['mark']})")
+            return d, st
+        # first run of a new run block whose window has no serving time: nothing contradicts the carried decision
+        st["pending"] = None
+        d["carried"] = True
+        act = pend["action"]
+        R(f"carried from window ending {pend['mark']} (ROAS {_f(pend.get('roas'))}), earned just before the schedule "
+          "gap; this window has no run time to contradict it")
+        if act == "step_up":
+            target, d["mult"] = _step_up_target(cfg, s.budget, s.floor)
+        elif act == "step_down":
+            target = max(s.budget / cfg.down_div, low)
         else:
-            first = cfg.base * cfg.first_mult
-            mult = cfg.first_mult if s.budget < first - 0.5 else cfg.step_mult
-            act, target = "step_up", min(first if s.budget < first - 0.5 else s.budget * cfg.step_mult, cfg.cap, cfg.max_budget)
-            R(f"ROAS {roas:.2f} >= {cfg.up_roas}, spend ${s.h_spend:.2f} >= ${need:.2f}, day ROAS {droas:.2f} >= {cfg.day_roas}: x{mult:g}")
+            target = low
+    else:
+        if s.w_spend <= 0 and s.campaign_status != "ENABLED":
+            d["action"] = "refused"; R(f"REFUSED: campaign is {s.campaign_status}, not ENABLED (no spend in the window)")
+            return d, st
+        if s.w_spend <= 0 or s.last_half_spend == 0:
+            d["action"] = "skip_lag"
+            R(f"Ads spend for {'the window' if s.w_spend <= 0 else 'the last 30 min'} is $0 while the campaign is "
+              f"{s.campaign_status} and in schedule - data looks incomplete, skipped")
+            return d, st
+        if mark in st["evals"]:
+            d["action"] = "already_evaluated"; R(f"window ending {mark} was already judged")
+            return d, st
+
+        bad = roas < cfg.down_roas
+        two = bad and st["last_bad"]
+        st["last_bad"] = bad
+        st["evals"][mark] = {"roas": round(roas, 4), "spend": round(s.w_spend, 2), "prev": round(s.p_spend, 2),
+                             "sales": round(s.w_sales, 2), "bad": bad, "rising": rising}
+        if two:
+            act, target = "base_pace", low
+            R(f"two checks in a row < {cfg.down_roas} (ROAS {roas:.2f}): base pace (surfs again on a window >= {cfg.up_roas})")
+        elif bad:
+            act, target = "step_down", max(s.budget / cfg.down_div, low)
+            R(f"ROAS {roas:.2f} < {cfg.down_roas}: one notch down (/{cfg.down_div:g})")
+        elif roas >= cfg.up_roas:
+            target, d["mult"] = _step_up_target(cfg, s.budget, s.floor)
+            act = "step_up"
+            R(f"ROAS {roas:.2f} >= {cfg.up_roas}: x{d['mult']:g}")
+        else:
+            R(f"hold: ROAS {roas:.2f} between {cfg.down_roas} and {cfg.up_roas}")
+
+        if pend and s.cur_run:                      # first judged window of the next run block decides on its own
+            st["pending"] = None
+            same = (pend["action"] == "step_up") == (act == "step_up") and act != "hold"
+            R(f"carried {pend['action']} from window ending {pend['mark']} "
+              + ("confirmed by this window" if same else "dropped: contradicted by this window"))
+            d["carried"] = same
 
     new = s.budget
     if act in ("step_down", "base_pace"):
-        new = round(target) if target >= s.floor else _dollars_up(s.floor)
-        if target < s.floor:
-            R(f"floor ${s.floor:,.2f} keeps the budget above ${target:,.0f} so Testing slows down instead of stopping")
-        new = min(new, s.budget)                 # a bad hour never raises the budget
-        if new > cfg.max_budget and s.floor <= cfg.max_budget:
-            new = cfg.max_budget; R(f"max-budget guard: ${cfg.max_budget:,.0f}")
+        new = min(float(max(round(target), low)), s.budget)     # a bad window never raises the budget
+        if act == "base_pace" or target <= low + 0.5:
+            R(f"never below max(floor ${s.floor:,.2f}, base ${cfg.base:,.0f}) = ${low:,.0f}: Testing slows down, never stops")
         if s.budget - new < cfg.min_change:
-            R("floor keeps the budget where it is - no change"); act, new = "hold", s.budget
+            R("floor / base keeps the budget where it is - no change"); act, new = "hold", s.budget
     elif act == "step_up":
-        new = min(max(round(target), _dollars_up(s.floor)), cfg.cap, cfg.max_budget)
+        new = float(round(target))
         if new <= s.budget + 0.5:
             act, new = "hold", s.budget
 
     if act != "hold":
-        block = None
         if not s.cur_run:
-            block = "current hour is outside Testing's run hours - not acting this hour"
-        elif s.campaign_status != "ENABLED":
+            st["pending"] = {"action": act, "mark": mark, "roas": None if roas is None else round(roas, 4)}
+            d["would"] = {"action": act, "new": new}
+            d["action"] = "carry"
+            R("run time is outside Testing's run hours: carried to the first run of the next run block")
+            return d, st
+        block = None
+        if s.campaign_status != "ENABLED":
             block = f"REFUSED: campaign is {s.campaign_status}, not ENABLED"
         elif s.manual_recent:
             block = "REFUSED: budget changed manually in the last 60 min (" + "; ".join(s.manual_recent) + ") - respecting the override"
-        elif st["changes"] >= cfg.max_changes:
-            block = f"REFUSED: {st['changes']} changes today already (max {cfg.max_changes})"
         if block:
             d["would"] = {"action": act, "new": new}
-            d["action"] = "refused" if block.startswith("REFUSED") else "hold_outside_run"
+            d["action"] = "refused"
             R(block)
             return d, st
         st["changes"] += 1
@@ -260,7 +374,7 @@ def decide(cfg, s, state):
     return d, st
 
 
-def decide_reset(cfg, budget, floor, remaining, campaign_status="ENABLED", manual_recent=(), changes=0):
+def decide_reset(cfg, budget, floor, remaining, campaign_status="ENABLED", manual_recent=()):
     """00:05 UK: back to base. If the account (NY) day still has run hours left (not the case with the current
     schedule: UK 00:05 = NY 19:05/20:05), the floor still applies so Testing is never stopped."""
     target = cfg.base if remaining <= 0 else max(cfg.base, _dollars_up(floor))
@@ -277,8 +391,6 @@ def decide_reset(cfg, budget, floor, remaining, campaign_status="ENABLED", manua
         block = f"REFUSED: campaign is {campaign_status}, not ENABLED"
     elif manual_recent:
         block = "REFUSED: budget changed manually in the last 60 min (" + "; ".join(manual_recent) + ")"
-    elif changes >= cfg.max_changes:
-        block = f"REFUSED: {changes} changes today already (max {cfg.max_changes})"
     if block:
         d["would"] = {"action": "reset", "new": float(target)}
         d["action"], d["new"] = "refused", budget

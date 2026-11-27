@@ -81,3 +81,24 @@ def set_budget(micros, a=None):
             msg = ""
         raise RuntimeError(f"budget mutate HTTP {r.status_code}: {msg[:200]}")
     return dt.datetime.now(UTC)
+
+
+def testing_spend(ny_from, ny_to, a=None):
+    """Testing hourly spend for NY dates [ny_from, ny_to] -> ({utc_hour_start: usd}, {ny_date: usd day total}).
+    The hour still running is included as Google Ads currently reports it (partial)."""
+    a = a or ads()
+    rows = a.search(f"SELECT segments.date, segments.hour, metrics.cost_micros FROM campaign "
+                    f"WHERE campaign.id = {int(CAMPAIGN_ID)} AND segments.date BETWEEN '{ny_from}' AND '{ny_to}'")
+    seg, days = {}, {}
+    d = dt.date.fromisoformat(str(ny_from))
+    while d <= dt.date.fromisoformat(str(ny_to)):
+        days[d.isoformat()] = 0.0
+        d += dt.timedelta(days=1)
+    for r in rows:
+        s = r.get("segments", {})
+        usd = int(r.get("metrics", {}).get("costMicros", 0)) / 1e6
+        y, m, dd = map(int, s["date"].split("-"))
+        t = dt.datetime(y, m, dd, int(s.get("hour", 0) or 0), tzinfo=NY).astimezone(UTC)
+        seg[t] = seg.get(t, 0.0) + usd
+        days[s["date"]] = days.get(s["date"], 0.0) + usd
+    return seg, {k: round(v, 2) for k, v in days.items()}
