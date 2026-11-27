@@ -116,8 +116,7 @@ def budget_floor(ny_spend_so_far, base, run_hours_in_day, remaining, buffer=0.10
 
 # ------------------------------------------------------------------ decision
 def new_day_state():
-    return {"evals": {}, "stepped_up": False, "guard": False, "base_lock": False, "changes": 0,
-            "virtual_budget": None}
+    return {"evals": {}, "stepped_up": False, "guard": False, "base_lock": False, "changes": 0}
 
 
 @dataclass

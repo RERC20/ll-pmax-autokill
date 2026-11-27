@@ -42,7 +42,8 @@ def data_dir():
 
 
 class Store:
-    """State file: {"days": {uk_date: day_state}, "writes": [{at, old_micros, new_micros}]} (last 10 days kept)."""
+    """State file: {"days": {uk_date: day_state}, "writes": [{at, old_micros, new_micros}], "virtual_budget": dry-run
+    budget (the budget the scaler would have set; null = use the live budget)} (last 10 days kept)."""
 
     def __init__(self, path=None):
         self.path = Path(path) if path else data_dir() / "surf_state.json"
@@ -176,7 +177,7 @@ def hourly_run(now_utc, cfg, live, store):
     key = H.date().isoformat()
     day = st["days"].get(key) or new_day_state()
     live_budget = camp["amount_micros"] / 1e6
-    budget = live_budget if live else (day.get("virtual_budget") or live_budget)
+    budget = live_budget if live else (st.get("virtual_budget") or live_budget)
     manual = manual_changes(gads.budget_events(now_utc), st.get("writes"), now_utc)
     status = camp["status"] if not problems else "MISCONFIGURED (" + "; ".join(problems) + ")"
     snap = Snap(h=H.hour, h_spend=hs, h_sales=hsa, day_spend=ds, day_sales=dsa, uk_run_hours=run_h, cur_run=cur_run,
@@ -187,7 +188,7 @@ def hourly_run(now_utc, cfg, live, store):
             if not _write(st, budget, dec["new"], dec):
                 day2["changes"] -= 1
         else:
-            day2["virtual_budget"] = dec["new"]
+            st["virtual_budget"] = dec["new"]
     st["days"][key] = day2
     store.save(st)
 
@@ -215,13 +216,13 @@ def reset_run(now_utc, cfg, live, store):
     key = uk_now.date().isoformat()
     day = st["days"].get(key) or new_day_state()
     live_budget = camp["amount_micros"] / 1e6
-    budget = live_budget if live else (day.get("virtual_budget") or live_budget)
+    budget = live_budget if live else (st.get("virtual_budget") or live_budget)
     manual = manual_changes(gads.budget_events(now_utc), st.get("writes"), now_utc)
     status = camp["status"] if not problems else "MISCONFIGURED (" + "; ".join(problems) + ")"
     dec = decide_reset(cfg, budget, floor, rem, status, tuple(manual), day["changes"])
     if dec["action"] == "reset":
         if not live:
-            day["virtual_budget"] = dec["new"]; day["changes"] += 1
+            st["virtual_budget"] = dec["new"]; day["changes"] += 1
         elif _write(st, budget, dec["new"], dec):
             day["changes"] += 1
     st["days"][key] = day
