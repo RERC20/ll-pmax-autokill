@@ -33,7 +33,7 @@ def campaign(a=None):
 
 def schedule_rows(a=None):
     a = a or ads()
-    rows = a.search("SELECT campaign_criterion.criterion_id, campaign_criterion.negative, "
+    return a.search("SELECT campaign_criterion.criterion_id, campaign_criterion.negative, "
                     "campaign_criterion.ad_schedule.day_of_week, campaign_criterion.ad_schedule.start_hour, "
                     "campaign_criterion.ad_schedule.start_minute, campaign_criterion.ad_schedule.end_hour, "
                     "campaign_criterion.ad_schedule.end_minute FROM campaign_criterion "
