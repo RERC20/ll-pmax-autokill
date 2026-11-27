@@ -33,7 +33,7 @@ def campaign(a=None):
 
 def schedule_rows(a=None):
     a = a or ads()
-    return a.search("SELECT campaign_criterion.criterion_id, campaign_criterion.negative, "
+    rows = a.search("SELECT campaign_criterion.criterion_id, campaign_criterion.negative, "
                     "campaign_criterion.ad_schedule.day_of_week, campaign_criterion.ad_schedule.start_hour, "
                     "campaign_criterion.ad_schedule.start_minute, campaign_criterion.ad_schedule.end_hour, "
                     "campaign_criterion.ad_schedule.end_minute FROM campaign_criterion "
@@ -45,12 +45,12 @@ def budget_events(now_utc, a=None):
     a = a or ads()
     lo = (now_utc - dt.timedelta(hours=3)).astimezone(NY).strftime("%Y-%m-%d %H:%M:%S")
     hi = (now_utc + dt.timedelta(hours=1)).astimezone(NY).strftime("%Y-%m-%d %H:%M:%S")
-    return a.search("SELECT change_event.change_date_time, change_event.client_type, change_event.change_resource_name, "
+    rows = a.search("SELECT change_event.change_date_time, change_event.client_type, change_event.change_resource_name, "
                     "change_event.changed_fields, change_event.old_resource, change_event.new_resource "
                     f"FROM change_event WHERE change_event.change_date_time BETWEEN '{lo}' AND '{hi}' "
                     "AND change_event.change_resource_type = 'CAMPAIGN_BUDGET' "
-                    f"AND change_event.change_resource_name = '{BUDGET_RN}' "
-                    "ORDER BY change_event.change_date_time DESC LIMIT 50")
+                    "ORDER BY change_event.change_date_time DESC LIMIT 200")
+    return [r for r in rows if (r.get("changeEvent") or {}).get("changeResourceName") == BUDGET_RN]
 
 
 def ny_day_spend(ny_date, a=None):
