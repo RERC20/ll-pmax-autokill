@@ -134,8 +134,9 @@ class StepUp(unittest.TestCase):
 
 class StepDown(unittest.TestCase):
     def test_one_notch(self):
+        up = new_day_state(); up["stepped_up"] = True
         for b, want in ((1350, 900), (900, 600), (600, 400), (400, 300)):
-            d, _ = decide(C, S(roas=1.5, budget=b), new_day_state())
+            d, _ = decide(C, S(roas=1.5, budget=b), up)
             self.assertEqual((d["action"], d["new"]), ("step_down", want))
 
     def test_at_base_bad_hour_is_hold_no_lock(self):
@@ -170,6 +171,16 @@ class StepDown(unittest.TestCase):
         d, st = decide(C, S(roas=0.0, budget=317, floor=316.5), new_day_state())
         self.assertEqual(d["action"], "hold")
         self.assertFalse(st["base_lock"])
+
+    def test_reset_floor_budget_is_not_a_surf_level(self):
+        # no step-up today and below the first step: a budget left on the floor by the reset is not stepped down
+        d, st = decide(C, S(roas=0.0, budget=522, floor=488), new_day_state())
+        self.assertEqual(d["action"], "hold")
+        self.assertFalse(st["base_lock"])
+
+    def test_manual_raise_is_stepped_down_after_bad_hour(self):
+        d, _ = decide(C, S(roas=1.5, budget=3000), new_day_state())
+        self.assertEqual((d["action"], d["new"]), ("step_down", 1500))
 
     def test_small_step_not_written(self):
         d, _ = decide(C, S(roas=1.5, budget=500, floor=495), new_day_state())

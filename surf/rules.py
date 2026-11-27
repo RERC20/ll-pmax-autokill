@@ -182,7 +182,10 @@ def decide(cfg, s, state):
 
     # "above base" = there is real room to go down: the floor (or the base) is at least min_change below the budget.
     # A budget held a few dollars over base by the floor counts as base (no lock, no micro-changes).
-    above = s.budget - max(cfg.base, _dollars_up(s.floor)) >= cfg.min_change
+    # It also needs a reason to be up: a step-up today, or a budget at/over the first step (e.g. a manual raise).
+    # (A reset that had to stay on the floor because the NY day was still running is not a surf level.)
+    above = (s.budget - max(cfg.base, _dollars_up(s.floor)) >= cfg.min_change
+             and (st["stepped_up"] or s.budget >= cfg.base * cfg.first_mult - 0.5))
     act, target = "hold", s.budget
     if above and (very or two):
         st["base_lock"] = True
@@ -226,6 +229,8 @@ def decide(cfg, s, state):
         if target < s.floor:
             R(f"floor ${s.floor:,.2f} keeps the budget above ${target:,.0f} so Testing slows down instead of stopping")
         new = min(new, s.budget)                 # a bad hour never raises the budget
+        if new > cfg.max_budget and s.floor <= cfg.max_budget:
+            new = cfg.max_budget; R(f"max-budget guard: ${cfg.max_budget:,.0f}")
         if s.budget - new < cfg.min_change:
             R("floor keeps the budget where it is - no change"); act, new = "hold", s.budget
     elif act == "step_up":
