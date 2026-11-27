@@ -226,7 +226,8 @@ def window_run(now_utc, cfg, live, store):
     snap = Snap(end=end, w_spend=fig["w_spend"], p_spend=fig["p_spend"], w_sales=fig["w_sales"],
                 day_spend=fig["day_spend"], day_sales=fig["day_sales"], end_run=end_run, cur_run=cur_run, floor=floor,
                 budget=budget, campaign_status=status, manual_recent=tuple(manual),
-                same_day=uk_date == uk_now.date(), last_half_spend=fig["last_half_spend"])
+                same_day=uk_date == uk_now.date(), last_half_spend=fig["last_half_spend"],
+                pace=cfg.base / max(1, nyc))
     dec, day2 = decide(cfg, snap, day)
     if dec["action"] in CHANGE_ACTIONS:
         if live:
@@ -245,6 +246,9 @@ def window_run(now_utc, cfg, live, store):
             f"{1 + cfg.buffer:g} | live budget ${live_budget:,.0f} | in run hours: window {'yes' if end_run else 'no'}, "
             f"now {'yes' if cur_run else 'no'}",
             f"Steps: x{cfg.first_mult:g} from base, then x{cfg.step_mult:g}; down /{cfg.down_div:g}; no cap | "
+            f"min spend: up ${dec.get('need_up', 0):,.2f}, down ${dec.get('need_down', 0):,.2f} | "
+            + (f"last step-up window ends {dt.datetime.fromisoformat(day2['last_up_end']).astimezone(UK):%H:%M} | "
+               if day2.get("last_up_end") else "") +
             f"changes today {day2['changes']}" + (f" | pending: {day2['pending']['action']}" if day2.get("pending") else "")]
     rec = {"mode": "window", "live": live, "at": now_utc.isoformat(), "uk_now": uk_now.isoformat(), "uk_date": key,
            "window_end": end.isoformat(), "end_run": end_run, "cur_run": cur_run, "ny_date": ny_today.isoformat(),

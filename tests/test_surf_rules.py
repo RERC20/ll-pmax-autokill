@@ -28,10 +28,11 @@ _mark = [0]
 
 
 def S(roas=2.5, spend=30.0, prev=20.0, budget=300.0, floor=0.0, end=None, cur_run=True, end_run=True, **kw):
-    """A judged window. Each call gets a new 30-minute mark unless end is given."""
+    """A judged window. Each call gets a new mark 60 min after the previous one unless end is given."""
     if end is None:
         _mark[0] += 1
-        end = at_uk(2026, 11, 27, 7, 0) + dt.timedelta(minutes=30 * _mark[0])
+        end = at_uk(2026, 11, 27, 7, 0) + dt.timedelta(minutes=60 * _mark[0])   # non-overlapping windows
+    kw.setdefault("pace", PACE)
     return Snap(end=end, w_spend=spend, p_spend=prev, w_sales=spend * roas, day_spend=kw.pop("day_spend", 100.0),
                 day_sales=kw.pop("day_sales", 250.0), end_run=end_run, cur_run=cur_run, floor=floor, budget=budget, **kw)
 
@@ -157,7 +158,7 @@ class StepUp(unittest.TestCase):
         self.assertEqual([b for _, b in path], [600, 1200, 2400])
 
     def test_spend_not_rising_still_steps_up(self):
-        d, _ = decide(C, S(roas=2.5, spend=10, prev=30, budget=600), new_day_state())
+        d, _ = decide(C, S(roas=2.5, spend=25, prev=30, budget=600), new_day_state())
         self.assertEqual((d["action"], d["new"], d["rising"]), ("step_up", 900, False))
 
     def test_bad_day_roas_does_not_block(self):                        # no day guard
@@ -311,6 +312,79 @@ class GapCarry(unittest.TestCase):
         d, st = decide(C, S(roas=3, end=at_uk(2026, 11, 27, 23, 30), cur_run=False), new_day_state())
         d, _ = decide(C, S(roas=0, spend=0, end=at_uk(2026, 11, 28, 7, 0), end_run=False), new_day_state())
         self.assertEqual(d["action"], "no_eval")
+
+
+class MinSpend(unittest.TestCase):
+    """Owner 27 Nov: a step-up needs window spend >= base pace (~$21); under half of it nothing is judged."""
+    def test_step_up_needs_base_pace_spend(self):
+        d, st = decide(C, S(roas=10, spend=20.0, budget=600), new_day_state())
+        self.assertEqual((d["action"], d["new"]), ("hold", 600))
+        self.assertIn("not enough spend to judge", " ".join(d["reasons"]))
+        self.assertFalse(st["stepped_up"])
+        d, _ = decide(C, S(roas=10, spend=21.5, budget=600), new_day_state())
+        self.assertEqual((d["action"], d["new"]), ("step_up", 900))
+
+    def test_step_down_needs_half_pace_spend(self):
+        d, st = decide(C, S(roas=0, spend=3.0, budget=900), new_day_state())
+        self.assertEqual((d["action"], d["new"]), ("hold", 900))
+        self.assertIn("not enough spend to judge", " ".join(d["reasons"]))
+        self.assertFalse(st["last_bad"])
+        d, _ = decide(C, S(roas=0, spend=11.0, budget=900), new_day_state())
+        self.assertEqual((d["action"], d["new"]), ("step_down", 600))
+
+    def test_thin_window_neither_extends_nor_breaks_bad_streak(self):
+        st = new_day_state(); b = 900.0; acts = []
+        for r, sp in ((1.0, 15), (0.0, 3), (1.0, 15)):
+            d, st = decide(C, S(roas=r, spend=sp, budget=b), st)
+            b = d["new"]; acts.append((d["action"], b))
+        self.assertEqual(acts, [("step_down", 600), ("hold", 600), ("base_pace", 300)])
+
+    def test_configurable(self):
+        c = Cfg.from_env({"SURF_MIN_WINDOW_SPEND": "40", "SURF_MIN_DOWN_SHARE": "1"})
+        d, _ = decide(c, S(roas=3, spend=35), new_day_state()); self.assertEqual(d["action"], "hold")
+        d, _ = decide(c, S(roas=1, spend=20, budget=900), new_day_state()); self.assertEqual(d["action"], "hold")
+        d, _ = decide(c, S(roas=1, spend=22, budget=900), new_day_state()); self.assertEqual(d["action"], "step_down")
+
+    def test_pace_follows_run_hours(self):                    # no schedule: 24 run hours -> $12.50
+        d, _ = decide(C, S(roas=3, spend=13, pace=12.5), new_day_state()); self.assertEqual(d["action"], "step_up")
+
+
+class CountOnce(unittest.TestCase):
+    """An order (and a spend minute) can count in one step-up only: next step-up needs a window ending >= T+60."""
+    def test_overlapping_window_cannot_step_up_again(self):
+        t = at_uk(2026, 11, 27, 12, 0)
+        d, st = decide(C, S(roas=5, end=t), new_day_state())
+        self.assertEqual((d["action"], d["new"]), ("step_up", 600))
+        d, st = decide(C, S(roas=5, end=t + dt.timedelta(minutes=30), budget=600), st)   # shares 11:30-12:00
+        self.assertEqual((d["action"], d["new"]), ("hold", 600))
+        self.assertIn("already counted", " ".join(d["reasons"]))
+        d, st = decide(C, S(roas=5, end=t + dt.timedelta(minutes=60), budget=600), st)   # fresh 12:00-13:00
+        self.assertEqual((d["action"], d["new"]), ("step_up", 900))
+        self.assertEqual([w for w, _ in st["up_windows"]], ["11:00-12:00", "12:00-13:00"])
+
+    def test_one_order_in_two_windows_counts_once(self):
+        # one GBP 50 order at 11:45 sits in both 11:00-12:00 and 11:30-12:30; only the first window may use it
+        t = at_uk(2026, 11, 27, 12, 0)
+        d, st = decide(C, S(roas=3.0, spend=22, end=t), new_day_state())
+        d, st = decide(C, S(roas=3.0, spend=22, end=t + dt.timedelta(minutes=30), budget=600), st)
+        self.assertEqual(d["action"], "hold")
+
+    def test_step_down_is_not_blocked(self):
+        t = at_uk(2026, 11, 27, 12, 0)
+        d, st = decide(C, S(roas=5, end=t), new_day_state())
+        d, st = decide(C, S(roas=1.0, end=t + dt.timedelta(minutes=30), budget=600), st)
+        self.assertEqual((d["action"], d["new"]), ("step_down", 400))
+
+    def test_carried_step_up_is_credited_to_its_earned_window(self):
+        t = at_uk(2026, 11, 27, 13, 0)
+        d, st = decide(C, S(roas=3, end=t, cur_run=False), new_day_state())
+        d, st = decide(C, S(roas=0, spend=0, end=at_uk(2026, 11, 27, 14, 0), end_run=False), st)
+        self.assertEqual((d["action"], st["last_up_end"]), ("step_up", t.isoformat()))
+        d, st = decide(C, S(roas=3, end=at_uk(2026, 11, 27, 14, 30), budget=600), st)   # >= 13:00 + 60
+        self.assertEqual((d["action"], d["new"]), ("step_up", 900))
+
+    def test_new_day_starts_clean(self):
+        self.assertIsNone(new_day_state()["last_up_end"])
 
 
 class Floor(unittest.TestCase):

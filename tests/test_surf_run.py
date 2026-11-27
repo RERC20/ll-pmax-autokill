@@ -77,10 +77,10 @@ class Run(unittest.TestCase):
 
     def test_dry_run_step_up_virtual_budget_and_table_message(self):
         # Fri 27 Nov 12:20 UK (NY 07:20, run hours): window 11:00-12:00 UK
-        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0})
-        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)])            # GBP 40 -> $50, ROAS 2.5
+        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 24.0})
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4800)])            # GBP 48 -> $60, ROAS 2.5
         d = rec["decision"]
-        self.assertEqual((d["window"], d["w_spend"], d["p_spend"], d["w_sales"]), ("11:00-12:00", 20.0, 15.0, 50.0))
+        self.assertEqual((d["window"], d["w_spend"], d["p_spend"], d["w_sales"]), ("11:00-12:00", 24.0, 15.0, 60.0))
         self.assertEqual((d["action"], d["new"]), ("step_up", 600))
         self.assertEqual(f.writes, [])                                              # dry run never writes
         self.assertEqual(self.store.load()["virtual_budget"], 600)
@@ -90,21 +90,27 @@ class Run(unittest.TestCase):
             self.assertIn(col, m)
         self.assertIn("11:00-12:00", m); self.assertIn("300→600", m); self.assertIn("UP x2", m)
 
-    def test_next_run_uses_virtual_budget_and_snapshots(self):
-        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0, uk(27, 12, 0): 10.0})
-        self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)])
+    def test_next_run_uses_virtual_budget_snapshots_and_counts_once(self):
+        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 24.0, uk(27, 12, 0): 20.0})
+        self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4800)])                 # step up 300 -> 600
         st = self.store.load()
         self.assertIn(uk(27, 12, 0).isoformat(), st["snaps"])
-        f.seg[uk(27, 12, 0)] = 12.0
-        rec = self.go(f, uk(27, 12, 50), orders=[(uk(27, 11, 10), 4000), (uk(27, 12, 5), 4000)])
+        orders = [(uk(27, 11, 10), 4800), (uk(27, 12, 5), 8000)]
+        rec = self.go(f, uk(27, 12, 50), orders=orders)                             # 11:30-12:30 overlaps
         d = rec["decision"]
         self.assertEqual(rec["figures"]["spend_method"], "hourly")                  # mark 11:30 / 10:30 readings missing
-        self.assertEqual(d["w_spend"], round(10.0 + 12.0 * 30 / 50, 2))
-        self.assertEqual((d["old"], d["action"], d["new"]), (600, "step_up", 900))
+        self.assertEqual(d["w_spend"], round(12.0 + 20.0 * 30 / 50, 2))
+        self.assertEqual((d["old"], d["action"], d["new"]), (600, "hold", 600))
+        self.assertIn("already counted", " ".join(d["reasons"]))
+        f.seg[uk(27, 12, 0)] = 30.0
+        rec = self.go(f, uk(27, 13, 20), orders=orders)
+        d = rec["decision"]                                                         # 12:00-13:00: fresh window
+        self.assertEqual((d["window"], d["action"], d["new"]), ("12:00-13:00", "carry", 600))   # 13:20 = gap
+        self.assertEqual(d["would"]["new"], 900)
 
     def test_live_write_and_verify(self):
-        f = Fake(budget=900, seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0})
-        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 2000)], live=True)  # $25 / $20 = 1.25: down
+        f = Fake(budget=900, seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 24.0})
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 2400)], live=True)  # $30 / $24 = 1.25: down
         self.assertEqual((rec["decision"]["action"], rec["decision"]["new"]), ("step_down", 600))
         self.assertEqual(f.writes, [600_000_000])
         self.assertTrue(rec["decision"]["verified"])
@@ -112,32 +118,32 @@ class Run(unittest.TestCase):
 
     def test_manual_override_refused(self):
         t = (uk(27, 12, 0)).astimezone(NY).strftime("%Y-%m-%d %H:%M:%S.%f")
-        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0},
+        f = Fake(seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 24.0},
                  events=[{"changeEvent": {"changeDateTime": t, "clientType": "GOOGLE_ADS_WEB_CLIENT",
                                           "oldResource": {"campaignBudget": {"amountMicros": "300000000"}},
                                           "newResource": {"campaignBudget": {"amountMicros": "300000000"}}}}])
-        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)], live=True)
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4800)], live=True)
         self.assertEqual(rec["decision"]["action"], "refused")
         self.assertEqual(len(rec["manual_recent"]), 1)
         self.assertEqual(f.writes, [])
 
     def test_paused_campaign_never_written(self):
-        f = Fake(status="PAUSED", seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 20.0})
-        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)], live=True)
+        f = Fake(status="PAUSED", seg={uk(27, 10, 0): 15.0, uk(27, 11, 0): 24.0})
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4800)], live=True)
         self.assertEqual(rec["decision"]["action"], "refused")
         self.assertEqual(f.writes, [])
 
     def test_gap_carry_over_end_to_end(self):
-        f = Fake(seg={uk(27, 11, 0): 15.0, uk(27, 12, 0): 20.0})
-        rec = self.go(f, uk(27, 13, 20), orders=[(uk(27, 12, 10), 4000)])          # NY 08:20: gap
+        f = Fake(seg={uk(27, 11, 0): 15.0, uk(27, 12, 0): 24.0})
+        rec = self.go(f, uk(27, 13, 20), orders=[(uk(27, 12, 10), 4800)])          # NY 08:20: gap
         self.assertEqual(rec["decision"]["action"], "carry")
-        rec = self.go(f, uk(27, 14, 20), orders=[(uk(27, 12, 10), 4000)])          # NY 09:20: next block
+        rec = self.go(f, uk(27, 14, 20), orders=[(uk(27, 12, 10), 4800)])          # NY 09:20: next block
         self.assertEqual((rec["decision"]["action"], rec["decision"]["new"]), ("step_up", 600))
         self.assertIn("UP x2*", self.msgs[-1])
 
     def test_incomplete_data_skipped(self):
         f = Fake(seg={uk(27, 10, 0): 15.0})                                        # hour 11 missing
-        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4000)])
+        rec = self.go(f, uk(27, 12, 20), orders=[(uk(27, 11, 10), 4800)])
         self.assertEqual(rec["decision"]["action"], "skip_lag")
         self.assertIn("SKIP data", self.msgs[-1])
 

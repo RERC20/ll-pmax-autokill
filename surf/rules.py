@@ -10,6 +10,11 @@
 #              two consecutive judged windows < 1.75: straight to base pace (max(base, floor)). No lock: a later
 #              window >= 2.5 surfs up again from there.
 #   "rising" (window spend > previous 60 min spend) is reported only.
+#   Safety (owner, 27 Nov): a step-up needs window spend >= SURF_MIN_WINDOW_SPEND (default the base hourly pace =
+#   base / NY run hours, ~$21); a window under half the pace is "not enough spend to judge" (no step down, no streak).
+#   COUNT ONCE: after a step-up credited to the window ending at T, the next step-up needs a window ending at T+60 or
+#   later. That window starts at T or later, so none of its orders (createdAt) or spend minutes were in the previous
+#   step-up's window [T-60, T): no order and no spend is ever counted in two step-ups.
 #   acts only while the run time is inside Testing's run hours; a decision earned in the last window before a schedule
 #   gap is carried to the first run of the next run block (dropped if that run's window contradicts it)
 #   no limit on changes per day; skip on incomplete data; 60-min pause after a manual change; 00:05 UK reset to base.
@@ -47,6 +52,10 @@ class Cfg:
     buffer: float = 0.10         # floor buffer
     min_change: float = 10.0     # a step down smaller than this (USD) is not written (floor noise)
     window_min: int = 60         # judged window length (minutes)
+    min_window_spend: float = 0.0  # SURF_MIN_WINDOW_SPEND: window spend needed to step up (0 = base hourly pace,
+                                   # i.e. base / run hours of the NY day, ~$21 with 14 run hours)
+    min_down_share: float = 0.5  # SURF_MIN_DOWN_SHARE: window spend needed to step down / count as bad, as a share
+                                 # of the base hourly pace (0.5 -> ~$11)
     # No budget cap and no daily change limit (owner, 27 Nov 2026): SURF_CAP / SURF_MAX_BUDGET / SURF_MAX_CHANGES
     # are no longer read. No day guard and no base-pace lock either.
 
@@ -218,7 +227,8 @@ def window_label(end):
 
 # ------------------------------------------------------------------ decision
 def new_day_state():
-    return {"evals": {}, "stepped_up": False, "changes": 0, "last_bad": False, "pending": None, "rows": []}
+    return {"evals": {}, "stepped_up": False, "changes": 0, "last_bad": False, "pending": None, "rows": [],
+            "last_up_end": None, "up_windows": []}
 
 
 @dataclass
@@ -238,6 +248,7 @@ class Snap:
     manual_recent: tuple = ()  # budget changes in the last 60 min that the scaler did not make
     same_day: bool = True      # the window belongs to the current UK day (False: after the 00:05 reset)
     last_half_spend: float = None   # spend in the window's last 30 min (hourly segments); 0 = data incomplete
+    pace: float = None         # base hourly pace = base / run hours of the NY day (None: base / 24)
 
 
 def _roas(sales, spend):
@@ -278,6 +289,11 @@ def decide(cfg, s, state):
     low = max(cfg.base, _dollars_up(s.floor))          # the lowest budget a step down / base pace may set
     pend = st.get("pending")
     act, target = "hold", s.budget
+    pace = s.pace if s.pace else cfg.base / 24.0
+    need_up = cfg.min_window_spend if cfg.min_window_spend > 0 else pace
+    need_down = cfg.min_down_share * pace
+    d["need_up"], d["need_down"] = round(need_up, 2), round(need_down, 2)
+    up_end = s.end                                       # the window a step-up is credited to (count-once rule)
 
     if not s.same_day:
         d["action"] = "no_eval"; R("window belongs to the previous UK day (the 00:05 reset already applied)")
@@ -296,6 +312,7 @@ def decide(cfg, s, state):
           "gap; this window has no run time to contradict it")
         if act == "step_up":
             target, d["mult"] = _step_up_target(cfg, s.budget, s.floor)
+            up_end = dt.datetime.fromisoformat(pend["end"]) if pend.get("end") else s.end
         elif act == "step_down":
             target = max(s.budget / cfg.down_div, low)
         else:
@@ -313,21 +330,38 @@ def decide(cfg, s, state):
             d["action"] = "already_evaluated"; R(f"window ending {mark} was already judged")
             return d, st
 
-        bad = roas < cfg.down_roas
+        thin = s.w_spend < need_down                     # too little spend to judge anything
+        bad = roas < cfg.down_roas and not thin
         two = bad and st["last_bad"]
-        st["last_bad"] = bad
+        if not thin:                                     # a thin window neither extends nor breaks a bad streak
+            st["last_bad"] = bad
         st["evals"][mark] = {"roas": round(roas, 4), "spend": round(s.w_spend, 2), "prev": round(s.p_spend, 2),
-                             "sales": round(s.w_sales, 2), "bad": bad, "rising": rising}
-        if two:
+                             "sales": round(s.w_sales, 2), "bad": bad, "thin": thin, "rising": rising}
+        last_up = dt.datetime.fromisoformat(st["last_up_end"]) if st.get("last_up_end") else None
+        fresh_from = last_up + dt.timedelta(minutes=cfg.window_min) if last_up else None
+        if thin and roas < cfg.up_roas:
+            R(f"hold: not enough spend to judge (${s.w_spend:.2f} < half the base pace ${need_down:.2f})"
+              + (f"; ROAS {roas:.2f}" if roas is not None else ""))
+        elif two:
             act, target = "base_pace", low
             R(f"two checks in a row < {cfg.down_roas} (ROAS {roas:.2f}): base pace (surfs again on a window >= {cfg.up_roas})")
         elif bad:
             act, target = "step_down", max(s.budget / cfg.down_div, low)
             R(f"ROAS {roas:.2f} < {cfg.down_roas}: one notch down (/{cfg.down_div:g})")
         elif roas >= cfg.up_roas:
-            target, d["mult"] = _step_up_target(cfg, s.budget, s.floor)
-            act = "step_up"
-            R(f"ROAS {roas:.2f} >= {cfg.up_roas}: x{d['mult']:g}")
+            fails = []
+            if s.w_spend < need_up:
+                fails.append(f"not enough spend to judge (${s.w_spend:.2f} < base pace ${need_up:.2f})")
+            if fresh_from and s.end < fresh_from:
+                fails.append(f"sales and spend before {last_up.astimezone(UK):%H:%M} already counted in the step-up "
+                             f"at {last_up.astimezone(UK):%H:%M}; next step-up needs a fresh window ending "
+                             f"{fresh_from.astimezone(UK):%H:%M} or later")
+            if fails:
+                R(f"hold: ROAS {roas:.2f} >= {cfg.up_roas} but " + "; ".join(fails))
+            else:
+                target, d["mult"] = _step_up_target(cfg, s.budget, s.floor)
+                act = "step_up"
+                R(f"ROAS {roas:.2f} >= {cfg.up_roas} on ${s.w_spend:.2f} spend: x{d['mult']:g}")
         else:
             R(f"hold: ROAS {roas:.2f} between {cfg.down_roas} and {cfg.up_roas}")
 
@@ -352,7 +386,8 @@ def decide(cfg, s, state):
 
     if act != "hold":
         if not s.cur_run:
-            st["pending"] = {"action": act, "mark": mark, "roas": None if roas is None else round(roas, 4)}
+            st["pending"] = {"action": act, "mark": mark, "roas": None if roas is None else round(roas, 4),
+                             "end": s.end.isoformat()}
             d["would"] = {"action": act, "new": new}
             d["action"] = "carry"
             R("run time is outside Testing's run hours: carried to the first run of the next run block")
@@ -370,6 +405,8 @@ def decide(cfg, s, state):
         st["changes"] += 1
         if act == "step_up":
             st["stepped_up"] = True
+            st["last_up_end"] = up_end.isoformat()
+            st["up_windows"] = (st.get("up_windows") or [])[-40:] + [[window_label(up_end), mark]]
     d["action"], d["new"] = act, float(new)
     return d, st
 

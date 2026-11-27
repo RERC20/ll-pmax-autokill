@@ -75,7 +75,7 @@ def simulate(seg, fx, orders, sched, d, cfg=None, budget0=None):
             s = Snap(end=end, w_spend=fig["w_spend"], p_spend=fig["p_spend"], w_sales=fig["w_sales"],
                      day_spend=fig["day_spend"], day_sales=fig["day_sales"], end_run=runs_at(end - HALF, sched),
                      cur_run=runs_at(now, sched), floor=fl, budget=budget, same_day=uk_date == d,
-                     last_half_spend=fig["last_half_spend"])
+                     last_half_spend=fig["last_half_spend"], pace=cfg.base / max(1, len(ny_run_hours(nyd, sched))))
             dec, st = decide(cfg, s, st)
             rows.append({"run": f"{now.astimezone(UK):%H:%M}", **dec})
             budget = dec["new"]
@@ -94,7 +94,8 @@ def main(argv):
     cfg = Cfg.from_env()
     seg, fx = load_seg(body)
     print(f"Rules v2: up x{cfg.first_mult:g} then x{cfg.step_mult:g} at window ROAS >= {cfg.up_roas}; "
-          f"down /{cfg.down_div:g} < {cfg.down_roas}; 2 in a row -> base pace; no cap / guard / lock")
+          f"down /{cfg.down_div:g} < {cfg.down_roas}; 2 in a row -> base pace; no cap / guard / lock; "
+          f"min window spend: up = base pace (or ${cfg.min_window_spend:g}), down = {cfg.min_down_share:g} x pace; count once")
     summary = []
     d = a
     while d <= b:
