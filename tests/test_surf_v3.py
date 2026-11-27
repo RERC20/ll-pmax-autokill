@@ -134,6 +134,8 @@ class Decide(unittest.TestCase):
         self.assertEqual(d["budget_after"], 501); self.assertFalse(st["at_base"])          # floor rounded up
         d, st = decide_v3(C, snap(1.0, spend=40, budget=390), None)
         self.assertEqual(d["budget_after"], 300); self.assertTrue(st["at_base"])          # landed on $300 = base
+        d, _ = decide_v3(C, snap(1.0, spend=40, budget=320, floor=400), None)
+        self.assertEqual((d["action"], d["budget_after"]), ("step_down", 320))            # floor never raises it
 
     def test_low_spend_bad_window_holds_and_breaks_streak(self):
         d, st = decide_v3(C, snap(1.0, spend=29.99), {"last_bad": True})
@@ -147,6 +149,8 @@ class Decide(unittest.TestCase):
         self.assertEqual((d["action"], d["budget_after"]), ("base_pace", 321)); self.assertTrue(st["at_base"])
         d, st = decide_v3(C, snap(1.0, spend=40, budget=321, floor=100, mark=uk(27, 14, 30)), st)
         self.assertEqual((d["action"], d["budget_after"]), ("base_pace", 300))             # still bad: base pace again
+        d, st = decide_v3(C, snap(1.0, spend=40, budget=300, floor=450, mark=uk(27, 15)), st)
+        self.assertEqual(d["budget_after"], 300)                                            # base pace never raises
 
     def test_hold_between_breaks_streak(self):
         _, st = decide_v3(C, snap(1.0, spend=40, budget=780), None)

@@ -512,8 +512,8 @@ def ny_spend_from_body(body, ny_date, upto_utc):
 #   Reset 00:05 UK -> $300.
 # Interpretations (recorded): "at base" = budget is $300 or was set by base pace and not changed since; x2 / x1.3 /
 # /1.3 multiply the current budget and round half-up to the dollar; the floor is rounded UP to the dollar when it is
-# used as a budget; step-down / base pace take max(result, floor, $300) even if that is above the current budget
-# ("never below the floor"); the bad streak and count-once are kept across non-judged marks and across the 00:05 reset.
+# used as a budget; a step-down / base pace NEVER raises the budget (coordinator fix 27 Nov): step-down =
+# min(current, max(300, floor, current / 1.3)), base pace = min(current, max(300, floor)); the bad streak and count-once are kept across non-judged marks and across the 00:05 reset.
 @dataclass
 class CfgV3:
     base: float = 300.0
@@ -648,13 +648,13 @@ def decide_v3(cfg, s, state):
     rs = f"smoothed {sm:.2f} (raw {'n/a' if raw is None else f'{raw:.2f}'}) on ${s.spend:.2f} spend, {s.orders} orders"
     act, new = "hold", s.budget
     if down_cond and st.get("last_bad"):
-        act, new = "base_pace", low
+        act, new = "base_pace", min(s.budget, low)
         d["reason"] = f"{rs}: second judged mark in a row with smoothed < {cfg.down_roas:g} and spend >= " \
                       f"${cfg.down_min_spend:g} -> base pace = max(floor ${s.floor:,.2f}, ${cfg.base:,.0f})"
     elif down_cond:
-        act, new = "step_down", max(round_dollar(s.budget / cfg.down_div), low)
+        act, new = "step_down", min(s.budget, max(round_dollar(s.budget / cfg.down_div), low))
         d["reason"] = f"{rs}: smoothed < {cfg.down_roas:g} and spend >= ${cfg.down_min_spend:g} -> /{cfg.down_div:g}" \
-                      + (f", held at max(floor, ${cfg.base:,.0f}) = ${low:,.0f}" if new == low else "")
+                      + (f", held at min(current, max(floor, ${cfg.base:,.0f}) = ${low:,.0f})" if new != round_dollar(s.budget / cfg.down_div) else "")
     elif sm >= cfg.up_roas:
         fails = []
         if s.spend < cfg.up_min_spend:
