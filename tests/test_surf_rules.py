@@ -165,6 +165,21 @@ class StepDown(unittest.TestCase):
         self.assertEqual((d["action"], d["new"]), ("base_pace", 300))
 
 
+    def test_floor_held_budget_counts_as_base(self):
+        # budget a few dollars over base only because of the floor: a bad hour neither locks nor micro-steps
+        d, st = decide(C, S(roas=0.0, budget=317, floor=316.5), new_day_state())
+        self.assertEqual(d["action"], "hold")
+        self.assertFalse(st["base_lock"])
+
+    def test_small_step_not_written(self):
+        d, _ = decide(C, S(roas=1.5, budget=500, floor=495), new_day_state())
+        self.assertEqual(d["action"], "hold")
+
+    def test_step_up_from_floor_held_budget_goes_to_first_step(self):
+        d, _ = decide(C, S(budget=317, spend=20), new_day_state())
+        self.assertEqual((d["action"], d["new"]), ("step_up", 600))
+
+
 class Guards(unittest.TestCase):
     def test_outside_run_hours_hold_with_would(self):
         d, _ = decide(C, S(cur_run=False), new_day_state())

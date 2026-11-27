@@ -31,6 +31,7 @@ class Cfg:
     buffer: float = 0.10         # floor buffer
     max_changes: int = 8         # budget changes per UK day (resets included)
     max_budget: float = 1500.0   # never write a budget above this
+    min_change: float = 10.0     # a step down smaller than this (USD) is not written (floor noise)
 
     @classmethod
     def from_env(cls, env=None):
@@ -179,7 +180,9 @@ def decide(cfg, s, state):
     if st["stepped_up"] and (droas is None or droas < cfg.day_roas) and not st["guard"]:
         st["guard"] = True; R(f"day guard ON: day-to-date ROAS {droas:.2f} < {cfg.day_roas} after a step-up - no more step-ups today")
 
-    above = s.budget > cfg.base + 0.5
+    # "above base" = there is real room to go down: the floor (or the base) is at least min_change below the budget.
+    # A budget held a few dollars over base by the floor counts as base (no lock, no micro-changes).
+    above = s.budget - max(cfg.base, _dollars_up(s.floor)) >= cfg.min_change
     act, target = "hold", s.budget
     if above and (very or two):
         st["base_lock"] = True
@@ -208,12 +211,13 @@ def decide(cfg, s, state):
         if s.budget >= min(cfg.cap, cfg.max_budget) - 0.5:
             fails.append(f"budget at cap ${min(cfg.cap, cfg.max_budget):,.0f}")
         if bad:
-            fails.insert(0, f"ROAS {roas:.2f} < {cfg.down_roas} but budget already at base")
+            fails.insert(0, f"ROAS {roas:.2f} < {cfg.down_roas} but budget already at base / floor")
         if fails:
             R("hold: " + "; ".join(fails))
         else:
-            mult = cfg.first_mult if not above else cfg.step_mult
-            act, target = "step_up", min(s.budget * mult, cfg.cap, cfg.max_budget)
+            first = cfg.base * cfg.first_mult
+            mult = cfg.first_mult if s.budget < first - 0.5 else cfg.step_mult
+            act, target = "step_up", min(first if s.budget < first - 0.5 else s.budget * cfg.step_mult, cfg.cap, cfg.max_budget)
             R(f"ROAS {roas:.2f} >= {cfg.up_roas}, spend ${s.h_spend:.2f} >= ${need:.2f}, day ROAS {droas:.2f} >= {cfg.day_roas}: x{mult:g}")
 
     new = s.budget
@@ -222,8 +226,8 @@ def decide(cfg, s, state):
         if target < s.floor:
             R(f"floor ${s.floor:,.2f} keeps the budget above ${target:,.0f} so Testing slows down instead of stopping")
         new = min(new, s.budget)                 # a bad hour never raises the budget
-        if new >= s.budget - 0.5:
-            R("floor already at/above the current budget - no change"); act, new = "hold", s.budget
+        if s.budget - new < cfg.min_change:
+            R("floor keeps the budget where it is - no change"); act, new = "hold", s.budget
     elif act == "step_up":
         new = min(max(round(target), _dollars_up(s.floor)), cfg.cap, cfg.max_budget)
         if new <= s.budget + 0.5:
