@@ -488,3 +488,211 @@ def ny_spend_from_body(body, ny_date, upto_utc):
             if t < upto_utc and t.astimezone(NY).date().isoformat() == ny_date:
                 tot += float(h["split"]["testing"]["cost_usd"] or 0)
     return round(tot, 2)
+
+
+# ====================================================================================================================
+# Rules v3 (owner spec, 27 Nov 2026; selected with SURF_RULESET=v3, v2 above stays the default and stays selectable).
+#   Decision marks: every :00 and :30 UK while the mark is inside Testing's run hours (outside: no action, no carry).
+#   Judged window: [mark - 60 - 180 min, mark - 60 min) = 3 hours ending 60 minutes before the mark.
+#     spend  = Testing spend in it (Ads hourly segments, partial hours pro-rated evenly)
+#     sales  = Testing true sales of Shopify orders created in it (hourly.py split; no test / cancelled / old-order /
+#              imported / store-credit orders; refunds not subtracted)
+#     orders = count of those orders with Testing sales > 0
+#   smoothed ROAS = (sales + 2.46 x 20) / (spend + 20); decisions use it, raw ROAS is reported.
+#   SKIP      spend < $10, or (live only) the window's last hour looks incomplete. Not judged: no state change.
+#   STEP UP   smoothed >= 3.0 and spend >= $45 and orders >= 3 and count-once: at base -> x2, else x1.3 (whole $)
+#   COUNT ONCE the next step-up needs a mark >= the last step-up's mark + 180 min (its window starts at or after the
+#             earlier window's end). Step-downs are not blocked.
+#   STEP DOWN smoothed < 1.75 and spend >= $30: budget / 1.3 (whole $), never below the floor, never below $300
+#   BASE PACE the previous judged mark also met the step-down conditions: budget = max(floor, $300)
+#   HOLD      anything else (1.75 <= smoothed < 3.0, or step-up conditions not met, or a low-spend bad window)
+#   FLOOR     (Testing spend so far in the NY account day + $300 / NY-day run hours x remaining NY run hours incl.
+#             the current hour) x 1.1
+#   Manual override (live only): a budget change in the last 60 min that is not the scaler's own pauses the run.
+#   Reset 00:05 UK -> $300.
+# Interpretations (recorded): "at base" = budget is $300 or was set by base pace and not changed since; x2 / x1.3 /
+# /1.3 multiply the current budget and round half-up to the dollar; the floor is rounded UP to the dollar when it is
+# used as a budget; step-down / base pace take max(result, floor, $300) even if that is above the current budget
+# ("never below the floor"); the bad streak and count-once are kept across non-judged marks and across the 00:05 reset.
+@dataclass
+class CfgV3:
+    base: float = 300.0
+    up_roas: float = 3.0           # smoothed ROAS needed to step up
+    down_roas: float = 1.75        # smoothed ROAS below this (with enough spend) = step-down conditions
+    prior_roas: float = 2.46       # shrinkage target (pooled Testing ROAS)
+    prior_spend: float = 20.0      # pseudo-spend of the prior
+    up_min_spend: float = 45.0     # window spend needed to step up
+    up_min_orders: int = 3         # window orders (Testing sales > 0) needed to step up
+    down_min_spend: float = 30.0   # window spend needed for step-down conditions
+    skip_spend: float = 10.0       # window spend below this: skip
+    first_mult: float = 2.0        # step up from base
+    step_mult: float = 1.3         # every other step up
+    down_div: float = 1.3          # step down
+    buffer: float = 0.10           # floor buffer
+    window_min: int = 180          # judged window length
+    lag_min: int = 60              # window ends this long before the mark
+    once_min: int = 180            # count-once spacing between step-up marks
+
+    @classmethod
+    def from_env(cls, env=None):
+        env = os.environ if env is None else env
+        kw = {}
+        for f in fields(cls):
+            v = env.get("SURF3_" + f.name.upper())
+            if v not in (None, ""):
+                kw[f.name] = int(float(v)) if isinstance(f.default, int) else float(v)
+        c = cls(**kw)
+        if c.first_mult <= 1 or c.step_mult <= 1 or c.down_div <= 1:
+            raise ValueError("SURF3_FIRST_MULT / SURF3_STEP_MULT / SURF3_DOWN_DIV must be > 1")
+        return c
+
+
+def ruleset(env=None):
+    """SURF_RULESET: 'v3' selects rules v3; anything else (default) keeps v2."""
+    env = os.environ if env is None else env
+    return "v3" if (env.get("SURF_RULESET") or "v2").strip().lower() == "v3" else "v2"
+
+
+def v3_window(mark, cfg=None):
+    cfg = cfg or CfgV3()
+    end = mark - dt.timedelta(minutes=cfg.lag_min)
+    return end - dt.timedelta(minutes=cfg.window_min), end
+
+
+def spend_prorated(seg, a, b):
+    """Spend in [a, b) from hourly segments {utc_hour_start: usd}, every hour spread evenly over its 60 minutes."""
+    tot, t = 0.0, a
+    while t < b:
+        h = hour_of(t)
+        nxt = min(b, h + HOUR)
+        tot += float(seg.get(h, 0.0)) * (nxt - t).total_seconds() / 3600.0
+        t = nxt
+    return tot
+
+
+def window_sales_orders(orders, a, b):
+    """orders: [(created_utc, testing_usd)] (store-credit etc. already removed) -> (sales usd, orders with sales > 0)."""
+    sel = [v for t, v in orders if a <= t < b]
+    return sum(sel), sum(1 for v in sel if v > 0)
+
+
+def smoothed_roas(sales, spend, cfg=None):
+    cfg = cfg or CfgV3()
+    return (sales + cfg.prior_roas * cfg.prior_spend) / (spend + cfg.prior_spend)
+
+
+def round_dollar(x):
+    """Half-up rounding to the whole dollar (x2 / x1.3 / 1.3 results)."""
+    return float(math.floor(round(x, 6) + 0.5))
+
+
+def floor_v3(ny_spend_so_far, run_hours_in_day, remaining, cfg=None):
+    cfg = cfg or CfgV3()
+    return budget_floor(ny_spend_so_far, cfg.base, run_hours_in_day, remaining, cfg.buffer)
+
+
+def new_state_v3(budget=300.0):
+    return {"budget": float(budget), "at_base": True, "last_bad": False, "last_up_mark": None, "last_mark": None}
+
+
+@dataclass
+class SnapV3:
+    mark: dt.datetime            # decision mark (UTC instant of a UK :00 / :30)
+    spend: float                 # window spend (USD)
+    sales: float                 # window true Testing sales (USD)
+    orders: int                  # window orders with Testing sales > 0
+    in_hours: bool               # the mark is inside Testing's run hours
+    floor: float                 # floor_v3 at the mark
+    budget: float                # budget before the decision (live, or the dry-run virtual budget)
+    live: bool = False
+    last_hour_incomplete: bool = False   # live only: the window's last hour has no Ads data yet
+    manual_recent: tuple = ()    # live only: budget changes in the last 60 min that the scaler did not make
+    campaign_status: str = "ENABLED"
+
+
+def decide_v3(cfg, s, state):
+    """-> (decision dict, new state). Pure."""
+    st = dict(new_state_v3(s.budget), **(state or {}))
+    a, b = v3_window(s.mark, cfg)
+    raw = s.sales / s.spend if s.spend > 0 else None
+    sm = smoothed_roas(s.sales, s.spend, cfg)
+    low = max(cfg.base, float(math.ceil(round(s.floor, 6))))
+    d = {"mark": s.mark, "window_start": a, "window_end": b, "spend": round(s.spend, 2), "sales": round(s.sales, 2),
+         "orders": s.orders, "raw_roas": None if raw is None else round(raw, 4), "smoothed_roas": round(sm, 4),
+         "action": "hold", "budget_before": s.budget, "budget_after": s.budget, "floor": round(s.floor, 2),
+         "would": None, "reason": ""}
+    at_base = st["at_base"] or abs(s.budget - cfg.base) < 0.5
+
+    if not s.in_hours:
+        d["action"], d["reason"] = "out_of_hours", "mark outside Testing's run hours: no action"
+        return d, st
+    if st.get("last_mark") == s.mark.isoformat():
+        d["action"], d["reason"] = "already_evaluated", "this mark was already judged"
+        return d, st
+    if s.spend < cfg.skip_spend:
+        d["action"], d["reason"] = "skip", f"window spend ${s.spend:.2f} < ${cfg.skip_spend:g}: skip"
+        return d, st
+    if s.live and s.last_hour_incomplete:
+        d["action"], d["reason"] = "skip", "Ads data for the window's last hour looks incomplete: skip"
+        return d, st
+    if s.live and (s.manual_recent or s.campaign_status != "ENABLED"):
+        why = (f"campaign is {s.campaign_status}" if s.campaign_status != "ENABLED" else
+               "budget changed manually in the last 60 min (" + "; ".join(s.manual_recent) + ")")
+        d["action"], d["reason"] = "paused", f"paused: {why} - not judged"
+        return d, st
+
+    down_cond = sm < cfg.down_roas and s.spend >= cfg.down_min_spend
+    last_up = dt.datetime.fromisoformat(st["last_up_mark"]) if st.get("last_up_mark") else None
+    next_up = last_up + dt.timedelta(minutes=cfg.once_min) if last_up else None
+    once_ok = next_up is None or s.mark >= next_up
+    rs = f"smoothed {sm:.2f} (raw {'n/a' if raw is None else f'{raw:.2f}'}) on ${s.spend:.2f} spend, {s.orders} orders"
+    act, new = "hold", s.budget
+    if down_cond and st.get("last_bad"):
+        act, new = "base_pace", low
+        d["reason"] = f"{rs}: second judged mark in a row with smoothed < {cfg.down_roas:g} and spend >= " \
+                      f"${cfg.down_min_spend:g} -> base pace = max(floor ${s.floor:,.2f}, ${cfg.base:,.0f})"
+    elif down_cond:
+        act, new = "step_down", max(round_dollar(s.budget / cfg.down_div), low)
+        d["reason"] = f"{rs}: smoothed < {cfg.down_roas:g} and spend >= ${cfg.down_min_spend:g} -> /{cfg.down_div:g}" \
+                      + (f", held at max(floor, ${cfg.base:,.0f}) = ${low:,.0f}" if new == low else "")
+    elif sm >= cfg.up_roas:
+        fails = []
+        if s.spend < cfg.up_min_spend:
+            fails.append(f"spend ${s.spend:.2f} < ${cfg.up_min_spend:g}")
+        if s.orders < cfg.up_min_orders:
+            fails.append(f"{s.orders} orders < {cfg.up_min_orders}")
+        if not once_ok:
+            fails.append(f"count-once: last step-up at {last_up.astimezone(UK):%d %b %H:%M}, next allowed from "
+                         f"{next_up.astimezone(UK):%H:%M}")
+        if fails:
+            d["reason"] = f"{rs}: hold, smoothed >= {cfg.up_roas:g} but " + "; ".join(fails)
+        else:
+            m = cfg.first_mult if at_base else cfg.step_mult
+            act, new = "step_up", round_dollar(s.budget * m)
+            d["mult"] = m
+            d["reason"] = f"{rs}: step up x{m:g}" + (" from base" if at_base else "")
+    elif sm < cfg.down_roas:
+        d["reason"] = f"{rs}: hold, smoothed < {cfg.down_roas:g} but spend < ${cfg.down_min_spend:g}"
+    else:
+        d["reason"] = f"{rs}: hold, smoothed between {cfg.down_roas:g} and {cfg.up_roas:g}"
+
+    st["last_bad"] = bool(down_cond)
+    st["last_mark"] = s.mark.isoformat()
+    if act == "step_up":
+        st["last_up_mark"] = s.mark.isoformat()
+        st["at_base"] = False
+    elif act == "base_pace":
+        st["at_base"] = True
+    elif act == "step_down":
+        st["at_base"] = abs(new - cfg.base) < 0.5
+    st["budget"] = float(new)
+    d["action"], d["budget_after"] = act, float(new)
+    return d, st
+
+
+def reset_v3(cfg, state, budget):
+    """00:05 UK: budget back to $300 (base). Count-once and the bad streak are kept."""
+    st = dict(new_state_v3(budget), **(state or {}))
+    st["budget"], st["at_base"] = cfg.base, True
+    return {"action": "reset" if abs(budget - cfg.base) >= 0.5 else "reset_noop", "budget_before": budget,
+            "budget_after": cfg.base, "reason": "daily reset 00:05 UK -> base"}, st

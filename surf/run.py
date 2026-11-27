@@ -21,6 +21,8 @@
 # Variables: GADS_* (Google Ads OAuth, as stores-monitor), SHOPIFY_NEWLOLA_* (new LolaLooks store), TELEGRAM_BOT_TOKEN /
 # TELEGRAM_CHAT_ID, SURF_FIRST_STEP / SURF_STEP / SURF_STEP_DOWN and other SURF_* rule overrides (rules.Cfg),
 # SURF_DATA_DIR (state + JSON-lines log; default /data when it exists). Secrets are never printed.
+# SURF_RULESET=v3 selects rules v3 (rules.decide_v3: 3-hour window ending 60 min before the :00/:30 mark, smoothed
+# ROAS; state under "v3" in the same state file, own virtual budget); anything else keeps rules v2 below.
 import argparse
 import datetime as dt
 import html
@@ -33,8 +35,10 @@ from pathlib import Path
 import requests
 
 from . import gads, sales
-from .rules import (HALF, NY, UK, UTC, Cfg, Snap, budget_floor, decide, decide_reset, last_mark, manual_changes,
-                    new_day_state, ny_run_hours, parse_schedule, remaining_ny_run_hours, runs_at, window_figures)
+from .rules import (HALF, HOUR, NY, UK, UTC, Cfg, CfgV3, Snap, SnapV3, budget_floor, decide, decide_reset, decide_v3,
+                    floor_v3, hour_of, last_mark, manual_changes, new_day_state, new_state_v3, ny_run_hours,
+                    parse_schedule, remaining_ny_run_hours, reset_v3, ruleset, runs_at, spend_prorated, v3_window,
+                    window_figures, window_sales_orders)
 from .shop import Shop
 
 TITLE = "Surf scaler | PMax Testing UK"
@@ -294,6 +298,169 @@ def reset_run(now_utc, cfg, live, store):
     return rec
 
 
+# ==================================================================================================== rules v3
+COLS3 = [("window", 11, "<"), ("spend", 7, ">"), ("sales", 7, ">"), ("ord", 3, ">"), ("raw", 5, ">"),
+         ("smooth", 6, ">"), ("action", 9, "<"), ("old→new", 11, ">"), ("floor", 5, ">")]
+LABEL3 = {"step_up": "UP", "step_down": "DOWN /1.3", "base_pace": "BASE", "hold": "HOLD", "skip": "SKIP",
+          "out_of_hours": "OFF HRS", "paused": "PAUSED", "already_evaluated": "DONE", "reset": "RESET",
+          "reset_noop": "RESET ok"}
+
+
+def table_row3(d):
+    n = lambda x, f="{:.2f}": "-" if x is None else f.format(x)          # noqa: E731
+    a = d["action"]
+    lab = f"UP x{d.get('mult', 0):g}" if a == "step_up" else LABEL3.get(a, a.upper())
+    o, nw = d["budget_before"], d["budget_after"]
+    bud = f"{o:,.0f}→{nw:,.0f}" if abs(nw - o) >= 0.5 else f"{o:,.0f}"
+    win = (f"{d['window_start'].astimezone(UK):%H:%M}-{d['window_end'].astimezone(UK):%H:%M}"
+           if d.get("window_start") else d.get("window", ""))
+    return {"window": win, "spend": n(d.get("spend")), "sales": n(d.get("sales")), "ord": n(d.get("orders"), "{}"),
+            "raw": n(d.get("raw_roas")), "smooth": n(d.get("smoothed_roas")), "action": lab, "old→new": bud,
+            "floor": n(d.get("floor"), "{:,.0f}")}
+
+
+def render_table3(rows):
+    def line(vals):
+        return " ".join(f"{str(vals[c])[:w]:{al}{w}}" for c, w, al in COLS3)
+    return "\n".join([line({c: c for c, _, _ in COLS3})] + [line(r) for r in rows])
+
+
+def message3(live, now_uk, dec, rows, foot):
+    tag = "LIVE" if live else "DRY RUN"
+    out = [f"<b>{html.escape(TITLE)} | v3 | {tag} | {now_uk:%a %d %b %H:%M} UK</b>",
+           "<pre>" + html.escape(render_table3(rows)) + "</pre>"]
+    a = dec["action"]
+    if a in CHANGE_ACTIONS:
+        out.append(("Budget" if live else "Would set budget") +
+                   f": ${dec['budget_before']:,.0f} → ${dec['budget_after']:,.0f} ({a})")
+    out.append("Reason: " + html.escape(dec.get("reason", "")))
+    out += [html.escape(x) for x in foot if x]
+    if live and a in CHANGE_ACTIONS:
+        out.append("Verified: " + ("yes" if dec.get("verified") else "NO - check the account"))
+    return "\n".join(out)
+
+
+def _v3_state(st, budget):
+    v = st.get("v3")
+    if not v:
+        v = new_state_v3(budget)
+        v["at_base"] = abs(budget - CfgV3().base) < 0.5
+        v["virtual_budget"] = None
+        v["rows"] = []
+    return v
+
+
+def _usd_orders(raw):
+    """[(created_utc, testing_pennies_gbp)] -> [(created_utc, testing_usd)] at the ECB rate of each order's UK date."""
+    rates, out = {}, []
+    for t, p in raw:
+        d = t.astimezone(UK).date()
+        if d not in rates:
+            rates[d] = sales.gbp_usd(d)[0]
+            if rates[d] is None:
+                raise RuntimeError(f"GBP->USD rate not available for {d}")
+        out.append((t, p / 100.0 * rates[d]))
+    return out, {k.isoformat(): v for k, v in rates.items()}
+
+
+def window_run_v3(now_utc, cfg, live, store):
+    mark = last_mark(now_utc)
+    uk_now = now_utc.astimezone(UK)
+    a, b = v3_window(mark, cfg)
+    camp, problems, sched = _ctx(now_utc)
+    ny_today = now_utc.astimezone(NY).date()
+    ny_from = min(a.astimezone(NY).date(), ny_today - dt.timedelta(days=1))
+    seg, day_totals = gads.testing_spend(ny_from.isoformat(), ny_today.isoformat())
+    ny_spend = day_totals.get(ny_today.isoformat(), 0.0)
+    nyc = len(ny_run_hours(ny_today, sched))
+    rem = remaining_ny_run_hours(now_utc, sched)
+    floor = floor_v3(ny_spend, nyc, rem, cfg)
+    spend = spend_prorated(seg, a, b)
+    last_h = hour_of(b - dt.timedelta(minutes=1))
+    incomplete = runs_at(last_h, sched) and float(seg.get(last_h, 0.0)) <= 0.0
+    orders, fx = _usd_orders(sales.testing_orders(Shop("NEWLOLA"), a, b, drop_store_credit=True))
+    w_sales, w_orders = window_sales_orders(orders, a, b)
+
+    st = store.load()
+    live_budget = camp["amount_micros"] / 1e6
+    v = _v3_state(st, live_budget)
+    budget = live_budget if live else (v.get("virtual_budget") or live_budget)
+    manual = manual_changes(gads.budget_events(now_utc), st.get("writes"), now_utc)
+    status = camp["status"] if not problems else "MISCONFIGURED (" + "; ".join(problems) + ")"
+    snap = SnapV3(mark=mark, spend=spend, sales=w_sales, orders=w_orders, in_hours=runs_at(mark, sched), floor=floor,
+                  budget=budget, live=live, last_hour_incomplete=incomplete, manual_recent=tuple(manual),
+                  campaign_status=status)
+    rules_state = {k: v[k] for k in new_state_v3() if k in v}
+    dec, rs2 = decide_v3(cfg, snap, rules_state)
+    if not live and manual:
+        dec["reason"] += " | manual budget change seen (" + "; ".join(manual) + ") - ignored in dry run"
+    if dec["action"] in CHANGE_ACTIONS:
+        if live:
+            if not _write(st, budget, dec["budget_after"], dec):
+                rs2 = rules_state                       # nothing was written: the decision did not happen
+                dec["budget_after"] = dec.get("new", budget)
+        else:
+            v["virtual_budget"] = dec["budget_after"]
+    v.update(rs2)
+    v["rows"] = (v.get("rows") or [])[-40:] + [table_row3(dec)]
+    st["v3"] = v
+    store.save(st)
+
+    foot = [f"Window {a.astimezone(UK):%d %b %H:%M}-{b.astimezone(UK):%H:%M} UK (3 h ending 60 min before the "
+            f"{mark.astimezone(UK):%H:%M} mark) | spend pro-rated from hourly Ads | GBP→USD {fx or '-'}",
+            f"Floor ${floor:,.2f} = (NY-day Testing spend ${ny_spend:,.2f} + ${cfg.base:,.0f}/{nyc} x {rem} run hrs "
+            f"left) x {1 + cfg.buffer:g} | live budget ${live_budget:,.0f} | mark in run hours: "
+            f"{'yes' if snap.in_hours else 'no'}",
+            f"Up: smoothed >= {cfg.up_roas:g}, spend >= ${cfg.up_min_spend:g}, orders >= {cfg.up_min_orders}, "
+            f"x{cfg.first_mult:g} from base else x{cfg.step_mult:g} | down: smoothed < {cfg.down_roas:g}, spend >= "
+            f"${cfg.down_min_spend:g}, /{cfg.down_div:g}; 2 in a row = base pace | prior {cfg.prior_roas:g} x "
+            f"${cfg.prior_spend:g}" + (f" | last step-up mark {dt.datetime.fromisoformat(v['last_up_mark']).astimezone(UK):%d %b %H:%M}"
+                                     if v.get("last_up_mark") else "")]
+    rec = {"mode": "window", "ruleset": "v3", "live": live, "at": now_utc.isoformat(), "uk_now": uk_now.isoformat(),
+           "mark": mark.isoformat(), "window": [a.isoformat(), b.isoformat()], "ny_date": ny_today.isoformat(),
+           "ny_run_hours": nyc, "remaining_ny_run_hours": rem, "ny_spend_usd": ny_spend, "live_budget": live_budget,
+           "campaign_status": camp["status"], "problems": problems, "manual_recent": manual, "fx_gbp_usd": fx,
+           "last_hour_incomplete": incomplete, "decision": dec,
+           "state": {k: val for k, val in v.items() if k != "rows"}}
+    rec["notified"] = telegram(message3(live, uk_now, dec, v["rows"][-8:], foot))
+    log_line(rec)
+    return rec
+
+
+def reset_run_v3(now_utc, cfg, live, store):
+    uk_now = now_utc.astimezone(UK)
+    camp, problems, sched = _ctx(now_utc)
+    st = store.load()
+    live_budget = camp["amount_micros"] / 1e6
+    v = _v3_state(st, live_budget)
+    budget = live_budget if live else (v.get("virtual_budget") or live_budget)
+    manual = manual_changes(gads.budget_events(now_utc), st.get("writes"), now_utc)
+    rules_state = {k: v[k] for k in new_state_v3() if k in v}
+    dec, rs2 = reset_v3(cfg, rules_state, budget)
+    dec["window"] = f"{uk_now:%H:%M} reset"
+    if dec["action"] == "reset":
+        if live and (manual or camp["status"] != "ENABLED" or problems):
+            dec["would"] = {"action": "reset", "new": dec["budget_after"]}
+            dec["action"], dec["budget_after"], rs2 = "paused", budget, rules_state
+            dec["reason"] += " | paused: " + ("; ".join(manual) or camp["status"] or "; ".join(problems))
+        elif live:
+            if not _write(st, budget, dec["budget_after"], dec):
+                rs2 = rules_state
+                dec["budget_after"] = dec.get("new", budget)
+        else:
+            v["virtual_budget"] = dec["budget_after"]
+    v.update(rs2)
+    v["rows"] = (v.get("rows") or [])[-40:] + [table_row3(dec)]
+    st["v3"] = v
+    store.save(st)
+    rec = {"mode": "reset", "ruleset": "v3", "live": live, "at": now_utc.isoformat(), "uk_now": uk_now.isoformat(),
+           "live_budget": live_budget, "campaign_status": camp["status"], "problems": problems,
+           "manual_recent": manual, "decision": dec}
+    rec["notified"] = telegram(message3(live, uk_now, dec, v["rows"][-8:], [f"live budget ${live_budget:,.0f}"]))
+    log_line(rec)
+    return rec
+
+
 def auto_mode(now_utc):
     uk = now_utc.astimezone(UK)
     if 5 <= uk.minute < 20:
@@ -316,12 +483,15 @@ def main(argv=None):
                   "note": "the :05 run only resets at UK 00:05"})
         return 0
     try:
-        cfg = Cfg.from_env()
-        (window_run if mode == "window" else reset_run)(now, cfg, live, Store())
+        if ruleset() == "v3":
+            (window_run_v3 if mode == "window" else reset_run_v3)(now, CfgV3.from_env(), live, Store())
+        else:
+            cfg = Cfg.from_env()
+            (window_run if mode == "window" else reset_run)(now, cfg, live, Store())
         return 0
     except Exception as e:                    # noqa: BLE001
         traceback.print_exc()
-        msg = (f"{TITLE} | {'LIVE' if live else 'DRY RUN'} | {uk:%a %d %b %H:%M} UK\nFAILED ({mode}): "
+        msg = (f"{TITLE} | {ruleset()} | {'LIVE' if live else 'DRY RUN'} | {uk:%a %d %b %H:%M} UK\nFAILED ({mode}): "
                f"{type(e).__name__}: {str(e)[:300]}\nNothing was written.")
         log_line({"mode": mode, "at": now.isoformat(), "live": live, "error": f"{type(e).__name__}: {str(e)[:300]}",
                   "notified": telegram(msg, html_mode=False)})
